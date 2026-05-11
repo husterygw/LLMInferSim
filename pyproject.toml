@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-infer-sim"
+version = "0.1.0"
+description = "LLM inference performance simulator (Phase 1 spike)"
+requires-python = ">=3.10"
+dependencies = [
+    "vllm==0.20.1",
+]
+
+[project.entry-points."vllm.platform_plugins"]
+virtual = "llm_infer_sim.adapters.vllm.virtual_platform:virtual_platform_plugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_infer_sim*"]
