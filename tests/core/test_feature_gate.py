@@ -17,6 +17,7 @@ def _bare_config(**overrides):
         speculative_config=None,
         decoding_config=SimpleNamespace(guided_decoding_backend=None),
         kv_transfer_config=None,
+        attention_config=SimpleNamespace(backend=None),  # 阶段 3.5: 第 7 类
         model_config=SimpleNamespace(
             is_multimodal_model=False,
             max_logprobs=0,
@@ -27,6 +28,8 @@ def _bare_config(**overrides):
             setattr(cfg.model_config, k[len("model_"):], v)
         elif k.startswith("decoding_"):
             setattr(cfg.decoding_config, k[len("decoding_"):], v)
+        elif k.startswith("attention_"):
+            setattr(cfg.attention_config, k[len("attention_"):], v)
         else:
             setattr(cfg, k, v)
     return cfg
@@ -76,6 +79,27 @@ def test_kv_transfer_rejected_unless_env_set(monkeypatch):
 
     # 环境变量显式设 1 后允许
     monkeypatch.setenv("VLLM_INFER_SIM_ALLOW_PD_DISAGG", "1")
+    VirtualPlatform._check_unsupported_features(cfg)
+
+
+def test_unsupported_attention_backend_rejected():
+    """阶段 3.5 第 7 类: 非 NVIDIA backend platform 启动期就拦。"""
+    cfg = _bare_config(attention_backend=SimpleNamespace(name="ROCM_ATTN"))
+    with pytest.raises(ValueError, match="ROCM_ATTN"):
+        VirtualPlatform._check_unsupported_features(cfg)
+
+
+def test_unknown_attention_backend_rejected():
+    cfg = _bare_config(
+        attention_backend=SimpleNamespace(name="HYPOTHETICAL_NEW_BACKEND")
+    )
+    with pytest.raises(ValueError, match="Unknown attention backend"):
+        VirtualPlatform._check_unsupported_features(cfg)
+
+
+def test_flash_attn_backend_passes():
+    """主流 backend 不应被 feature gate 拦下。"""
+    cfg = _bare_config(attention_backend=SimpleNamespace(name="FLASH_ATTN"))
     VirtualPlatform._check_unsupported_features(cfg)
 
 

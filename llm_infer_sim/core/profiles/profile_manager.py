@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from llm_infer_sim.core.profiles.backend_profile import (
     BackendExecutionProfile,
     default_backend_profile,
+    infer_backend_profile_from_vllm,
 )
 from llm_infer_sim.core.profiles.deploy import DeployConfig, ParallelConfig
 from llm_infer_sim.core.profiles.hardware import HardwareConfig, get_hardware_profile
@@ -97,12 +98,14 @@ class ProfileManager:
             use_flash_attention=True,                # 现代 vLLM 默认 flash
         )
 
+        # 阶段 3.5: 从 vllm_config.attention_config.backend 推导 mixed_mode
+        # (详设 §4.8.1.1); 老 default_backend_profile() 保留供 standalone 模式。
         return ProfileBundle(
             model=model_config,
             deploy=deploy,
             hw=hw,
             efficiency=efficiency,
-            backend=default_backend_profile(),
+            backend=infer_backend_profile_from_vllm(vllm_config),
         )
 
 
