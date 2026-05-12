@@ -118,24 +118,50 @@ class VirtualWorker(WorkerBase):
         return spec
 
     def determine_available_memory(self) -> int:
-        """返回 *KV cache 可用* 字节数 (粗估)。
+        """返回 *KV cache 可用* 字节数 (详设 §4.3.3 阶段 4 真实化)。
 
-        阶段 0/1/2: 从 hardware profile 的 mem_capacity_gb 读 HBM 容量
-        (env LLM_INFER_SIM_HW 选定, 默认 H100=80GB), 留一半给权重 + 激活粗估。
-        阶段 4 起: 改为真实模型权重 + 激活估算 (详设 §4.3.3)。
+        公式 (阶段 4 起):
+          available_kv = HBM × gpu_memory_utilization
+                       - per_rank_weight_bytes(model, w_byte, tp)
+                       - activation_buffer(model, max_num_batched_tokens, a_byte)
+
+        阶段 0-3 旧公式 `× 0.5` 占位已替换。
+        阶段 5 (MoE) / 阶段 6 (EP) 起需细化 expert 切分逻辑。
         """
-        import os
-        from llm_infer_sim.core.profiles.hardware import get_hardware_profile
+        from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
+        from llm_infer_sim.core.profiles.sizing import (
+            estimate_activation_bytes,
+            per_rank_param_bytes,
+        )
 
-        hw_name = os.environ.get("LLM_INFER_SIM_HW", "H100")
-        hw = get_hardware_profile(hw_name)
+        bundle = extract_profile_bundle(self.vllm_config)
+        model = bundle.model
+        deploy = bundle.deploy
+        hw = bundle.hw
+
         hbm = int(hw.mem_capacity_gb * 1024 * 1024 * 1024)
         utilization = self.cache_config.gpu_memory_utilization
-        # todo: 权重后续阶段补上后, 这里的 0.5 可以改成 config 注入的预留比例, 让用户模拟不同程度的内存压力
-        available = int(hbm * utilization * 0.5)  # 留一半给权重 + 激活粗估
+        budget = int(hbm * utilization)
+
+        tp = deploy.tp
+        weight_bytes = per_rank_param_bytes(model, deploy.w_byte, tp)
+        max_batched = getattr(self.scheduler_config, "max_num_batched_tokens", 2048)
+        activation_bytes = estimate_activation_bytes(model, max_batched, deploy.a_byte)
+
+        available = budget - weight_bytes - activation_bytes
+        if available <= 0:
+            _log(
+                f"[WARN] estimated weights({weight_bytes/1e9:.1f}GB) + "
+                f"activations({activation_bytes/1e9:.2f}GB) > budget({budget/1e9:.1f}GB);"
+                f" falling back to 10% of HBM for KV"
+            )
+            available = max(int(hbm * 0.1), 1)
+
         _log(
             f"virtual available_memory={available/1e9:.1f} GB "
-            f"(hw={hw_name} hbm={hw.mem_capacity_gb:.0f}GB utilization={utilization:.2f})"
+            f"(hbm={hw.mem_capacity_gb:.0f}GB util={utilization:.2f} "
+            f"weights/rank={weight_bytes/1e9:.1f}GB tp={tp} "
+            f"activation={activation_bytes/1e9:.2f}GB)"
         )
         return available
 
