@@ -100,6 +100,83 @@ def test_unsupported_model_raises():
         extract_profile_bundle(_make_vllm_config(hf))
 
 
+def test_qwen3_30b_a3b_moe_parse():
+    """阶段 5: Qwen3-30B-A3B MoE 字段被正确读 (兼容 Qwen num_experts 命名)。"""
+    hf = SimpleNamespace(
+        model_type="qwen3_moe",
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        hidden_size=2048,
+        num_hidden_layers=48,
+        intermediate_size=6144,        # dense FFN dim, MoE layer 不用
+        vocab_size=151936,
+        head_dim=128,
+        # MoE fields (Qwen 命名)
+        num_experts=128,
+        num_experts_per_tok=8,
+        moe_intermediate_size=768,
+        mlp_only_layers=[],            # 全部 MoE 层
+    )
+    bundle = extract_profile_bundle(_make_vllm_config(hf, "Qwen/Qwen3-30B-A3B"))
+    m = bundle.model
+    assert m.is_moe                    # ✓ Qwen num_experts 字段被识别
+    assert m.num_experts == 128
+    assert m.num_activated_experts == 8
+    assert m.expert_dim == 768
+    assert m.num_shared_experts == 0   # A3B 没有 shared
+    assert m.first_moe_layer == 0      # mlp_only_layers=[] → 第 0 层就是 MoE
+    # 验证 is_moe_layer(i) 在所有层都为 True
+    assert all(m.is_moe_layer(i) for i in range(m.num_layers))
+
+
+def test_deepseek_naming_still_works():
+    """DeepSeek 命名 (n_routed_experts / n_shared_experts / first_k_dense_replace) 不能破坏。"""
+    hf = SimpleNamespace(
+        model_type="qwen3_moe",        # 用 qwen adapter, 但字段名走 DeepSeek 路径
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        hidden_size=2048,
+        num_hidden_layers=24,
+        intermediate_size=8192,
+        vocab_size=102400,
+        head_dim=128,
+        n_routed_experts=64,
+        num_experts_per_tok=6,
+        moe_intermediate_size=1024,
+        n_shared_experts=2,
+        first_k_dense_replace=3,
+    )
+    bundle = extract_profile_bundle(_make_vllm_config(hf, "fake-deepseek-like"))
+    m = bundle.model
+    assert m.is_moe
+    assert m.num_experts == 64
+    assert m.num_shared_experts == 2
+    assert m.first_moe_layer == 3      # 前 3 层是 dense
+
+
+def test_qwen_shared_expert_intermediate_size_derived():
+    """Qwen 旧 MoE (Qwen2-MoE) 用 shared_expert_intermediate_size, n_shared 推算得到。"""
+    hf = SimpleNamespace(
+        model_type="qwen2_moe",
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        hidden_size=2048,
+        num_hidden_layers=24,
+        intermediate_size=8192,
+        vocab_size=102400,
+        head_dim=128,
+        num_experts=60,
+        num_experts_per_tok=4,
+        moe_intermediate_size=1408,
+        shared_expert_intermediate_size=2816,   # = 2 × moe_intermediate_size
+    )
+    bundle = extract_profile_bundle(_make_vllm_config(hf, "fake-qwen2-moe"))
+    m = bundle.model
+    assert m.is_moe
+    assert m.num_experts == 60
+    assert m.num_shared_experts == 2   # 2816 / 1408 = 2
+
+
 def test_extracted_backend_profile_for_no_attention_config():
     """attention_config 缺失时 fallback 到 flash_attn_auto / unified_ragged。"""
     hf = SimpleNamespace(

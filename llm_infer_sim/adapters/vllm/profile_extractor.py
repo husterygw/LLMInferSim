@@ -111,13 +111,31 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
     explicit_head_dim = getattr(hf, "head_dim", 0) or 0
     head_dim = explicit_head_dim if explicit_head_dim > 0 else head_dim_default
 
-    # MoE 字段 (阶段 5+)
-    n_routed = getattr(hf, "n_routed_experts", 0) or 0
+    # MoE 字段 (阶段 5+): 兼容 DeepSeek 与 Qwen 两种命名
+    #   DeepSeek-V2/V3: n_routed_experts / n_shared_experts / first_k_dense_replace
+    #   Qwen2-MoE / Qwen3-MoE: num_experts / shared_expert_intermediate_size / mlp_only_layers
+    n_routed = (
+        getattr(hf, "n_routed_experts", 0)
+        or getattr(hf, "num_experts", 0)
+        or 0
+    )
     is_moe = n_routed > 0
     num_activated = getattr(hf, "num_experts_per_tok", 0) or 0
     expert_dim = getattr(hf, "moe_intermediate_size", 0) or 0
-    n_shared = getattr(hf, "n_shared_experts", 0) or 0
+    # n_shared: DeepSeek 显式给数, Qwen 用 shared_expert_intermediate_size / expert_dim 推算
+    n_shared_explicit = getattr(hf, "n_shared_experts", 0) or 0
+    shared_intermediate = getattr(hf, "shared_expert_intermediate_size", 0) or 0
+    if n_shared_explicit:
+        n_shared = n_shared_explicit
+    elif shared_intermediate > 0 and expert_dim > 0:
+        n_shared = shared_intermediate // expert_dim
+    else:
+        n_shared = 0
+    # first_moe_layer: DeepSeek 用 first_k_dense_replace, Qwen 用 mlp_only_layers (列表)
     first_k_dense = getattr(hf, "first_k_dense_replace", 0) or 0
+    if first_k_dense == 0:
+        mlp_only = getattr(hf, "mlp_only_layers", None) or []
+        first_k_dense = (max(mlp_only) + 1) if mlp_only else 0
 
     # MLA 字段 (阶段 8+)
     kv_lora_rank = getattr(hf, "kv_lora_rank", 0) or 0

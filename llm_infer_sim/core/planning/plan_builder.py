@@ -67,10 +67,12 @@ def build_mixed_plan(
     )
     ctx_len = workload.max_context_len
 
+    moe_routing = bundle.backend.moe_routing
     for layer_idx in range(model.num_layers):
         if model.is_moe_layer(layer_idx):
             lr = moe_layer_time(layer_idx, "prefill", total_tokens,
-                                ctx_len, model, deploy_merged, hw)
+                                ctx_len, model, deploy_merged, hw,
+                                moe_routing_skew=moe_routing.get_skew_for_layer(layer_idx))
         else:
             lr = dense_layer_time(layer_idx, "prefill", total_tokens,
                                   ctx_len, model, deploy_merged, hw)

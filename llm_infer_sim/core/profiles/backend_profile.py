@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from llm_infer_sim.core.cost_model.moe_routing import MoERoutingPolicy
+
 
 @dataclass
 class MixedAttentionPolicy:
@@ -70,6 +72,8 @@ class BackendExecutionProfile:
     name: str = "flash_attn_paged"
     mixed_attention: MixedAttentionPolicy = field(default_factory=MixedAttentionPolicy)
     dense_gemm: DenseGemmPolicy = field(default_factory=DenseGemmPolicy)
+    # 阶段 5-δ: MoE 路由建模 (默认 skew=0.0 = uniform, 阶段 X calibrate)
+    moe_routing: MoERoutingPolicy = field(default_factory=MoERoutingPolicy)
 
 
 def default_backend_profile() -> BackendExecutionProfile:

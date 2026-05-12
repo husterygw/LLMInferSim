@@ -387,8 +387,14 @@ def _build_moe_ffn_block(
     model: ModelConfig,
     deploy: DeployConfig,
     hw: HardwareConfig,
+    moe_routing_skew: float = 0.0,
 ) -> list[OperatorProfile]:
-    """Build MoE FFN sub-block operators."""
+    """Build MoE FFN sub-block operators.
+
+    Args:
+        moe_routing_skew: 路由偏度 ∈ [0, 1] 用于 estimate_distinct_experts。
+                          0=uniform (默认, 阶段 0-9 哲学), 1=极端 imbalance。
+    """
     tp = deploy.tp
     ep = deploy.ep
     h = model.hidden_dim
@@ -432,8 +438,18 @@ def _build_moe_ffn_block(
     else:
         expert_precision = ""  # follow global quantization settings
 
-    # Roofline load_weight: per rank, only top_k/ep activated experts are read
-    expert_weight_read = int(top_k * 3 * h * expert_dim_per_device * expert_w_byte / ep)
+    # Roofline load_weight: per rank, only *distinct* activated experts are read.
+    # 阶段 5-δ: 用 coupon collector (+ skew interp) 替换硬编码 top_k —— 因为单 step 内
+    # tokens × top_k 路由总数往往覆盖比 top_k 多得多的 distinct experts。
+    # tokens=1 + skew=0 时 distinct == top_k (退化到旧行为, decode 边界正确)。
+    # 大 tokens + skew=0 时 distinct → num_experts (prefill 全 sweep, 真实贴近)。
+    from llm_infer_sim.core.cost_model.moe_routing import estimate_distinct_experts
+    distinct_experts = estimate_distinct_experts(
+        tokens, top_k, model.num_experts, skew=moe_routing_skew
+    )
+    expert_weight_read = int(
+        distinct_experts * 3 * h * expert_dim_per_device * expert_w_byte / ep
+    )
     # Activation IO:
     # - TP only (ep=1): all tokens are replicated on every device; each token's
     #   activation is read once regardless of top_k (the dispatch is local).
@@ -572,11 +588,15 @@ def moe_layer_time(
     model: ModelConfig,
     deploy: DeployConfig,
     hw: HardwareConfig,
+    moe_routing_skew: float = 0.0,
 ) -> LayerResult:
-    """Compute timing for a MoE transformer layer (§8.5.2)."""
+    """Compute timing for a MoE transformer layer (§8.5.2).
+
+    moe_routing_skew: 路由偏度 ∈ [0, 1], 透传给 _build_moe_ffn_block。
+    """
     ops = []
     ops.extend(_build_attention_block(stage, tokens, ctx_len, model, deploy, hw, layer_idx))
-    ops.extend(_build_moe_ffn_block(tokens, model, deploy, hw))
+    ops.extend(_build_moe_ffn_block(tokens, model, deploy, hw, moe_routing_skew))
 
     t_compute, t_comm = _compute_layer_time(ops, hw, deploy)
 

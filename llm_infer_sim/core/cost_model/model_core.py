@@ -271,10 +271,12 @@ class ModelCoreCostModel:
         total_comm = 0.0
         total_time = 0.0
 
+        moe_routing = self.bundle.backend.moe_routing
         for layer_idx in range(self.model_cfg.num_layers):
             if self.model_cfg.is_moe_layer(layer_idx):
                 lr = moe_layer_time(layer_idx, stage, tokens_for_stage,
-                                    ctx_len, self.model_cfg, deploy, self.hw)
+                                    ctx_len, self.model_cfg, deploy, self.hw,
+                                    moe_routing_skew=moe_routing.get_skew_for_layer(layer_idx))
             else:
                 lr = dense_layer_time(layer_idx, stage, tokens_for_stage,
                                       ctx_len, self.model_cfg, deploy, self.hw)
