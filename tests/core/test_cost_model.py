@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from llm_infer_sim.core.cost_model.model_core import ModelCoreCostModel
-from llm_infer_sim.core.profiles.profile_manager import ProfileManager
+from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
 from llm_infer_sim.core.workload.workload import (
     GlobalStepWorkload,
     RequestWorkload,
@@ -31,7 +31,7 @@ def opt125m_bundle():
         num_attention_heads=12, hidden_size=768, num_hidden_layers=12,
         ffn_dim=3072, vocab_size=50272,
     )
-    return ProfileManager.from_vllm_config(_make_vllm_config(hf, "opt-125m"))
+    return extract_profile_bundle(_make_vllm_config(hf, "opt-125m"))
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def qwen3_4b_bundle():
         hidden_size=2560, num_hidden_layers=36,
         intermediate_size=9728, vocab_size=151936, head_dim=128,
     )
-    return ProfileManager.from_vllm_config(_make_vllm_config(hf, "Qwen3-4B"))
+    return extract_profile_bundle(_make_vllm_config(hf, "Qwen3-4B"))
 
 
 def _make_prefill_workload(prefill_tokens=7, num_requests=1):

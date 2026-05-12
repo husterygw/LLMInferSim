@@ -20,7 +20,7 @@ from llm_infer_sim.core.profiles.backend_profile import (
     BackendExecutionProfile,
     MixedAttentionPolicy,
 )
-from llm_infer_sim.core.profiles.profile_manager import ProfileManager
+from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
 
 
 def _make_vllm_config(hf, model_id="dummy"):
@@ -41,7 +41,7 @@ def qwen3_4b_bundle():
         hidden_size=2560, num_hidden_layers=36,
         intermediate_size=9728, vocab_size=151936, head_dim=128,
     )
-    return ProfileManager.from_vllm_config(_make_vllm_config(hf, "Qwen3-4B"))
+    return extract_profile_bundle(_make_vllm_config(hf, "Qwen3-4B"))
 
 
 def _make_estimator(bundle, mode: str, ragged_efficiency: float = 1.0):

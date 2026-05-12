@@ -4,7 +4,7 @@
   ─ 弃用阶段 1 手写的 _build_layer_ops (通用 dense decoder 简化模板, 漏 SwiGLU gate)
   ─ 改调 llm-viewer 的 dense_layer_time / moe_layer_time
   ─ ModelConfig 上的真实分支 (V3 MLA / V4 sparse / MoE) 都跟着免费来 ——
-    阶段 5/8/9 大部分工作变成 "ProfileManager 解析新字段", 而不是 "建 cost model"
+    阶段 5/8/9 大部分工作变成 "adapter profile_extractor 解析新字段", 而不是 "建 cost model"
 
 能力清单:
   ✓ MHA / GQA dense decoder: pure prefill / pure decode

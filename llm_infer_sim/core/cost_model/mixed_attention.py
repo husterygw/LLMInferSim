@@ -9,7 +9,8 @@
 设计原则:
   同一份 vLLM trace 在不同 attention backend 下成本不同, 必须由
   BackendExecutionProfile.mixed_attention.mode dispatch, 不在 cost model 写死。
-  mode 由 §4.8.1.1 infer_backend_profile_from_vllm() 从 vllm_config 推导。
+  mode 由 §4.8.1.1 adapters/vllm/profile_extractor._extract_backend_profile()
+  从 vllm_config 推导 (core 完全框架无关, 详设 §1.1)。
 """
 from __future__ import annotations
 

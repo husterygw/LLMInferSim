@@ -168,23 +168,23 @@ class VirtualPlatform(Platform):
         attn_cfg = getattr(vllm_config, "attention_config", None)
         backend = getattr(attn_cfg, "backend", None) if attn_cfg is not None else None
         if backend is not None:
-            from llm_infer_sim.core.profiles.backend_profile import (
-                _BACKEND_MODE_MAP,
-                _UNSUPPORTED_BACKENDS,
+            from llm_infer_sim.adapters.vllm.profile_extractor import (
+                _VLLM_BACKEND_MODE_MAP,
+                _VLLM_UNSUPPORTED_BACKENDS,
             )
             name = backend.name
-            if name in _UNSUPPORTED_BACKENDS:
+            if name in _VLLM_UNSUPPORTED_BACKENDS:
                 errors.append(
                     f"Attention backend {name} is not supported (阶段 3.5): "
                     f"本系统当前仅支持 NVIDIA CUDA / FlashInfer 系列。"
-                    f"已支持: {sorted(_BACKEND_MODE_MAP.keys())}。"
+                    f"已支持: {sorted(_VLLM_BACKEND_MODE_MAP.keys())}。"
                     f"替代: 设置 VLLM_ATTENTION_BACKEND=FLASH_ATTN 或留空走默认。"
                 )
-            elif name not in _BACKEND_MODE_MAP:
+            elif name not in _VLLM_BACKEND_MODE_MAP:
                 errors.append(
                     f"Unknown attention backend {name} (新 enum, 未在 §4.8.1.1 "
-                    f"_BACKEND_MODE_MAP 中映射)。请在 backend_profile.py 加映射, "
-                    f"或临时设置 VLLM_ATTENTION_BACKEND=FLASH_ATTN 绕过。"
+                    f"_VLLM_BACKEND_MODE_MAP 中映射)。请在 adapters/vllm/profile_extractor.py "
+                    f"加映射, 或临时设置 VLLM_ATTENTION_BACKEND=FLASH_ATTN 绕过。"
                 )
 
         if errors:

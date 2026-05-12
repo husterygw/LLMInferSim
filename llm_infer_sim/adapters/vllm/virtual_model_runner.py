@@ -1,10 +1,14 @@
 """VirtualModelRunner — 阶段 2: 接 llm-viewer builder。
 
 阶段 2 增量 (vs 阶段 1):
-  - 用 ProfileManager.from_vllm_config 一次构造 ProfileBundle
+  - 用 adapters/vllm/profile_extractor.extract_profile_bundle 一次构造 ProfileBundle
     (ModelConfig + DeployConfig + HardwareConfig + EfficiencyProfile)
   - 弃用阶段 1 手写的 model_meta 抽取 (只 7 个字段, 漏 head_dim explicit / MLA / MoE)
   - ModelCoreCostModel 改接 ProfileBundle, 内部走 llm-viewer dense/moe_layer_time
+
+阶段 3.5 重构:
+  - ProfileManager.from_vllm_config 改名为 extract_profile_bundle, 实现搬到
+    adapters/vllm/profile_extractor.py (core 完全框架无关, 详设 §1.1)
 
 阶段 3+ 起:
   - chunked prefill mixed step (MixedAttentionEstimator)
@@ -20,13 +24,13 @@ from typing import Any
 from vllm.config import VllmConfig
 from vllm.v1.outputs import ModelRunnerOutput
 
+from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
 from llm_infer_sim.adapters.vllm.step_extractor import VllmStepExtractor
 from llm_infer_sim.core.cost_model.cost_result import GlobalStepCost
 from llm_infer_sim.core.cost_model.model_core import ModelCoreCostModel
 from llm_infer_sim.core.metrics.breakdown import format_step_breakdown
 from llm_infer_sim.core.metrics.collector import MetricsCollector
 from llm_infer_sim.core.metrics.reporter import ReportGenerator
-from llm_infer_sim.core.profiles.profile_manager import ProfileManager
 from llm_infer_sim.core.simulation.time_emulator import VirtualTimeEmulator
 from llm_infer_sim.core.workload.workload import GlobalStepWorkload
 
@@ -42,7 +46,7 @@ class VirtualModelRunner:
         self.vllm_config = vllm_config
 
         # ---- 1. ProfileBundle (ModelConfig + DeployConfig + hw + efficiency) ----
-        self.bundle = ProfileManager.from_vllm_config(vllm_config)
+        self.bundle = extract_profile_bundle(vllm_config)
 
         # ---- 2. cost model (走 llm-viewer dense/moe_layer_time) ----
         self.model_cost = ModelCoreCostModel(self.bundle)

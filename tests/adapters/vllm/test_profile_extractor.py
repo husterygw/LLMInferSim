@@ -1,18 +1,16 @@
-"""ProfileManager.from_vllm_config 解析正确性。
+"""extract_profile_bundle 解析正确性 (阶段 3.5 重构后从 ProfileManager 改名)。
 
 不依赖 vLLM 真实 LLM 实例 —— 用 mock VllmConfig (只需要 model_config /
-parallel_config 两个子对象)。
+parallel_config / attention_config 三个子对象)。
 """
 from types import SimpleNamespace
 
-from llm_infer_sim.core.profiles.profile_manager import (
-    ProfileBundle,
-    ProfileManager,
-)
+from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
+from llm_infer_sim.core.profiles.profile_manager import ProfileBundle
 
 
 def _make_vllm_config(hf_config, model_id="dummy"):
-    """合成最小 VllmConfig 形态: 只暴露 ProfileManager 用到的子字段。"""
+    """合成最小 VllmConfig 形态: 只暴露 extract_profile_bundle 用到的子字段。"""
     model_config = SimpleNamespace(
         hf_config=hf_config,
         model=model_id,
@@ -28,7 +26,7 @@ def _make_vllm_config(hf_config, model_id="dummy"):
 
 
 def test_qwen3_4b_parse():
-    """阶段 2 退出条件: ProfileManager 能正确解析 Qwen3 hf_config."""
+    """阶段 2 退出条件: 能正确解析 Qwen3 hf_config."""
     hf = SimpleNamespace(
         model_type="qwen3",
         num_attention_heads=32,
@@ -40,7 +38,7 @@ def test_qwen3_4b_parse():
         head_dim=128,                # Qwen3 显式 head_dim ≠ hidden / num_heads
     )
     vllm_cfg = _make_vllm_config(hf, model_id="Qwen/Qwen3-4B-Instruct-2507")
-    bundle = ProfileManager.from_vllm_config(vllm_cfg)
+    bundle = extract_profile_bundle(vllm_cfg)
 
     assert isinstance(bundle, ProfileBundle)
     m = bundle.model
@@ -66,7 +64,7 @@ def test_opt125m_parse():
         vocab_size=50272,
     )
     vllm_cfg = _make_vllm_config(hf, model_id="facebook/opt-125m")
-    bundle = ProfileManager.from_vllm_config(vllm_cfg)
+    bundle = extract_profile_bundle(vllm_cfg)
 
     m = bundle.model
     assert m.num_layers == 12
@@ -85,7 +83,7 @@ def test_efficiency_placeholder_all_ones():
         num_attention_heads=12, hidden_size=768, num_hidden_layers=12,
         ffn_dim=3072, vocab_size=50272,
     )
-    bundle = ProfileManager.from_vllm_config(_make_vllm_config(hf))
+    bundle = extract_profile_bundle(_make_vllm_config(hf))
     assert bundle.efficiency.compute_efficiency == 1.0
     assert bundle.efficiency.mem_efficiency == 1.0
     assert bundle.efficiency.comm_efficiency == 1.0
@@ -99,4 +97,17 @@ def test_unsupported_model_raises():
 
     hf = SimpleNamespace(model_type="nonexistent_family")
     with pytest.raises(UnsupportedModelError):
-        ProfileManager.from_vllm_config(_make_vllm_config(hf))
+        extract_profile_bundle(_make_vllm_config(hf))
+
+
+def test_extracted_backend_profile_for_no_attention_config():
+    """attention_config 缺失时 fallback 到 flash_attn_auto / unified_ragged。"""
+    hf = SimpleNamespace(
+        model_type="qwen3",
+        num_attention_heads=32, num_key_value_heads=8,
+        hidden_size=2560, num_hidden_layers=36,
+        intermediate_size=9728, vocab_size=151936, head_dim=128,
+    )
+    bundle = extract_profile_bundle(_make_vllm_config(hf))
+    assert bundle.backend.name == "flash_attn_auto"
+    assert bundle.backend.mixed_attention.mode == "unified_ragged"
