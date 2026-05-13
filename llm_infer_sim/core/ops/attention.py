@@ -43,33 +43,23 @@ def attention_decode_standard(
     head_size: int,
     a_byte: float,
     kv_byte: float,
-    kv_latent_dim: int | None = None,
-    kv_lora_rank: int | None = None,
 ) -> list[OperatorProfile]:
-    """Standard (non-flash) decode attention: returns [qk_matmul, sv_matmul, softmax]."""
-    is_mla = kv_latent_dim is not None and kv_latent_dim > 0
-    if is_mla:
-        _qk = kv_latent_dim        # absorbed Q dim for QK
-        _sv = kv_lora_rank or kv_latent_dim  # c_kv dim for SV
-    else:
-        _qk = head_size
-        _sv = head_size
+    """Standard (non-flash) decode attention for MHA/GQA: [qk_matmul, sv_matmul, softmax].
+
+    MLA decode 用专用 `attention_decode_mla` (FlashMLA kernel, kv-absorbed),
+    不走本函数。
+    """
+    _qk = head_size
+    _sv = head_size
 
     qk_ops = seqlen * _qk * num_attention_heads * batchsize * 2
     sv_ops = 1 * _sv * seqlen * num_attention_heads * batchsize * 2
     softmax_ops = batchsize * num_attention_heads * seqlen * 1 * 5
 
-    if is_mla:
-        # MLA decode: compressed KV cache is a single tensor (kv_latent_dim per position)
-        qk_kv_io = int(seqlen * kv_latent_dim * batchsize * kv_byte)
-        sv_kv_io = int(seqlen * _sv * batchsize * kv_byte)
-        q_io = int(1 * _qk * batchsize * num_attention_heads * a_byte)
-        o_io = int(1 * _sv * batchsize * num_attention_heads * a_byte)
-    else:
-        qk_kv_io = int(seqlen * head_size * batchsize * num_key_value_heads * kv_byte)
-        sv_kv_io = int(seqlen * head_size * batchsize * num_key_value_heads * kv_byte)
-        q_io = int(1 * head_size * batchsize * num_attention_heads * a_byte)
-        o_io = int(1 * head_size * batchsize * num_attention_heads * a_byte)
+    qk_kv_io = int(seqlen * head_size * batchsize * num_key_value_heads * kv_byte)
+    sv_kv_io = int(seqlen * head_size * batchsize * num_key_value_heads * kv_byte)
+    q_io = int(1 * head_size * batchsize * num_attention_heads * a_byte)
+    o_io = int(1 * head_size * batchsize * num_attention_heads * a_byte)
 
     qk = OperatorProfile(
         name="qk_matmul",
@@ -106,17 +96,14 @@ def attention_decode_flash(
     a_byte: float,
     kv_byte: float,
     onchip_buffer: float,
-    kv_latent_dim: int | None = None,
-    kv_lora_rank: int | None = None,
 ) -> list[OperatorProfile]:
-    """FlashAttention-2 fused decode attention."""
-    is_mla = kv_latent_dim is not None and kv_latent_dim > 0
-    if is_mla:
-        _qk = kv_latent_dim        # absorbed Q dim for QK
-        _sv = kv_lora_rank or kv_latent_dim  # c_kv dim for SV
-    else:
-        _qk = head_size
-        _sv = head_size
+    """FlashAttention-2 fused decode attention for MHA/GQA.
+
+    MLA decode 用专用 `attention_decode_mla` (FlashMLA kernel, kv-absorbed),
+    不走本函数。
+    """
+    _qk = head_size
+    _sv = head_size
 
     qk_ops = seqlen * _qk * num_attention_heads * batchsize * 2
     sv_ops = 1 * _sv * seqlen * num_attention_heads * batchsize * 2
@@ -127,14 +114,57 @@ def attention_decode_flash(
     q_numel = 1 * _qk * batchsize * num_attention_heads * a_byte
     o_numel = 1 * _sv * batchsize * num_attention_heads * a_byte
 
-    if is_mla:
-        # MLA decode: compressed KV cache is a single tensor (kv_latent_dim per position)
-        kv_io = int(n_blocks_r * seqlen * kv_latent_dim * batchsize * kv_byte)
-    else:
-        kv_io = int(n_blocks_r * seqlen * head_size * batchsize * num_key_value_heads * kv_byte * 2)
+    kv_io = int(n_blocks_r * seqlen * head_size * batchsize * num_key_value_heads * kv_byte * 2)
 
     fused = OperatorProfile(
         name="fused_attention",
+        op_category="attention",
+        flops=qk_ops + sv_ops + softmax_ops,
+        load_act=int(q_numel),
+        store_act=int(o_numel * 2),
+        load_kv_cache=kv_io,
+    )
+    return [fused]
+
+
+def attention_decode_mla(
+    ctx_len: int,
+    batchsize: int,
+    num_attention_heads: int,
+    kv_latent_dim: int,
+    kv_lora_rank: int,
+    a_byte: float,
+    kv_byte: float,
+    onchip_buffer: float,
+) -> list[OperatorProfile]:
+    """FlashMLA fused decode attention (DeepSeek-V2/V3, kv-absorbed).
+
+    vLLM 真实路径 (`/vllm/v1/attention/ops/flashmla.py` 调 FlashMLA kernel):
+      - KV cache 存 c_kv (kv_latent_dim = kv_lora_rank + qk_rope_head_dim, single-head)
+      - Q 投到 absorbed 维 (kv_latent_dim), 跟 cache 算 dot → softmax →
+        scores × c_kv (kv_lora_rank) → output (per-head v dim)
+      - 跟 MHA/GQA FlashAttention-2 的差异:
+          * QK matmul: Q[heads, kv_latent_dim] × K[seqlen, kv_latent_dim], 不切 head_dim
+          * SV matmul: S[heads, seqlen] × V[seqlen, kv_lora_rank], 共享 V (single head)
+          * KV cache IO = seqlen × kv_latent_dim × kv_byte (NO num_kv_heads 因子)
+    """
+    _qk = kv_latent_dim                  # absorbed Q dim for QK
+    _sv = kv_lora_rank or kv_latent_dim  # c_kv dim for SV output
+
+    qk_ops = ctx_len * _qk * num_attention_heads * batchsize * 2
+    sv_ops = 1 * _sv * ctx_len * num_attention_heads * batchsize * 2
+    softmax_ops = batchsize * num_attention_heads * ctx_len * 1 * 5
+
+    block_size_r = min(math.ceil(onchip_buffer / (kv_byte * _qk)), _qk)
+    n_blocks_r = math.ceil(1 / block_size_r)
+    q_numel = 1 * _qk * batchsize * num_attention_heads * a_byte
+    o_numel = 1 * _sv * batchsize * num_attention_heads * a_byte
+
+    # MLA cache: single-head c_kv per position, dim = kv_latent_dim.
+    kv_io = int(n_blocks_r * ctx_len * kv_latent_dim * batchsize * kv_byte)
+
+    fused = OperatorProfile(
+        name="fused_mla_attention",
         op_category="attention",
         flops=qk_ops + sv_ops + softmax_ops,
         load_act=int(q_numel),
@@ -152,15 +182,13 @@ def attention_prefill_standard(
     head_size: int,
     a_byte: float,
     kv_byte: float,
-    qk_head_dim: int | None = None,
-    v_head_dim: int | None = None,
 ) -> list[OperatorProfile]:
-    """Standard (non-flash) prefill attention: returns [qk_matmul, sv_matmul, softmax]."""
-    _qk = qk_head_dim if qk_head_dim is not None else head_size
-    _v = v_head_dim if v_head_dim is not None else head_size
-    is_mla = qk_head_dim is not None
-    # MLA prefill: after kv_b_proj decompression, K/V are MHA (kv_heads = num_heads)
-    kv_heads = num_attention_heads if is_mla else num_key_value_heads
+    """Standard (non-flash) prefill attention for MHA/GQA: [qk_matmul, sv_matmul, softmax].
+
+    MLA prefill 用专用 `attention_prefill_mla`, 不走本函数。
+    """
+    _qk = head_size
+    _v = head_size
 
     qk_ops = seqlen * seqlen * _qk * num_attention_heads * batchsize * 2
     sv_ops = seqlen * _v * seqlen * num_attention_heads * batchsize * 2
@@ -172,7 +200,7 @@ def attention_prefill_standard(
         flops=qk_ops,
         load_act=int(seqlen * _qk * batchsize * num_attention_heads * a_byte),
         store_act=int(seqlen * _qk * batchsize * num_attention_heads * a_byte),
-        load_kv_cache=int(seqlen * _qk * batchsize * kv_heads * kv_byte),
+        load_kv_cache=int(seqlen * _qk * batchsize * num_key_value_heads * kv_byte),
     )
     sv = OperatorProfile(
         name="sv_matmul",
@@ -180,7 +208,7 @@ def attention_prefill_standard(
         flops=sv_ops,
         load_act=int(seqlen * seqlen * batchsize * num_attention_heads * a_byte),
         store_act=int(seqlen * _v * batchsize * num_attention_heads * a_byte),
-        load_kv_cache=int(seqlen * _v * batchsize * kv_heads * kv_byte),
+        load_kv_cache=int(seqlen * _v * batchsize * num_key_value_heads * kv_byte),
     )
     soft = OperatorProfile(
         name="softmax",
@@ -201,13 +229,13 @@ def attention_prefill_flash(
     a_byte: float,
     kv_byte: float,
     onchip_buffer: float,
-    qk_head_dim: int | None = None,
-    v_head_dim: int | None = None,
 ) -> list[OperatorProfile]:
-    """FlashAttention-2 fused prefill attention."""
-    _qk = qk_head_dim if qk_head_dim is not None else head_size
-    _v = v_head_dim if v_head_dim is not None else head_size
-    is_mla = qk_head_dim is not None
+    """FlashAttention-2 fused prefill attention for MHA/GQA.
+
+    MLA prefill 用专用 `attention_prefill_mla`, 不走本函数。
+    """
+    _qk = head_size
+    _v = head_size
 
     qk_ops = seqlen * seqlen * _qk * num_attention_heads * batchsize * 2
     sv_ops = seqlen * _v * seqlen * num_attention_heads * batchsize * 2
@@ -218,17 +246,165 @@ def attention_prefill_flash(
     q_numel = seqlen * _qk * batchsize * num_attention_heads * a_byte
     o_numel = seqlen * _v * batchsize * num_attention_heads * a_byte
 
-    if is_mla:
-        # MLA prefill: after kv_b_proj, K[qk_dim] and V[v_dim] are MHA (num_heads per TP)
-        kv_io = int(n_blocks_r * seqlen * (_qk + _v) * batchsize * num_attention_heads * kv_byte)
-    else:
-        kv_io = int(n_blocks_r * seqlen * head_size * batchsize * num_key_value_heads * kv_byte * 2)
+    kv_io = int(n_blocks_r * seqlen * head_size * batchsize * num_key_value_heads * kv_byte * 2)
 
     fused = OperatorProfile(
         name="fused_attention",
         op_category="attention",
         flops=qk_ops + sv_ops + softmax_ops,
         load_act=int(q_numel),
+        store_act=int(o_numel * 2),
+        load_kv_cache=kv_io,
+    )
+    return [fused]
+
+
+def attention_decode_mla_sparse(
+    ctx_len: int,
+    batchsize: int,
+    num_attention_heads: int,
+    kv_latent_dim: int,
+    kv_lora_rank: int,
+    index_topk: int,
+    a_byte: float,
+    kv_byte: float,
+    onchip_buffer: float,
+) -> list[OperatorProfile]:
+    """DSA decode attention (DeepSeek-V3.2-Exp, sparse MLA + FlashMLA).
+
+    跟 `attention_decode_mla` 的区别: attended_len = min(ctx_len, index_topk) 而非 ctx_len.
+    Indexer 选出 top-k positions, 主 attention 只在这 top-k 上做 (vLLM FlashMLASparse).
+    其余公式 (kv-absorbed Q[kv_latent_dim] × K[kv_latent_dim], SV with c_kv) 跟 MLA 一致.
+    """
+    attended = min(ctx_len, index_topk) if index_topk > 0 else ctx_len
+    _qk = kv_latent_dim
+    _sv = kv_lora_rank or kv_latent_dim
+
+    qk_ops = attended * _qk * num_attention_heads * batchsize * 2
+    sv_ops = 1 * _sv * attended * num_attention_heads * batchsize * 2
+    softmax_ops = batchsize * num_attention_heads * attended * 1 * 5
+
+    block_size_r = min(math.ceil(onchip_buffer / (kv_byte * _qk)), _qk)
+    n_blocks_r = math.ceil(1 / block_size_r)
+    q_numel = 1 * _qk * batchsize * num_attention_heads * a_byte
+    o_numel = 1 * _sv * batchsize * num_attention_heads * a_byte
+    # Cache 读量按 sparse attended (top-k 选中的 c_kv positions).
+    kv_io = int(n_blocks_r * attended * kv_latent_dim * batchsize * kv_byte)
+
+    fused = OperatorProfile(
+        name="fused_mla_sparse_attention",
+        op_category="attention",
+        flops=qk_ops + sv_ops + softmax_ops,
+        load_act=int(q_numel),
+        store_act=int(o_numel * 2),
+        load_kv_cache=kv_io,
+    )
+    return [fused]
+
+
+def attention_prefill_mla_sparse(
+    seqlen: int,
+    batchsize: int,
+    num_attention_heads: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    kv_latent_dim: int,
+    index_topk: int,
+    a_byte: float,
+    kv_byte: float,
+    onchip_buffer: float,
+    prior_ctx_tokens: int = 0,
+) -> list[OperatorProfile]:
+    """DSA prefill attention (DeepSeek-V3.2-Exp, sparse MLA).
+
+    跟 `attention_prefill_mla` 的区别: per-query attended 上界 = index_topk (而非 seqlen+prior_ctx).
+    总 attended = sum over query pos of min(pos+1+prior_ctx, index_topk).
+    简化: 用 avg attended ≈ min((seqlen+1)/2 + prior_ctx, index_topk) 作为 per-pos 平均.
+    总 attended_sum = seqlen × avg_attended.
+    """
+    avg_ctx = (seqlen + 1) / 2 + prior_ctx_tokens
+    avg_attended = min(avg_ctx, float(index_topk)) if index_topk > 0 else avg_ctx
+    attended_sum = int(seqlen * avg_attended)
+
+    qk_ops = int(attended_sum * qk_head_dim * num_attention_heads * batchsize * 2)
+    sv_ops = int(attended_sum * v_head_dim * num_attention_heads * batchsize * 2)
+    softmax_ops = int(batchsize * num_attention_heads * attended_sum * 5)
+
+    block_size_r = min(math.ceil(onchip_buffer / (kv_byte * qk_head_dim)), qk_head_dim)
+    n_blocks_r = math.ceil(seqlen / block_size_r)
+    q_numel = seqlen * qk_head_dim * batchsize * num_attention_heads * a_byte
+    o_numel = seqlen * v_head_dim * batchsize * num_attention_heads * a_byte
+    # K/V staging activation (sparse: 只读 top-k 选中的 c_kv 重算 K/V, 不是全 ctx).
+    # 跟 dense MLA 一样: K/V 是 kv_b_proj 输出, MHA 形状 × avg_attended.
+    kv_staging_act = int(
+        n_blocks_r * avg_attended * (qk_head_dim + v_head_dim) * batchsize * num_attention_heads * a_byte
+    )
+    # Prior ctx cache 读 (c_kv single-head), 同样受 index_topk 限制.
+    if prior_ctx_tokens > 0:
+        prior_attended = min(prior_ctx_tokens, index_topk) if index_topk > 0 else prior_ctx_tokens
+        kv_io = int(prior_attended * kv_latent_dim * batchsize * kv_byte)
+    else:
+        kv_io = 0
+
+    fused = OperatorProfile(
+        name="fused_mla_sparse_attention",
+        op_category="attention",
+        flops=qk_ops + sv_ops + softmax_ops,
+        load_act=int(q_numel + kv_staging_act),
+        store_act=int(o_numel * 2),
+        load_kv_cache=kv_io,
+    )
+    return [fused]
+
+
+def attention_prefill_mla(
+    seqlen: int,
+    batchsize: int,
+    num_attention_heads: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    kv_latent_dim: int,
+    a_byte: float,
+    kv_byte: float,
+    onchip_buffer: float,
+    prior_ctx_tokens: int = 0,
+) -> list[OperatorProfile]:
+    """MLA prefill attention (DeepSeek-V2/V3, FlashAttn-2 with diff_headdims).
+
+    vLLM 真实路径 (`mla_attention.py:2341-2355` `_run_prefill_new_tokens_fa` →
+    `flash_attn_varlen_diff_headdims`):
+      - 新 token prefill: K/V 来自上游 `kv_b_proj` staging activation (MHA 形状
+        [seqlen, num_heads, qk_head_dim] + [seqlen, num_heads, v_head_dim]),
+        不读 KV cache; activation IO 用 a_byte (非 kv_byte).
+      - Chunked prefill 跨 step (`mla_attention.py:2596-2650`): prior context
+        从 paged cache gather c_kv (kv_latent_dim × 1 head), 再 kv_b_proj 重算.
+        cache 读量是 c_kv 维 (single-head), 不是 decompressed K+V × num_heads.
+      - QK / SV 用 FlashAttention-2 with different headdims (qk_dim ≠ v_dim,
+        V3 是 192 vs 128); kernel 跑 MHA 形状 (num_heads × qk_dim).
+    """
+    qk_ops = seqlen * seqlen * qk_head_dim * num_attention_heads * batchsize * 2
+    sv_ops = seqlen * v_head_dim * seqlen * num_attention_heads * batchsize * 2
+    softmax_ops = batchsize * num_attention_heads * seqlen * seqlen * 5
+
+    block_size_r = min(math.ceil(onchip_buffer / (kv_byte * qk_head_dim)), qk_head_dim)
+    n_blocks_r = math.ceil(seqlen / block_size_r)
+    q_numel = seqlen * qk_head_dim * batchsize * num_attention_heads * a_byte
+    o_numel = seqlen * v_head_dim * batchsize * num_attention_heads * a_byte
+    # K/V staging activation (kv_b_proj 输出 + FlashAttn 重读 n_blocks_r 次), 走 load_act.
+    kv_staging_act = int(
+        n_blocks_r * seqlen * (qk_head_dim + v_head_dim) * batchsize * num_attention_heads * a_byte
+    )
+    # Chunked prefill prior context: 从 cache 读 c_kv (single-head latent).
+    if prior_ctx_tokens > 0:
+        kv_io = int(prior_ctx_tokens * kv_latent_dim * batchsize * kv_byte)
+    else:
+        kv_io = 0
+
+    fused = OperatorProfile(
+        name="fused_mla_attention",
+        op_category="attention",
+        flops=qk_ops + sv_ops + softmax_ops,
+        load_act=int(q_numel + kv_staging_act),
         store_act=int(o_numel * 2),
         load_kv_cache=kv_io,
     )

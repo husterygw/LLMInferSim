@@ -216,3 +216,113 @@ def test_total_attn_proj_flops_significantly_higher_than_pre_fix():
     total = sum(_find_op(lr, n).flops for n in proj_ops)
     assert total > 70e6
     assert total < 80e6  # 也别异常高
+
+
+# ------- MLA prefill flash KV IO (audit 修复后) -------
+
+def test_mla_prefill_new_token_does_not_read_kv_cache():
+    """MLA 新 token prefill 不应读 KV cache.
+
+    vLLM 真实路径: prefill 时 K/V 来自上游 kv_b_proj staging activation, 不读 cache;
+    只有 chunked prefill 跨 step 的 prior context 才读 c_kv (single-head latent).
+    旧 bug: load_kv_cache = seqlen*(_qk+_v)*num_heads*kv_byte (虚高 num_heads≈128 倍).
+    """
+    b = _deepseek_v3_bundle(tp_size=8)
+    # prefill 新 token: ctx_len == seq, prior_ctx = 0
+    lr = dense_layer_time(0, "prefill", tokens=128, ctx_len=128,
+                          model=b.model, deploy=b.deploy, hw=b.hw)
+    fused = _find_op(lr, "fused_mla_attention")
+    assert fused.load_kv_cache == 0, (
+        f"MLA new-token prefill load_kv_cache should be 0, got {fused.load_kv_cache}")
+
+
+def test_mla_prefill_kv_staging_in_load_act_not_kv_cache():
+    """MLA prefill 的 K/V staging (kv_b_proj 输出) 必须进 load_act, 用 a_byte (非 kv_byte)。"""
+    b = _deepseek_v3_bundle(tp_size=8)
+    m, deploy, hw = b.model, b.deploy, b.hw
+    lr = dense_layer_time(0, "prefill", tokens=128, ctx_len=128, model=m, deploy=deploy, hw=hw)
+    fused = _find_op(lr, "fused_mla_attention")
+    # 旧 bug 公式给的 cache IO = seqlen*(qk+v)*num_heads*kv_byte; 新公式 = 0.
+    # 同时 K/V staging activation (n_blocks_r * seqlen * (qk+v) * num_heads_per_tp * a_byte)
+    # 应该出现在 load_act 中, 远大于纯 Q activation IO.
+    heads_per_tp = m.num_heads // deploy.tp
+    qk_dim = (m.qk_nope_head_dim if m.qk_nope_head_dim > 0 else m.head_dim) + (m.rope_head_dim or 0)
+    v_dim = m.v_head_dim if m.v_head_dim > 0 else m.qk_nope_head_dim
+    # 下界: 至少包含 Q + K/V staging (n_blocks_r >= 1)
+    min_staging = int(128 * (qk_dim + v_dim) * 1 * heads_per_tp * deploy.a_byte)
+    assert fused.load_act >= min_staging, (
+        f"load_act={fused.load_act} should include K/V staging ≥ {min_staging}")
+
+
+def test_mla_prefill_chunked_reads_c_kv_cache():
+    """MLA chunked prefill 跨 step 时, prior context 应读 c_kv (single-head latent)。"""
+    b = _deepseek_v3_bundle(tp_size=8)
+    m, deploy, hw = b.model, b.deploy, b.hw
+    # 模拟 chunked prefill 第二个 chunk: seq=128 当前 chunk, ctx_len=1024 (其中 896 是 prior)
+    lr = dense_layer_time(0, "prefill", tokens=128, ctx_len=1024, model=m, deploy=deploy, hw=hw)
+    fused = _find_op(lr, "fused_mla_attention")
+    # prior_ctx = 1024 - 128 = 896, c_kv 维 = kv_latent_dim = kv_lora_rank + qk_rope = 512 + 64 = 576
+    expected_min = int(896 * 576 * 1 * deploy.kv_byte * 0.5)  # 给点容差
+    expected_max = int(896 * 576 * 1 * deploy.kv_byte * 2.0)
+    assert expected_min <= fused.load_kv_cache <= expected_max, (
+        f"chunked prefill prior cache read should be ~ {896*576*deploy.kv_byte:.0f}, "
+        f"got {fused.load_kv_cache}")
+
+
+def test_mla_prefill_kv_io_far_smaller_than_pre_fix():
+    """新公式 KV cache IO 比旧公式 (num_heads * qk+v * kv_byte) 至少小 100×.
+
+    Sanity guard 防回归: 若未来谁误恢复 num_heads 维, 这条立刻挂。
+    """
+    b = _deepseek_v3_bundle(tp_size=8)
+    m, deploy, hw = b.model, b.deploy, b.hw
+    seqlen = 128
+    lr = dense_layer_time(0, "prefill", tokens=seqlen, ctx_len=seqlen,
+                          model=m, deploy=deploy, hw=hw)
+    fused = _find_op(lr, "fused_mla_attention")
+    heads_per_tp = m.num_heads // deploy.tp  # 128/8 = 16
+    qk_dim = (m.qk_nope_head_dim or m.head_dim) + (m.rope_head_dim or 0)  # 192
+    v_dim = m.v_head_dim or m.qk_nope_head_dim  # 128
+    old_bug_io = seqlen * (qk_dim + v_dim) * heads_per_tp * deploy.kv_byte
+    # 新公式 cache IO ≈ 0 (new token); 旧 bug ~ 1.3M+; 实际差距 >> 100×
+    assert fused.load_kv_cache * 100 < old_bug_io, (
+        f"new cache_io={fused.load_kv_cache} should be << old_bug={old_bug_io} (100×)")
+
+
+def test_mla_uses_dedicated_op_not_generic_fused_attention():
+    """MLA 走专用 `fused_mla_attention` (FlashMLA decode + diff_headdim prefill),
+    跟 MHA/GQA 的 `fused_attention` 区分; 防止重构回退把 MLA 误塞回 generic flash 算子.
+    """
+    b = _deepseek_v3_bundle(tp_size=8)
+    lr_dec = dense_layer_time(0, "decode", tokens=1, ctx_len=128,
+                              model=b.model, deploy=b.deploy, hw=b.hw)
+    assert _has_op(lr_dec, "fused_mla_attention"), "MLA decode op should be fused_mla_attention"
+    assert not _has_op(lr_dec, "fused_attention"), "MLA decode must NOT use generic fused_attention"
+    lr_pre = dense_layer_time(0, "prefill", tokens=128, ctx_len=128,
+                              model=b.model, deploy=b.deploy, hw=b.hw)
+    assert _has_op(lr_pre, "fused_mla_attention"), "MLA prefill op should be fused_mla_attention"
+    assert not _has_op(lr_pre, "fused_attention"), "MLA prefill must NOT use generic fused_attention"
+
+
+def test_non_mla_prefill_kv_io_unchanged():
+    """非 MLA (GQA) prefill 的 KV cache IO 公式不应受 MLA 修复影响."""
+    hf = SimpleNamespace(
+        model_type="qwen3",
+        num_attention_heads=32, num_key_value_heads=8,
+        hidden_size=4096, num_hidden_layers=36,
+        intermediate_size=11008, vocab_size=151936,
+        head_dim=128,
+    )
+    vc = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf, model="Qwen/Qwen3-test"),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, data_parallel_size=1, enable_expert_parallel=False,
+        ),
+    )
+    b = extract_profile_bundle(vc)
+    lr = dense_layer_time(0, "prefill", tokens=128, ctx_len=128,
+                          model=b.model, deploy=b.deploy, hw=b.hw)
+    fused = _find_op(lr, "fused_attention")
+    # GQA: kv_io = n_blocks_r * seqlen * head_dim * num_kv_heads * kv_byte * 2
+    # n_blocks_r >= 1, 至少应 > 0
+    assert fused.load_kv_cache > 0, "GQA prefill should still read KV cache"

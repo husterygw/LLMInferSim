@@ -65,6 +65,30 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # ---- 3. EfficiencyProfile (placeholder 全 1.0) ----
     efficiency = EfficiencyProfile.placeholder()
 
+    # ---- 3.5. Quantization 切 w_byte/a_byte ----
+    # 从 hf_config.quantization_config 读 quant_method, 决定全局 weight/activation byte:
+    #   fp8 (V3/V4): w=1.0, activation_scheme="dynamic" → a=1.0; "static" → a 也是 1.0
+    #   fp4 / nvfp4 / mxfp4: w=0.5, a=0.5 (假设 activation 同精度)
+    #   其他 (gptq/awq/None): 不动, 沿用默认 fp16 (w=a=2.0)
+    # 注意: kv_byte 由 cache_config (KVCacheSpec) 单独控制, 这里不动.
+    qcfg = getattr(hf, "quantization_config", None) or {}
+    if isinstance(qcfg, dict):
+        quant_method = (qcfg.get("quant_method") or "").lower()
+        activation_scheme = (qcfg.get("activation_scheme") or "").lower()
+    else:
+        quant_method = (getattr(qcfg, "quant_method", "") or "").lower()
+        activation_scheme = (getattr(qcfg, "activation_scheme", "") or "").lower()
+    # vLLM 会把 model-family-specific 名字写回 (e.g. "deepseek_v4_fp8"),
+    # 不只是裸 "fp8" / "fp4"。用子串匹配兜底; "fp4" 优先匹配以免被 "fp8" 撞上.
+    if "fp4" in quant_method:
+        efficiency.w_byte = 0.5
+        efficiency.a_byte = 0.5
+    elif "fp8" in quant_method:
+        efficiency.w_byte = 1.0
+        # activation_scheme="dynamic"/"static" 都是 per-token/tensor fp8 量化
+        if activation_scheme in ("dynamic", "static"):
+            efficiency.a_byte = 1.0
+
     # ---- 4. HardwareConfig (默认 H100, env 可覆盖) ----
     hw_name = os.environ.get("LLM_INFER_SIM_HW", "H100")
     hw = get_hardware_profile(hw_name)

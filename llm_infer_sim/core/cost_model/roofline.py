@@ -71,7 +71,10 @@ class RooflineAnalyzer:
             return self.hw.effective_peak_fp4 if self.hw.has_fp4_tc else self.hw.effective_peak_flops
         if op.op_precision == "fp32":
             return self.hw.effective_vector_flops
-        if op.op_precision == "bf16":
+        if op.op_precision == "bf16" or op.op_precision == "fp16":
+            # bf16 / fp16 共用 Tensor Core 16-bit peak. 显式列 "fp16" 防止
+            # 当全局 w_bit=8 (fp8 quant) 时, 标注为 fp16 的 op 被 fall-through
+            # 错误地按 fp8 peak (≈ 2× 虚高) 算。
             return self.hw.effective_peak_flops
 
         # Element-wise ops run on CUDA cores, not tensor cores
