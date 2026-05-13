@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from llm_infer_sim.core.profiles.model_adapters import deepseek_v3 as _deepseek_v3
+from llm_infer_sim.core.profiles.model_adapters import deepseek_v4 as _deepseek_v4
 from llm_infer_sim.core.profiles.model_adapters import opt as _opt
 from llm_infer_sim.core.profiles.model_adapters import qwen as _qwen
 
@@ -26,6 +27,8 @@ ADAPTERS: dict[str, object] = {
     "qwen3": _qwen,
     "qwen3_moe": _qwen,
     "deepseek_v3": _deepseek_v3,
+    "deepseek_v32": _deepseek_v3,    # V3.2-Exp 字段基础同 V3, indexer 字段独立透传
+    "deepseek_v4": _deepseek_v4,
 }
 
 

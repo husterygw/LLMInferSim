@@ -66,6 +66,9 @@ class ModelConfig:
     # V4 expert quantization
     expert_fp4: bool = False    # Experts use FP4 weights (0.5 byte/param)
 
+    # V4 hash MoE routing: 前 num_hash_layers 层用 tid2eid lookup, 无 router GEMM (FLOPs≈0)
+    num_hash_layers: int = 0
+
     def get_compress_ratio(self, layer_idx: int) -> int:
         """Return compression ratio for a given layer index.
 

@@ -275,7 +275,9 @@ def attention_prefill_sparse(
         else:
             # HCA or no compression: attend to ALL compressed positions
             compressed_attended = all_compressed
-        attended = local_attended + compressed_attended
+        # 阶段 9 fix 17: attn_sink softmax 包含 1 个 -inf init sink token
+        attn_sink = 1
+        attended = local_attended + compressed_attended + attn_sink
         total_attended += attended
         if block_size_r is None:
             total_kv_positions_loaded += attended
@@ -329,7 +331,9 @@ def attention_decode_sparse(
     else:
         # HCA or no compression: attend to ALL compressed positions
         compressed_attended = all_compressed
-    attended = min(ctx_len, window_size) + compressed_attended
+    # 阶段 9 fix 17: attn_sink +1 attended pos (softmax 包含 1 个 sink)
+    attn_sink = 1
+    attended = min(ctx_len, window_size) + compressed_attended + attn_sink
 
     qk_ops = attended * head_size * num_attention_heads * batchsize * 2
     sv_ops = 1 * head_size * attended * num_attention_heads * batchsize * 2

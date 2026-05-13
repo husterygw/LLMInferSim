@@ -69,6 +69,9 @@ class DeployConfig:
     w_byte: float = 2.0   # weight: 2=fp16, 1=int8, 0.5=int4
     a_byte: float = 2.0   # activation
     kv_byte: float = 2.0  # KV cache
+    # V4-specific: indexer K cache byte width. fp8 = 1.0 默认, fp4 = 0.5.
+    # 从 vllm_config.attention_config.use_fp4_indexer_cache 推导(阶段 9 加).
+    indexer_kv_byte: float = 1.0
 
     # Parallelism
     parallel: ParallelConfig = field(default_factory=ParallelConfig)

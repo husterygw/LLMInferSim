@@ -23,11 +23,52 @@ from __future__ import annotations
 from typing import Any
 
 from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.ops.base import OperatorProfile
 from llm_infer_sim.core.ops.embedding import embedding, lm_head
 from llm_infer_sim.core.cost_model.layer_builder import dense_layer_time, moe_layer_time
 from llm_infer_sim.core.cost_model.roofline import RooflineAnalyzer
 from llm_infer_sim.core.profiles.profile_manager import ProfileBundle
 from llm_infer_sim.core.workload.workload import GlobalStepWorkload, StepPhase
+
+
+def _hc_model_level_ops(
+    tokens: int, hidden: int, hc_mult: int, w_byte: float, a_byte: float,
+) -> list[tuple[str, OperatorProfile]]:
+    """V4 HC model-level ops: embedding 后的 repeat + 所有 layer 后的 hc_head + final_norm.
+
+    阶段 9 fix 10/11: hc_mult > 0 时,residual stream 实际 shape 是 [tokens, hc_mult, h],
+    每次 forward 末尾用 hc_head fuse 把 [tokens, hc_mult, h] 压回 [tokens, h] 再 final_norm,
+    再过 lm_head. 这条只在 hc_mult > 0 时生效,标准模型 (V3 / Qwen 等) hc_mult=0 跳过.
+
+    返回 (scope, op) tuple 列表, 顺序: hc_embedding_repeat → hc_head → final_norm.
+    """
+    if hc_mult <= 0:
+        return []
+    ops: list[tuple[str, OperatorProfile]] = []
+    # 11. embedding 后实化 hc_mult 副本(view → real store): tokens × hc_mult × h × a_byte
+    ops.append(("hc_embedding_repeat", OperatorProfile(
+        name="hc_embedding_repeat", op_category="activation",
+        flops=0,
+        load_act=int(tokens * hidden * a_byte),
+        store_act=int(tokens * hc_mult * hidden * a_byte),
+    )))
+    # 10. hc_head fuse: Linear([tokens, hc_mult*h] → [tokens, h]) + RMSNorm
+    #     weight = (hc_mult*h, h), 一次性合并 hc_mult 个 residual 流到 h
+    ops.append(("hc_head", OperatorProfile(
+        name="hc_head", op_category="matmul",
+        flops=2 * tokens * (hc_mult * hidden) * hidden,
+        load_weight=int(hc_mult * hidden * hidden * w_byte),
+        load_act=int(tokens * hc_mult * hidden * a_byte),
+        store_act=int(tokens * hidden * a_byte),
+    )))
+    # 10. final_norm: RMSNorm over hidden
+    ops.append(("final_norm", OperatorProfile(
+        name="final_norm", op_category="norm",
+        flops=tokens * hidden * 7,
+        load_act=int(tokens * hidden * a_byte),
+        store_act=int(tokens * hidden * a_byte),
+    )))
+    return ops
 
 
 class ModelCoreCostModel:
@@ -164,11 +205,11 @@ class ModelCoreCostModel:
                 "bound": "mixed",
             })
 
-        # ---- Embedding + LM head ----
+        # ---- Embedding + (HC model-level ops if V4) + LM head ----
         tokens_for_stage = workload.total_scheduled_tokens
         batch_for_lm_head = max(1, workload.num_prefill_requests + workload.num_decode_requests)
         deploy_for_lm = self.bundle.deploy
-        for scope, op in (
+        model_level_ops: list[tuple[str, OperatorProfile]] = [
             ("embedding", embedding(
                 tokens_for_stage,
                 self.model_cfg.vocab_size,
@@ -176,15 +217,23 @@ class ModelCoreCostModel:
                 self.eff.w_byte,
                 self.eff.a_byte,
             )),
-            ("lm_head", lm_head(
-                batch_for_lm_head,
-                self.model_cfg.vocab_size,
-                self.model_cfg.hidden_dim,
-                deploy_for_lm.tp,
-                self.eff.w_byte,
-                self.eff.a_byte,
-            )),
-        ):
+        ]
+        # 阶段 9 fix 10/11: V4 HC residual stream 实化 + hc_head + final_norm
+        model_level_ops.extend(_hc_model_level_ops(
+            tokens=tokens_for_stage,
+            hidden=self.model_cfg.hidden_dim,
+            hc_mult=self.model_cfg.hc_mult,
+            w_byte=self.eff.w_byte, a_byte=self.eff.a_byte,
+        ))
+        model_level_ops.append(("lm_head", lm_head(
+            batch_for_lm_head,
+            self.model_cfg.vocab_size,
+            self.model_cfg.hidden_dim,
+            deploy_for_lm.tp,
+            self.eff.w_byte,
+            self.eff.a_byte,
+        )))
+        for scope, op in model_level_ops:
             res = self.analyzer.analyze(op)
             total_compute += res.t_compute
             total_memory += res.t_memory
@@ -342,10 +391,10 @@ class ModelCoreCostModel:
                 }
             )
 
-        # ----- Embedding + LM head (整模型一次) -----
+        # ----- Embedding + (HC model-level ops if V4) + LM head (整模型一次) -----
         # 注: 用 max(t_compute, t_memory) 替代 llm-viewer result.total_time
         # 后者在 flops=0 (embedding lookup) 时退化为 0 (阶段 1 已记录此 bug)
-        for scope, op in (
+        model_level_ops: list[tuple[str, OperatorProfile]] = [
             ("embedding", embedding(
                 tokens_for_stage,
                 self.model_cfg.vocab_size,
@@ -353,15 +402,23 @@ class ModelCoreCostModel:
                 self.eff.w_byte,
                 self.eff.a_byte,
             )),
-            ("lm_head", lm_head(
-                batch,
-                self.model_cfg.vocab_size,
-                self.model_cfg.hidden_dim,
-                deploy.tp,
-                self.eff.w_byte,
-                self.eff.a_byte,
-            )),
-        ):
+        ]
+        # 阶段 9 fix 10/11: V4 HC residual stream 实化 + hc_head + final_norm
+        model_level_ops.extend(_hc_model_level_ops(
+            tokens=tokens_for_stage,
+            hidden=self.model_cfg.hidden_dim,
+            hc_mult=self.model_cfg.hc_mult,
+            w_byte=self.eff.w_byte, a_byte=self.eff.a_byte,
+        ))
+        model_level_ops.append(("lm_head", lm_head(
+            batch,
+            self.model_cfg.vocab_size,
+            self.model_cfg.hidden_dim,
+            deploy.tp,
+            self.eff.w_byte,
+            self.eff.a_byte,
+        )))
+        for scope, op in model_level_ops:
             res = self.analyzer.analyze(op)
             total_compute += res.t_compute
             total_memory += res.t_memory

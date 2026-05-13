@@ -3,7 +3,7 @@
 Source: 复制自 llm-viewer models/parallel.py (拆分: ModelConfig 留 profiles/model_config.py)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from llm_infer_sim.core.ops.base import OperatorProfile
 from llm_infer_sim.core.ops.linear import (
     linear_layer,
@@ -39,12 +39,6 @@ class LayerResult:
     t_compute: float   # sum of compute/memory time
     t_comm: float      # sum of communication time
     t_total: float     # t_compute + t_comm
-
-
-def _tokens_for_stage(stage: str, batch_size: int, seq_len: int) -> int:
-    if stage == "decode":
-        return batch_size
-    return batch_size * seq_len
 
 
 def _comm_op(name: str, comm_bytes: float, comm_type: str) -> OperatorProfile:
@@ -85,19 +79,27 @@ def _build_attention_block(
         # Determine per-op precision: FP8 for non-expert linear ops when global quant is FP8
         op_prec = "fp8" if deploy.w_byte <= 1.0 else "fp16"
 
-        # Q path: attn_norm -> wq_a(h → q_lora_rank, NOT TP) -> q_norm -> wq_b(...)
-        ops.append(linear_layer("wq_a", h, model.q_lora_rank, tokens,
-                                deploy.w_byte, deploy.a_byte, deploy.kv_byte,
-                                op_precision=op_prec))
+        # 9-γ fusion 1: 真实 V4 用 fused_wqa_wkv (MergedColumnParallelLinear, disable_tp=True)
+        # 一次性输出 [q_lora_rank, head_dim] concat; 旧拆分代码 x 读两次, fused 后只读一次.
+        wqa_wkv_oc = model.q_lora_rank + head_dim
+        ops.append(OperatorProfile(
+            name="fused_wqa_wkv", op_category="matmul",
+            flops=h * wqa_wkv_oc * tokens * 2,
+            load_weight=int(h * wqa_wkv_oc * deploy.w_byte),
+            load_act=int(h * tokens * deploy.a_byte),         # x 一次
+            store_act=int(wqa_wkv_oc * tokens * deploy.a_byte),
+            op_precision=op_prec,
+        ))
+        # q_norm + wq_b (norm 在 q_lora_rank 上, 然后 ColumnParallel q_b_proj)
         ops.append(norm_layer("q_norm", tokens, model.q_lora_rank, deploy.a_byte))
         ops.append(linear_layer("wq_b", model.q_lora_rank, heads_per_tp * head_dim, tokens,
                                 deploy.w_byte, deploy.a_byte, deploy.kv_byte,
                                 op_precision=op_prec))
-
-        # KV path: wkv(h → head_dim, NOT TP, single head) → kv_norm
-        ops.append(linear_layer("wkv", h, head_dim, tokens,
-                                deploy.w_byte, deploy.a_byte, deploy.kv_byte,
-                                is_kv_proj=True, op_precision=op_prec))
+        # kv_norm (在 head_dim 上, 不切 TP)
+        # 阶段 9 fix 12: 真实 V4 用 fused_q_kv_rmsnorm 把 q_norm + kv_norm 融合到单 kernel.
+        # 我们的 cost model 把它们当两个独立 norm op, 主要损失是一次 kernel launch overhead
+        # (~µs/layer). hw.kernel_overhead 字典是 placeholder=0 时这个差异不可见,
+        # 阶段 X calibration 填 kernel_overhead 后自动包含. 此处不单独融合.
         ops.append(norm_layer("kv_norm", tokens, head_dim, deploy.a_byte))
 
         # Compressor (layers with compress_ratio > 0)
@@ -112,44 +114,56 @@ def _build_attention_block(
             coff = 2 if compress_ratio == 4 else 1
             compress_out_dim = coff * head_dim
 
-            # vllm compress_wkv and compress_gate use fp16
-            ops.append(linear_layer("compress_wkv", h, compress_out_dim, tokens,
-                                    2.0, deploy.a_byte, deploy.kv_byte,
-                                    op_precision="fp16", store_a_byte=2.0))
-            ops.append(linear_layer("compress_gate", h, compress_out_dim, tokens,
-                                    2.0, deploy.a_byte, deploy.kv_byte,
-                                    op_precision="fp16", store_a_byte=2.0))
-            # Softmax pooling: compress_ratio elements per group, ~5 ops/element
+            # 9-γ fusion 2: 真实 V4 用 fused_wkv_wgate (MergedColumnParallelLinear,
+            # disable_tp=True, bf16 unquant), 一次输出 [coff*hd, coff*hd] concat.
+            # 旧拆分代码 x 读两次, fused 后只读一次.
+            fused_oc = 2 * compress_out_dim
+            ops.append(OperatorProfile(
+                name="fused_compress_wkv_wgate", op_category="matmul",
+                flops=h * fused_oc * tokens * 2,
+                load_weight=int(h * fused_oc * 2.0),    # bf16 weight
+                load_act=int(h * tokens * deploy.a_byte),  # x 一次
+                store_act=int(fused_oc * tokens * 2.0),     # bf16 output
+                op_precision="fp16",
+            ))
+            # Softmax pooling: compress_ratio elements per group, ~5 ops/element.
+            # 9-γ fusion 9 修: store 真实写 paged kv_cache(fp8/fp4), 不是 activation;
+            # 用 deploy.kv_byte 替代 a_byte (compress 后的紧凑 KV).
             compressed_tokens = tokens // compress_ratio if compress_ratio > 0 else 0
             ops.append(OperatorProfile(
                 name="compress_pool", op_category="activation",
                 flops=tokens * compress_out_dim * 5,
                 load_act=int(tokens * compress_out_dim * deploy.a_byte * 2),
-                store_act=int(compressed_tokens * compress_out_dim * deploy.a_byte),
+                store_kv_cache=int(compressed_tokens * compress_out_dim * deploy.kv_byte),
             ))
 
             # Indexer (only for compress_ratio == 4 layers)
             if compress_ratio == 4 and model.index_topk > 0:
                 # Inner compressor for indexer uses index_head_dim (128), NOT main head_dim (512).
                 # Source: Indexer.__init__ → Compressor(args, ratio, self.head_dim=index_head_dim)
+                # 9-γ fusion 3: indexer.compressor 同样 fused_wkv_wgate (bf16, disable_tp)
                 idx_coff = 2  # always overlap (ratio==4)
                 idx_compress_out_dim = idx_coff * model.index_head_dim
-                ops.append(linear_layer("index_compress_wkv", h, idx_compress_out_dim, tokens,
-                                        2.0, deploy.a_byte, deploy.kv_byte,
-                                        op_precision="fp16", store_a_byte=2.0))
-                ops.append(linear_layer("index_compress_gate", h, idx_compress_out_dim, tokens,
-                                        2.0, deploy.a_byte, deploy.kv_byte,
-                                        op_precision="fp16", store_a_byte=2.0))
-                # index_wq_b: q_lora_rank → index_n_heads * index_head_dim / tp
-                index_heads_per_tp = model.index_n_heads // tp
+                idx_fused_oc = 2 * idx_compress_out_dim
+                ops.append(OperatorProfile(
+                    name="fused_index_compress_wkv_wgate", op_category="matmul",
+                    flops=h * idx_fused_oc * tokens * 2,
+                    load_weight=int(h * idx_fused_oc * 2.0),
+                    load_act=int(h * tokens * deploy.a_byte),
+                    store_act=int(idx_fused_oc * tokens * 2.0),
+                    op_precision="fp16",
+                ))
+                # 9-β bug 2 修: index_wq_b 和 index_weights_proj 在真实 V4 里都是
+                # ReplicatedLinear (disable_tp=True), 不切 TP. 每 rank 跑完整 index_n_heads.
+                # 旧代码用 `index_n_heads // tp` 在 tp=8 时低估 8× weight read 和 compute.
+                index_full_heads = model.index_n_heads  # NOT divided by tp
                 ops.append(linear_layer("index_wq_b", model.q_lora_rank,
-                                        index_heads_per_tp * model.index_head_dim, tokens,
+                                        index_full_heads * model.index_head_dim, tokens,
                                         deploy.w_byte, deploy.a_byte, deploy.kv_byte,
                                         op_precision=op_prec))
-                # weights_proj (bf16 in reference impl): dim → index_n_heads.
-                # Small but non-trivial weight read, applied per token.
+                # weights_proj (bf16, ReplicatedLinear): h → index_n_heads (no /tp).
                 ops.append(linear_layer("index_weights_proj", h,
-                                        index_heads_per_tp, tokens,
+                                        index_full_heads, tokens,
                                         2.0, deploy.a_byte, deploy.kv_byte,
                                         op_precision="bf16"))
                 # Scoring matmul: Q_index @ K_compressed → scores → topk.
@@ -159,17 +173,19 @@ def _build_attention_block(
                 # code used `tokens // ratio`, which collapses to 0 in decode
                 # (tokens=batch_size=1) and silently drops the entire op.
                 cache_compressed_size = ctx_len // compress_ratio if compress_ratio > 0 else 0
-                # K cache is single-head, shared across query heads → loaded
-                # once per batch element. Reference impl stores K in BF16
-                # (with FP4 simulation during compute).
-                indexer_kv_byte = 2.0
+                # 9-β bug 4 修: indexer_kv_byte 从 deploy.indexer_kv_byte 读
+                # (来自 vllm_config.attention_config.use_fp4_indexer_cache):
+                #   fp8 默认 = 1.0 B/elem, fp4 = 0.5 B/elem. 旧代码写死 2.0 bf16 是错的.
+                # 同时也修 bug 2 的 iH: load_act / store_act / flops 都用 index_full_heads
+                # (不切 TP) 跟 ReplicatedLinear 一致.
+                indexer_kv_byte = deploy.indexer_kv_byte
                 ops.append(OperatorProfile(
                     name="index_score", op_category="attention",
-                    flops=tokens * cache_compressed_size * model.index_head_dim * index_heads_per_tp * 2,
-                    load_act=int(tokens * index_heads_per_tp * model.index_head_dim * deploy.a_byte),
+                    flops=tokens * cache_compressed_size * model.index_head_dim * index_full_heads * 2,
+                    load_act=int(tokens * index_full_heads * model.index_head_dim * deploy.a_byte),
                     load_kv_cache=int(cache_compressed_size * model.index_head_dim
                                       * tokens * indexer_kv_byte),
-                    store_act=int(tokens * cache_compressed_size * index_heads_per_tp * deploy.a_byte),
+                    store_act=int(tokens * cache_compressed_size * index_full_heads * deploy.a_byte),
                 ))
 
         # Sparse attention
@@ -196,11 +212,13 @@ def _build_attention_block(
         n_local_groups = max(model.o_groups // tp, 1)
         wo_a_ic = heads_per_tp * head_dim // n_local_groups
         wo_a_oc = n_local_groups * model.o_lora_rank
-        # wo_a: reference impl uses BF16 einsum ("using BF16 for simplicity", not FP8)
-        # Weight is explicitly BF16 (dtype=torch.bfloat16), not FP8.
+        # 9-β bug 3 修: production vLLM 用 deepseek_v4_fp8_einsum("bhr,hdr->bhd")
+        # 调 FP8 einsum (wo_a.weight + weight_scale_inv), 不是 BF16.
+        # 旧注释说 "reference impl 用 BF16 for simplicity" 是 DeepSeek 参考实现的话,
+        # 不是 vLLM production path. cost 模型应跟 production 一致 → 用 deploy.w_byte.
         ops.append(linear_layer("wo_a", wo_a_ic, wo_a_oc, tokens,
-                                2.0, deploy.a_byte, deploy.kv_byte,
-                                op_precision="bf16"))
+                                deploy.w_byte, deploy.a_byte, deploy.kv_byte,
+                                op_precision=op_prec))
         # wo_b: RowParallel [n_local_groups * o_lora_rank, h]
         wo_b_ic = n_local_groups * model.o_lora_rank
         ops.append(linear_layer("wo_b", wo_b_ic, h, tokens,
@@ -413,12 +431,16 @@ def _build_moe_ffn_block(
     deploy: DeployConfig,
     hw: HardwareConfig,
     moe_routing_skew: float = 0.0,
+    layer_idx: int = -1,
 ) -> list[OperatorProfile]:
     """Build MoE FFN sub-block operators.
 
     Args:
         moe_routing_skew: 路由偏度 ∈ [0, 1] 用于 estimate_distinct_experts。
                           0=uniform (默认, 阶段 0-9 哲学), 1=极端 imbalance。
+        layer_idx: 当前 layer 索引 (≥0 时生效), 用于 V4 hash MoE routing 判断:
+                   layer_idx < model.num_hash_layers 的层走 tid2eid lookup (无 router GEMM),
+                   FLOPs≈0. 默认 -1 表示不区分 (向后兼容).
     """
     tp = deploy.tp
     ep = deploy.ep
@@ -431,15 +453,35 @@ def _build_moe_ffn_block(
                           model.hc_sinkhorn_iters, deploy.a_byte, deploy.w_byte))
     ops.append(norm_layer("mlp_norm", tokens, h, deploy.a_byte))
 
-    # Router gate (replicated, no comm)
-    ops.append(OperatorProfile(
-        name="moe_gate", op_category="matmul",
-        flops=2 * tokens * h * model.num_experts,
-        load_weight=int(h * model.num_experts * deploy.w_byte),
-        load_act=int(tokens * h * deploy.a_byte),
-        store_act=int(tokens * model.num_experts * deploy.a_byte),
-        op_precision="fp32",
-    ))
+    # Router gate (replicated, no comm).
+    # 阶段 9 fix 13: V4 前 num_hash_layers 层用 tid2eid lookup (无 router GEMM),
+    # FLOPs≈0; 跳过 moe_gate op 注入. 普通 MoE 模型 num_hash_layers=0 行为不变.
+    is_hash_routed = (
+        0 <= layer_idx < model.num_hash_layers if model.num_hash_layers > 0 else False
+    )
+    if not is_hash_routed:
+        # 阶段 9 fix 14: V3 用 noaux_tc + softmax, V4 用 sqrtsoftplus(softplus(x)).
+        # 两者 post-linear FLOPs 都 O(tokens × num_experts), 量级 << linear 部分
+        # (linear = 2 × tokens × h × num_experts), 当前公式仅算 linear 部分 (主导项),
+        # post-linear normalization 差异 < 0.5%, 不单独建模. 阶段 X 校准时如对不上数再细化.
+        ops.append(OperatorProfile(
+            name="moe_gate", op_category="matmul",
+            flops=2 * tokens * h * model.num_experts,
+            load_weight=int(h * model.num_experts * deploy.w_byte),
+            load_act=int(tokens * h * deploy.a_byte),
+            store_act=int(tokens * model.num_experts * deploy.a_byte),
+            op_precision="fp32",
+        ))
+    else:
+        # tid2eid lookup: 一次内存读 (token_id → expert_id 映射), FLOPs 几乎 0.
+        # 14 sqrtsoftplus / softmax (非 hash 时) 比 softmax 多 ~5 ops/elem,
+        # 量级 << linear, 不单独建模 (落 §10 阶段 9 显式不做).
+        ops.append(OperatorProfile(
+            name="moe_hash_lookup", op_category="activation",
+            flops=0,
+            load_act=int(tokens * 4),       # token_id index (int32 = 4 B)
+            store_act=int(tokens * model.num_activated_experts * 4),  # expert_ids (int32)
+        ))
 
     # AllToAll dispatch (EP group)
     if ep > 1:
@@ -484,6 +526,11 @@ def _build_moe_ffn_block(
     expert_act_in  = int(tokens_per_device * h * deploy.a_byte)
     expert_act_out = int(tokens_per_device * h * deploy.a_byte)
 
+    # 阶段 9 fix 16: V4 MegaMoE 内部 FP4 quant + dispatch fusion 等 kernel-level 细节
+    # 不改变 op-level 公式 (flops / weight read / act IO 跟拆开模型的 GEMM 等价).
+    # 这里我们用单 routed_experts op 表达,精度差异在 op_precision (fp4/fp8) 体现.
+    # MegaMoE specific 优化 (per-expert padding / sort-scatter overhead) 阶段 X 校准时
+    # 通过 EfficiencyProfile (op_kind="moe_experts", shape_bucket=...) 反映.
     ops.append(OperatorProfile(
         name="routed_experts", op_category="matmul",
         flops=expert_flops,
@@ -539,6 +586,11 @@ def _build_moe_ffn_block(
         ))
 
         if tp > 1:
+            # 阶段 9 fix 15: 真实 V4 MegaMoE 模式下 reduce_results=True (RowParallel 内部
+            # 触发 allreduce); 非 MegaMoE 模式下 reduce_results=False, allreduce 由 caller
+            # 后做. 当前模型无 use_mega_moe knob, 默认按 MegaMoE 算 (即 reduce_results=True
+            # 加 allreduce). 影响主要在非 MegaMoE V4 变体上, V4-Flash + EP 默认 MegaMoE 时
+            # 当前行为正确. 阶段 X 校准时如果对不上数, 加 BackendExecutionProfile.use_mega_moe.
             ops.append(_comm_op("shared_expert_allreduce",
                                 tokens * h * deploy.a_byte, "allreduce"))
 
@@ -621,7 +673,7 @@ def moe_layer_time(
     """
     ops = []
     ops.extend(_build_attention_block(stage, tokens, ctx_len, model, deploy, hw, layer_idx))
-    ops.extend(_build_moe_ffn_block(tokens, model, deploy, hw, moe_routing_skew))
+    ops.extend(_build_moe_ffn_block(tokens, model, deploy, hw, moe_routing_skew, layer_idx))
 
     t_compute, t_comm = _compute_layer_time(ops, hw, deploy)
 

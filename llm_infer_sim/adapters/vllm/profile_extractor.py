@@ -71,6 +71,12 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     efficiency.apply_to(hw)
 
     # ---- 5. DeployConfig (跨 step 不变的部分; estimate() 时按 workload 覆盖) ----
+    # V4 indexer K cache dtype: 从 attention_config.use_fp4_indexer_cache 推
+    # (option C, 阶段 9-β). use_fp4_indexer_cache=True → 0.5B (MXFP4), 默认 1.0B (FP8).
+    attn_cfg = getattr(vllm_config, "attention_config", None)
+    use_fp4_indexer = bool(getattr(attn_cfg, "use_fp4_indexer_cache", False))
+    indexer_kv_byte = 0.5 if use_fp4_indexer else 1.0
+
     deploy = DeployConfig(
         batch_size=1,                            # 占位
         input_len=1,                             # 占位
@@ -78,6 +84,7 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         w_byte=efficiency.w_byte,
         a_byte=efficiency.a_byte,
         kv_byte=efficiency.kv_byte,
+        indexer_kv_byte=indexer_kv_byte,
         parallel=parallel,
         use_flash_attention=True,                # 现代 vLLM 默认 flash
     )
@@ -158,6 +165,30 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
     # q_lora_rank: DeepSeek-V3 Q 投影也走 LoRA 分解 (1536 in V3); 0 = 直接 hidden→Q proj
     q_lora_rank = getattr(hf, "q_lora_rank", 0) or 0
 
+    # V4 字段 (阶段 9+): sparse attention + HC + grouped O proj.
+    # V4 path 触发条件: window_size > 0 AND o_groups > 0.
+    # V4-Flash hf_config 真实字段名:
+    #   sliding_window=128 (注意映射到 ModelConfig.window_size)
+    #   o_groups=8, o_lora_rank=1024
+    #   compress_ratios=[0,0,4,128,...] (list, 优先级高于 a/b 派生)
+    #   index_topk=512, index_n_heads=64, index_head_dim=128
+    #   hc_mult=4, hc_sinkhorn_iters=20
+    #   expert_dtype="fp4" → expert_fp4=True
+    window_size = getattr(hf, "sliding_window", 0) or 0
+    o_lora_rank = getattr(hf, "o_lora_rank", 0) or 0
+    o_groups = getattr(hf, "o_groups", 0) or 0
+    compress_ratios_list = list(getattr(hf, "compress_ratios", None) or [])
+    index_topk = getattr(hf, "index_topk", 0) or 0
+    index_n_heads = getattr(hf, "index_n_heads", 0) or 0
+    index_head_dim = getattr(hf, "index_head_dim", 0) or 0
+    hc_mult = getattr(hf, "hc_mult", 0) or 0
+    hc_sinkhorn_iters = getattr(hf, "hc_sinkhorn_iters", 0) or 0
+    # expert_fp4: 从 expert_dtype="fp4" 推导 (V4 用); 默认 False
+    expert_dtype = getattr(hf, "expert_dtype", "") or ""
+    expert_fp4 = (expert_dtype.lower() == "fp4")
+    # num_hash_layers: V4 前 N 层用 hash routing (tid2eid lookup, FLOPs≈0)
+    num_hash_layers = getattr(hf, "num_hash_layers", 0) or 0
+
     return ModelConfig(
         name=model_id.split("/")[-1] if isinstance(model_id, str) else "model",
         hidden_dim=hidden_dim,
@@ -180,6 +211,18 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
         qk_nope_head_dim=qk_nope_head_dim,
         rope_head_dim=qk_rope_head_dim,
         q_lora_rank=q_lora_rank,
+        # V4 字段
+        window_size=window_size,
+        o_lora_rank=o_lora_rank,
+        o_groups=o_groups,
+        compress_ratios=compress_ratios_list,
+        index_topk=index_topk,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=hc_sinkhorn_iters,
+        expert_fp4=expert_fp4,
+        num_hash_layers=num_hash_layers,
     )
 
 
