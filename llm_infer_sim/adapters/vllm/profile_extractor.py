@@ -139,12 +139,24 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
         mlp_only = getattr(hf, "mlp_only_layers", None) or []
         first_k_dense = (max(mlp_only) + 1) if mlp_only else 0
 
-    # MLA 字段 (阶段 8+)
+    # MLA 字段 (阶段 8+): DeepSeek-V3 真实激活
     kv_lora_rank = getattr(hf, "kv_lora_rank", 0) or 0
     qk_rope_head_dim = getattr(hf, "qk_rope_head_dim", 0) or 0
     qk_nope_head_dim = getattr(hf, "qk_nope_head_dim", 0) or 0
     kv_latent_dim = (kv_lora_rank + qk_rope_head_dim) if kv_lora_rank > 0 else 0
-    v_head_dim = getattr(hf, "v_head_dim", 0) or 0
+    # v_head_dim: DeepSeek-V3 config.json 无显式字段, fallback 到 qk_nope_head_dim
+    # (V3 modeling.py 中 v_head_dim ≡ qk_nope_head_dim = 128); 仅在两者都不存在时
+    # 才用 head_dim (hidden/num_heads). 这条 fallback 链是阶段 8-β 修正:
+    # 旧代码默认 head_dim=56(7168/128), 但 V3 真实 v_head_dim = 128.
+    v_head_dim_explicit = getattr(hf, "v_head_dim", 0) or 0
+    if v_head_dim_explicit > 0:
+        v_head_dim = v_head_dim_explicit
+    elif qk_nope_head_dim > 0:
+        v_head_dim = qk_nope_head_dim   # MLA 默认: v_head_dim ≡ qk_nope_head_dim
+    else:
+        v_head_dim = 0                  # 非 MLA 模型, layer_builder 退到 head_dim
+    # q_lora_rank: DeepSeek-V3 Q 投影也走 LoRA 分解 (1536 in V3); 0 = 直接 hidden→Q proj
+    q_lora_rank = getattr(hf, "q_lora_rank", 0) or 0
 
     return ModelConfig(
         name=model_id.split("/")[-1] if isinstance(model_id, str) else "model",
@@ -167,6 +179,7 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
         v_head_dim=v_head_dim,
         qk_nope_head_dim=qk_nope_head_dim,
         rope_head_dim=qk_rope_head_dim,
+        q_lora_rank=q_lora_rank,
     )
 
 

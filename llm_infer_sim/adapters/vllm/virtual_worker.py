@@ -19,7 +19,12 @@ import sys
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    MLAAttentionSpec,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -90,31 +95,64 @@ class VirtualWorker(WorkerBase):
     # ------- KV cache -------
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """返回每层的 KV cache spec (详设 §4.3.3 + 阶段 8-γ MLA 分支)。
+
+        阶段 0-7: 所有模型走 `FullAttentionSpec`(标准 MHA/GQA per-head KV)
+        阶段 8-γ 新增: MLA 模型(kv_lora_rank > 0)走 `MLAAttentionSpec`,
+                     每 token 只存 (c_kv + qk_rope) bytes,远小于 num_kv_heads × head_dim × 2(K+V)。
+                     V3 example: 标准 MHA 用 128×128×2×2=65536 bytes,MLA 用 (512+64)×2=1152,**~57× 小**
+        """
         model_cfg = self.model_config
         cache_cfg = self.cache_config
+        hf = model_cfg.hf_config
 
         num_layers = model_cfg.get_num_layers(self.parallel_config)
-        num_kv_heads = model_cfg.get_num_kv_heads(self.parallel_config)
-        head_size = model_cfg.get_head_size()
+        block_size = cache_cfg.block_size
 
         if cache_cfg.cache_dtype == "auto":
             kv_dtype = model_cfg.dtype
         else:
             kv_dtype = getattr(torch, cache_cfg.cache_dtype, torch.float16)
 
-        block_size = cache_cfg.block_size
-        spec = {
-            f"model.layers.{i}.self_attn.attn": FullAttentionSpec(
-                block_size=block_size,
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
-                dtype=kv_dtype,
+        # 检测 MLA: kv_lora_rank 存在且 > 0
+        kv_lora_rank = int(getattr(hf, "kv_lora_rank", 0) or 0)
+        is_mla = kv_lora_rank > 0
+
+        if is_mla:
+            qk_rope = int(getattr(hf, "qk_rope_head_dim", 0) or 0)
+            # MLA: c_kv 在 heads 间共享 (MQA-style), 所以 num_kv_heads=1
+            # head_size = c_kv (kv_lora_rank) + qk_rope (rope_k 共享)
+            mla_head_size = kv_lora_rank + qk_rope
+            spec = {
+                f"model.layers.{i}.self_attn.attn": MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,                    # MLA: c_kv shared across heads
+                    head_size=mla_head_size,           # = kv_lora_rank + qk_rope
+                    dtype=kv_dtype,
+                )
+                for i in range(num_layers)
+            }
+            _log(
+                f"kv_cache_spec built MLA (layers={num_layers}, block_size={block_size}, "
+                f"head_size={mla_head_size}={kv_lora_rank}+{qk_rope}, "
+                f"per-token-bytes/layer={mla_head_size * 2}, dtype={kv_dtype})"
             )
-            for i in range(num_layers)
-        }
-        _log(
-            f"kv_cache_spec built (layers={num_layers}, block_size={block_size}, dtype={kv_dtype})"
-        )
+        else:
+            num_kv_heads = model_cfg.get_num_kv_heads(self.parallel_config)
+            head_size = model_cfg.get_head_size()
+            spec = {
+                f"model.layers.{i}.self_attn.attn": FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    dtype=kv_dtype,
+                )
+                for i in range(num_layers)
+            }
+            _log(
+                f"kv_cache_spec built (layers={num_layers}, block_size={block_size}, "
+                f"num_kv_heads={num_kv_heads}, head_size={head_size}, dtype={kv_dtype})"
+            )
         return spec
 
     def determine_available_memory(self) -> int:

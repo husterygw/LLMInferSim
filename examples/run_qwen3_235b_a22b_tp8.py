@@ -57,6 +57,7 @@ def main() -> int:
     llm = LLM(
         model=model,
         tensor_parallel_size=8,
+        enable_expert_parallel=True,
         dtype="float16",
         gpu_memory_utilization=0.5,
         enforce_eager=True,

@@ -225,19 +225,44 @@ def _build_attention_block(
     ops.append(norm_layer("attn_norm", tokens, h, deploy.a_byte))
 
     if model.kv_lora_rank > 0:
-        # MLA path: q/k/v 走独立 Linear (后面 MLA-specific ops 还要 kv_b_proj 等)
-        # vLLM 也不对 MLA 路径做 QKV fusion. 阶段 3 不动 MLA, 推到阶段 8。
-        ops.append(linear_layer("q_proj", h, heads_per_tp * head_dim, tokens,
-                                deploy.w_byte, deploy.a_byte, deploy.kv_byte))
-        ops.append(linear_layer("k_proj", h, kv_heads_per_tp * head_dim, tokens,
-                                deploy.w_byte, deploy.a_byte, deploy.kv_byte, is_kv_proj=True))
-        ops.append(linear_layer("v_proj", h, kv_heads_per_tp * head_dim, tokens,
-                                deploy.w_byte, deploy.a_byte, deploy.kv_byte, is_kv_proj=True))
+        # MLA path (DeepSeek-V3/V4, 详设 §4.1.4 + 阶段 8-β 修正)
+        #
+        # 真实 MLA 结构(对齐 vLLM `DeepseekV2Attention` impl):
+        #   Q side (with optional LoRA decomposition):
+        #     - q_lora_rank > 0: q_a_proj(h → q_lora_rank) + q_b_proj(q_lora_rank → heads×q_head_dim)
+        #     - q_lora_rank == 0: q_proj(h → heads × q_head_dim)
+        #   KV side(单个 fused down-projection):
+        #     - kv_a_proj_with_mqa: h → kv_lora_rank + qk_rope_head_dim
+        #     - kv_b_proj: kv_lora_rank → heads × (qk_nope_head_dim + v_head_dim)  (compute-time)
+        #
+        # 阶段 8-β 修正(从 8-α inspect 发现的 bug):
+        #   旧代码用 q_proj/k_proj/v_proj 三个独立 Linear 加 dense head_dim(7168/128=56),
+        #   完全没用 q_lora_rank 和真实 MLA 维度。V3 实际 q_head_dim=192/v_head_dim=128。
+        qk_nope = model.qk_nope_head_dim if model.qk_nope_head_dim > 0 else head_dim
+        qk_rope = model.rope_head_dim or 0  # = qk_rope_head_dim in V3 config
+        v_dim = model.v_head_dim if model.v_head_dim > 0 else qk_nope  # MLA default = qk_nope
+        q_head_dim = qk_nope + qk_rope  # 192 in V3 (128 nope + 64 rope)
 
-        # MLA kv_b_proj: up-project c_kv → (num_heads × (qk_nope_head_dim + v_head_dim)) / tp
-        v_dim = model.v_head_dim if model.v_head_dim > 0 else head_dim
-        qk_nope_head_dim = head_dim
-        kv_b_oc = model.num_heads * (qk_nope_head_dim + v_dim) // tp
+        # Q projection: 可选 LoRA 分解
+        if model.q_lora_rank > 0:
+            ops.append(linear_layer("q_a_proj", h, model.q_lora_rank, tokens,
+                                    deploy.w_byte, deploy.a_byte, deploy.kv_byte))
+            ops.append(linear_layer("q_b_proj", model.q_lora_rank,
+                                    heads_per_tp * q_head_dim, tokens,
+                                    deploy.w_byte, deploy.a_byte, deploy.kv_byte))
+        else:
+            ops.append(linear_layer("q_proj", h, heads_per_tp * q_head_dim, tokens,
+                                    deploy.w_byte, deploy.a_byte, deploy.kv_byte))
+
+        # KV side fused down-projection (input proj that hits HBM only this much)
+        # output: c_kv (size=kv_lora_rank) + k_rope (size=qk_rope_head_dim) per token
+        ops.append(linear_layer("kv_a_proj_with_mqa", h,
+                                model.kv_lora_rank + qk_rope, tokens,
+                                deploy.w_byte, deploy.a_byte, deploy.kv_byte,
+                                is_kv_proj=True))
+
+        # kv_b_proj: c_kv → per-rank (qk_nope + v_head_dim) × heads, compute-time decompression
+        kv_b_oc = heads_per_tp * (qk_nope + v_dim)
         ops.append(linear_layer("kv_b_proj", model.kv_lora_rank, kv_b_oc, tokens,
                                 deploy.w_byte, deploy.a_byte, deploy.kv_byte))
     else:
@@ -263,14 +288,14 @@ def _build_attention_block(
             a_byte=deploy.a_byte,
         ))
 
-    # MLA attention dimensions
+    # MLA attention dimensions (阶段 8-β: v_head_dim 默认 qk_nope_head_dim, 不退回 head_dim)
     if model.kv_lora_rank > 0:
-        v_dim = model.v_head_dim if model.v_head_dim > 0 else head_dim
-        qk_rope = model.kv_latent_dim - model.kv_lora_rank
-        attn_qk_head_dim = (model.qk_nope_head_dim if model.qk_nope_head_dim > 0
-                            else head_dim) + qk_rope
-        attn_v_head_dim = v_dim
-        o_proj_ic = heads_per_tp * v_dim
+        _qk_nope = model.qk_nope_head_dim if model.qk_nope_head_dim > 0 else head_dim
+        _qk_rope = model.rope_head_dim or (model.kv_latent_dim - model.kv_lora_rank)
+        _v_dim = model.v_head_dim if model.v_head_dim > 0 else _qk_nope
+        attn_qk_head_dim = _qk_nope + _qk_rope
+        attn_v_head_dim = _v_dim
+        o_proj_ic = heads_per_tp * _v_dim
     else:
         attn_qk_head_dim = None
         attn_v_head_dim = None

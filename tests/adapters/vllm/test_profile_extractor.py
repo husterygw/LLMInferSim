@@ -177,6 +177,52 @@ def test_qwen_shared_expert_intermediate_size_derived():
     assert m.num_shared_experts == 2   # 2816 / 1408 = 2
 
 
+def test_deepseek_v3_parse():
+    """阶段 8-α: DeepSeek-V3 hf_config (MLA + MoE + shared experts + Q-side LoRA)。"""
+    hf = SimpleNamespace(
+        model_type="deepseek_v3",
+        num_attention_heads=128, num_key_value_heads=128,
+        hidden_size=7168, num_hidden_layers=61,
+        intermediate_size=18432, vocab_size=129280,
+        # MLA
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        q_lora_rank=1536,
+        # MoE
+        n_routed_experts=256,
+        num_experts_per_tok=8,
+        moe_intermediate_size=2048,
+        n_shared_experts=1,
+        first_k_dense_replace=3,
+    )
+    bundle = extract_profile_bundle(_make_vllm_config(hf, "deepseek-ai/DeepSeek-V3"))
+    m = bundle.model
+    # 基础
+    assert m.hidden_dim == 7168
+    assert m.num_heads == 128
+    assert m.num_layers == 61
+    assert m.ffn_dim == 18432
+    # MLA 字段
+    assert m.kv_lora_rank == 512
+    assert m.qk_nope_head_dim == 128
+    assert m.rope_head_dim == 64
+    assert m.kv_latent_dim == 512 + 64        # = kv_lora_rank + qk_rope_head_dim
+    assert m.q_lora_rank == 1536              # ★ V3 Q-side LoRA, 阶段 8-α 新增透传
+    # MoE
+    assert m.is_moe
+    assert m.num_experts == 256
+    assert m.num_activated_experts == 8
+    assert m.expert_dim == 2048
+    assert m.num_shared_experts == 1          # ★ V3 shared experts
+    assert m.first_moe_layer == 3             # ★ 前 3 层 dense FFN
+    # 层路由
+    assert not m.is_moe_layer(0)
+    assert not m.is_moe_layer(2)
+    assert m.is_moe_layer(3)
+    assert m.is_moe_layer(60)
+
+
 def test_extracted_backend_profile_for_no_attention_config():
     """attention_config 缺失时 fallback 到 flash_attn_auto / unified_ragged。"""
     hf = SimpleNamespace(

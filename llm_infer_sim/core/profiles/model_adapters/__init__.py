@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+from llm_infer_sim.core.profiles.model_adapters import deepseek_v3 as _deepseek_v3
 from llm_infer_sim.core.profiles.model_adapters import opt as _opt
 from llm_infer_sim.core.profiles.model_adapters import qwen as _qwen
 
@@ -24,6 +25,7 @@ ADAPTERS: dict[str, object] = {
     "qwen2_moe": _qwen,
     "qwen3": _qwen,
     "qwen3_moe": _qwen,
+    "deepseek_v3": _deepseek_v3,
 }
 
 
