@@ -35,11 +35,13 @@ class HardwareConfig:
     onchip_buffer: float = 33792e3       # On-chip SRAM bytes (FlashAttention tile sizing)
 
     # --- Interconnect: intra-node (NVLink) ---
-    intra_node_bandwidth: float = 450e9  # per-direction B/s
+    intra_node_bandwidth: float = 450e9  # bidirectional B/s (NVLink spec convention)
+    intra_node_size: int = 8             # GPUs per node (standard NVIDIA HGX = 8)
     link_latency: float = 1e-6           # seconds
 
-    # --- Interconnect: inter-node (InfiniBand) ---
-    inter_node_bandwidth: float = 50e9
+    # --- Interconnect: inter-node (InfiniBand / Ethernet) ---
+    inter_node_bandwidth: float = 50e9   # unidirectional B/s (IB spec convention)
+                                         # NDR400: 400 Gbps ≈ 50 GB/s per port (default)
     inter_node_latency: float = 5e-6
 
     # --- Efficiency calibration (0.0 ~ 1.0) ---
@@ -95,7 +97,23 @@ class HardwareConfig:
     @property
     def effective_comm_bandwidth(self) -> float:
         # intra_node_bandwidth是双向带宽，这里需要除以2来得到单向带宽
+        # 阶段 7 起公式有 hierarchical 路径优先用 effective_intra_bw / effective_inter_bw,
+        # 本属性保留供阶段 0-6 旧路径 (N ≤ intra_node_size) fallback 用。
         return self.intra_node_bandwidth * self.comm_efficiency / 2
+
+    @property
+    def effective_intra_bw(self) -> float:
+        """单向 intra-node 带宽 (跟 effective_comm_bandwidth 同, 显式命名供阶段 7 公式用)."""
+        return self.intra_node_bandwidth * self.comm_efficiency / 2
+
+    @property
+    def effective_inter_bw(self) -> float:
+        """单向 inter-node 带宽 (IB / Ethernet)。
+
+        IB spec 通常直接以单向为口径 (NDR400 = 50 GB/s per port unidirectional),
+        所以不再除 2。返回 0 时阶段 7 公式 fallback 到 flat ring 全 intra_bw。
+        """
+        return self.inter_node_bandwidth * self.comm_efficiency
 
     @property
     def ridge_point(self) -> float:
@@ -135,7 +153,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=27648e3,
         intra_node_bandwidth=600e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=2.5e+10,
         inter_node_latency=0.0,
     ),
     "A100_40G": dict(
@@ -151,7 +169,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=27648e3,
         intra_node_bandwidth=600e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=2.5e+10,
         inter_node_latency=0.0,
     ),
     "A100_80G": dict(
@@ -167,7 +185,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=27648e3,
         intra_node_bandwidth=600e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=2.5e+10,
         inter_node_latency=0.0,
     ),
     "A800_80G_SXM": dict(
@@ -183,7 +201,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=27648e3,
         intra_node_bandwidth=400e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=2.5e+10,
         inter_node_latency=0.0,
     ),
     "H100": dict(
@@ -199,7 +217,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H100_SXM": dict(
@@ -215,7 +233,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H100_SXM_Sparse": dict(
@@ -231,7 +249,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H100_PCIe": dict(
@@ -247,7 +265,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=29184e3,
         intra_node_bandwidth=600e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=2.5e+10,
         inter_node_latency=0.0,
     ),
     "H800": dict(
@@ -263,7 +281,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=400e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H800_SXM": dict(
@@ -279,7 +297,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=400e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H800_PCIe": dict(
@@ -295,7 +313,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=29184e3,
         intra_node_bandwidth=400e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=2.5e+10,
         inter_node_latency=0.0,
     ),
     "H200": dict(
@@ -311,7 +329,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H200_SXM": dict(
@@ -327,7 +345,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H200_SXM_Sparse": dict(
@@ -343,7 +361,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H200_NVL": dict(
@@ -359,7 +377,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=33792e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "H20_96G": dict(
@@ -375,7 +393,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=19968e3,
         intra_node_bandwidth=900e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=5e+10,
         inter_node_latency=0.0,
     ),
     "B200": dict(
@@ -391,7 +409,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=65536e3,
         intra_node_bandwidth=1800e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=1e+11,
         inter_node_latency=0.0,
     ),
     "B300": dict(
@@ -407,7 +425,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         onchip_buffer=65536e3,
         intra_node_bandwidth=1800e9,
         link_latency=0.0,
-        inter_node_bandwidth=0.0,
+        inter_node_bandwidth=1e+11,
         inter_node_latency=0.0,
     ),
     "NGU800P": dict(

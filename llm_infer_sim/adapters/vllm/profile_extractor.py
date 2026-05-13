@@ -52,12 +52,14 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     model_id = mc.model
     model_config = _extract_model_config(model_id, adapter, hf)
 
-    # ---- 2. ParallelConfig (阶段 2: TP=1) ----
+    # ---- 2. ParallelConfig (阶段 4 起 tp>1, 阶段 6 起 ep>1) ----
     pc = vllm_config.parallel_config
     parallel = ParallelConfig(
         tp_size=pc.tensor_parallel_size,
         dp_size=getattr(pc, "data_parallel_size", 1) or 1,
-        enable_ep=False,
+        # vLLM ParallelConfig.enable_expert_parallel: bool, 默认 False
+        # 当 True 时, EP group = TP × DP (单节点下 = TP)
+        enable_ep=bool(getattr(pc, "enable_expert_parallel", False)),
     )
 
     # ---- 3. EfficiencyProfile (placeholder 全 1.0) ----
