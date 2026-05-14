@@ -83,19 +83,26 @@ def estimate_param_bytes(
     model: ModelConfig,
     w_byte: float = 2.0,
     expert_w_byte: float | None = None,
+    base_w_byte: float | None = None,
 ) -> int:
     """估算模型总权重字节数, dtype-aware.
 
     Args:
-      w_byte: 非 routed-expert 部分 dtype (attention / dense FFN / shared expert / embed / lm_head / norm)
+      w_byte: 量化层 dtype (attention QKVO / dense FFN / shared expert).
       expert_w_byte: routed expert 专用 dtype. None 时按 model.expert_fp4 推断:
                      expert_fp4=True → 0.5 (fp4), 否则 fallback 到 w_byte.
+      base_w_byte: 非量化层 dtype (embed / lm_head / final_norm / per-layer norm).
+                   None 时 fallback 到 w_byte (向后兼容旧 caller).
+                   fp8 / fp4 量化模型实际 lm_head / embed 仍是 bf16, 因此 base_w_byte
+                   应是 model_config.dtype 对应字节数 (一般 2.0), 不跟 w_byte 走.
 
-    V4 production 真实: attention/wo/shared = fp8 (1.0), routed expert = fp4 (0.5).
-    旧版本 sizing 按统一 w_byte 算导致 V4 weights/rank 高估 ~4× (`阶段 9-ε` 退出验证记录).
+    V4 production 真实: attention/wo/shared = fp8 (1.0), routed expert = fp4 (0.5),
+    lm_head/embed/norm = bf16 (2.0).
     """
     if expert_w_byte is None:
         expert_w_byte = 0.5 if model.expert_fp4 else w_byte
+    if base_w_byte is None:
+        base_w_byte = w_byte
     h = model.hidden_dim
     attn_per_layer = _count_attention_per_layer(model)
     dense_ffn = _count_dense_ffn_per_layer(model)
@@ -110,12 +117,14 @@ def estimate_param_bytes(
             bytes_total += int(shared * w_byte)
         else:
             bytes_total += int(dense_ffn * w_byte)
-        bytes_total += int(2 * h * w_byte)
+        # 每 layer 2 个 RMSNorm: 用 base (norm 永远不量化)
+        bytes_total += int(2 * h * base_w_byte)
 
+    # embed / lm_head / final_norm: 永远走基础 dtype (即使主体量化也保留 bf16)
     embed = model.vocab_size * h
     lm_head = model.vocab_size * h
     final_norm = h
-    bytes_total += int((embed + lm_head + final_norm) * w_byte)
+    bytes_total += int((embed + lm_head + final_norm) * base_w_byte)
     return bytes_total
 
 
@@ -125,6 +134,7 @@ def per_rank_param_bytes(
     tp_size: int,
     ep_size: int = 1,
     expert_w_byte: float | None = None,
+    base_w_byte: float | None = None,
 ) -> int:
     """估算 TP+EP shard 后单 rank 的权重字节数.
 
@@ -135,10 +145,17 @@ def per_rank_param_bytes(
         两种布局存储量等价, 都是 routed_total / tp.
       - 其他 (attention / dense / shared / embed / lm_head): 按 tp_size 切
 
+    dtype 切分:
+      - 量化层 (attention / dense / shared expert): w_byte
+      - routed expert: expert_w_byte (默认按 model.expert_fp4)
+      - 非量化层 (embed / lm_head / final_norm / per-layer norm): base_w_byte (None → w_byte)
+
     EP=1 时退化到纯 TP 切分.
     """
     if expert_w_byte is None:
         expert_w_byte = 0.5 if model.expert_fp4 else w_byte
+    if base_w_byte is None:
+        base_w_byte = w_byte
     h = model.hidden_dim
     attn_per_layer = _count_attention_per_layer(model)
     dense_ffn = _count_dense_ffn_per_layer(model)
@@ -148,8 +165,6 @@ def per_rank_param_bytes(
     ep = max(1, ep_size)
     expert_shard = max(tp, ep)
 
-    # norm bytes 量级 << 其他 (< 0.1% 总量), 简化跟着 tp 一起切 — 保持 sizing 对 tp 线性,
-    # 跟 `estimate_param_bytes / tp` 等价 (现有测试约定).
     bytes_total = 0
     for layer_idx in range(model.num_layers):
         bytes_total += int(attn_per_layer * w_byte // tp)
@@ -158,12 +173,14 @@ def per_rank_param_bytes(
             bytes_total += int(shared * w_byte // tp)
         else:
             bytes_total += int(dense_ffn * w_byte // tp)
-        bytes_total += int(2 * h * w_byte // tp)
+        # 2 个 RMSNorm 用 base (norm 永远不量化, 跟 tp 一起切)
+        bytes_total += int(2 * h * base_w_byte // tp)
 
+    # embed / lm_head / final_norm: 永远走基础 dtype (即使主体量化也保留 bf16)
     embed = model.vocab_size * h
     lm_head = model.vocab_size * h
     final_norm = h
-    bytes_total += int((embed + lm_head + final_norm) * w_byte // tp)
+    bytes_total += int((embed + lm_head + final_norm) * base_w_byte // tp)
     return bytes_total
 
 
@@ -179,5 +196,10 @@ def estimate_activation_bytes(
 
     fudge 反映: FA workspace + intermediate buffers + 短时峰值, 默认 4× 保守.
     阶段 X profiling 校准后替换.
+
+    注: 这里 a_byte 应是 **buffer dtype**, 不是 GEMM input dtype.
+        dynamic fp8 量化下 activation buffer 短时为 bf16 (a_byte=2.0) 后才被
+        in-place quantize 到 fp8 喂给 GEMM (a_byte=1.0). caller 应传 base_a_byte
+        而非 quant a_byte (否则 KV budget 偏乐观).
     """
     return int(max_num_batched_tokens * model.hidden_dim * a_byte * fudge)

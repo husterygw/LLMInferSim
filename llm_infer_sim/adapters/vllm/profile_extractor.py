@@ -93,6 +93,20 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         if activation_scheme in ("dynamic", "static"):
             efficiency.a_byte = 1.0
 
+    # ---- 3.5b. Non-quantized modules 解析 ----
+    # compressed-tensors: `ignore` (list of patterns / regex)
+    # awq / gptq / bitsandbytes: `modules_to_not_convert` (list of module names)
+    covered_non_quantized, unhandled_non_quantized = _classify_non_quantized_modules(qcfg)
+    if unhandled_non_quantized:
+        # log 让用户知道有 ignore pattern 没被 base 路径覆盖, sizing 会偏差
+        import warnings
+        warnings.warn(
+            f"profile_extractor: 检测到 {len(unhandled_non_quantized)} 个 ignore "
+            f"pattern 不在已知 base 集合 (lm_head/embed/norm), sizing 不为它们做 "
+            f"bytes correction. patterns: {unhandled_non_quantized}",
+            stacklevel=2,
+        )
+
     # ---- 3.6. KV cache dtype 切 kv_byte ----
     # vLLM `cache_config.cache_dtype`:
     #   "auto"        → 跟 model dtype 走 (默认; 这里保留 efficiency.kv_byte 不变)
@@ -121,6 +135,11 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     use_fp4_indexer = bool(getattr(attn_cfg, "use_fp4_indexer_cache", False))
     indexer_kv_byte = 0.5 if use_fp4_indexer else 1.0
 
+    # ---- 5.4 base dtype (非量化层 + activation buffer) ----
+    # 从 model_config.dtype (torch.dtype) 推: bf16/fp16=2.0, fp32=4.0, fp8=1.0.
+    # 即使 quant_method=fp8, lm_head / embed / final_norm / per-layer norm 仍走基础 dtype.
+    base_dtype_byte = _torch_dtype_to_byte(getattr(mc, "dtype", None), default=2.0)
+
     # ---- 5.5 PD 分离 (详设 §7.6) ----
     pd_cfg = _extract_pd_config(vllm_config)
 
@@ -131,7 +150,11 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         w_byte=efficiency.w_byte,
         a_byte=efficiency.a_byte,
         kv_byte=efficiency.kv_byte,
+        base_w_byte=base_dtype_byte,
+        base_a_byte=base_dtype_byte,
         indexer_kv_byte=indexer_kv_byte,
+        covered_non_quantized=covered_non_quantized,
+        unhandled_non_quantized_modules=unhandled_non_quantized,
         parallel=parallel,
         pd=pd_cfg,
         use_flash_attention=True,                # 现代 vLLM 默认 flash
@@ -147,6 +170,71 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         efficiency=efficiency,
         backend=backend,
     )
+
+
+# 已知的 "永远 base dtype" 模块 (我们 sizing 已经把它们算成 base_w_byte).
+# pattern 是 substring match (case-insensitive). 真实 ignore 列表通常含 regex 比如
+# "re:.*lm_head", 我们简化成 substring 匹配 (够覆盖 99% 场景).
+_KNOWN_BASE_PATTERNS = (
+    "lm_head", "embed_tokens", "embedding",
+    "layernorm", "rms_norm", "rmsnorm", "norm",
+)
+
+
+def _classify_non_quantized_modules(qcfg) -> tuple[list[str], list[str]]:
+    """解析 quantization_config 里的 ignore / modules_to_not_convert.
+
+    返回 (covered, unhandled):
+      covered: pattern 命中 _KNOWN_BASE_PATTERNS, sizing 已经把这些层算成 base dtype, no-op
+      unhandled: 其他 pattern (例: 某层 q_proj, 某 Linear), 当前 sizing 没建模
+                 — 用 list 记录, extract 时 log warn, 让用户感知精度 gap
+
+    覆盖的 quant config schema:
+      - compressed-tensors: {"ignore": [str, ...]}    (可能含 "re:..." regex 前缀)
+      - awq / gptq / bitsandbytes: {"modules_to_not_convert": [str, ...]}
+      - 其他: 不动
+    """
+    if qcfg is None:
+        return [], []
+    if isinstance(qcfg, dict):
+        ignore = qcfg.get("ignore") or []
+        not_convert = qcfg.get("modules_to_not_convert") or []
+    else:
+        ignore = getattr(qcfg, "ignore", None) or []
+        not_convert = getattr(qcfg, "modules_to_not_convert", None) or []
+    raw = list(ignore) + list(not_convert)
+    if not raw:
+        return [], []
+    covered: list[str] = []
+    unhandled: list[str] = []
+    for pat in raw:
+        if not isinstance(pat, str):
+            continue
+        # 剥 regex 前缀 "re:"
+        norm = pat[3:] if pat.startswith("re:") else pat
+        norm_lower = norm.lower()
+        # 任意 known base substring 命中 → covered
+        if any(kp in norm_lower for kp in _KNOWN_BASE_PATTERNS):
+            covered.append(pat)
+        else:
+            unhandled.append(pat)
+    return covered, unhandled
+
+
+def _torch_dtype_to_byte(dtype, default: float = 2.0) -> float:
+    """torch.dtype → 字节宽度. 不 import torch, 用字符串匹配 (适配 mock 场景)."""
+    if dtype is None:
+        return default
+    name = str(dtype).lower()  # e.g. "torch.bfloat16"
+    if any(k in name for k in ("float32", "float64")):
+        return 4.0
+    if any(k in name for k in ("float16", "bfloat16", "half")):
+        return 2.0
+    if "float8" in name or "fp8" in name or "int8" in name:
+        return 1.0
+    if "float4" in name or "fp4" in name:
+        return 0.5
+    return default
 
 
 def _extract_model_config(model_id, adapter, hf) -> ModelConfig:

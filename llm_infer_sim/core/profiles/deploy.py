@@ -139,12 +139,29 @@ class DeployConfig:
     output_len: int = 128
 
     # Quantization (byte widths)
-    w_byte: float = 2.0   # weight: 2=fp16, 1=int8, 0.5=int4
-    a_byte: float = 2.0   # activation
-    kv_byte: float = 2.0  # KV cache
+    w_byte: float = 2.0   # weight (主体, 量化层): 2=fp16, 1=fp8/int8, 0.5=fp4/int4
+    a_byte: float = 2.0   # activation (GEMM input, 量化层): 跟 quant 一致 (fp8 → 1.0)
+    kv_byte: float = 2.0  # KV cache: 2=fp16, 1=fp8, 0.5=fp4
+    # 非量化层 (lm_head / embed / norm) 始终走基础 dtype.
+    # 从 model_config.dtype 推导, 跟 quant_method 解耦. 例 fp8 量化模型:
+    #   w_byte = 1.0, base_w_byte = 2.0 (lm_head/embed/norm 仍是 bf16).
+    base_w_byte: float = 2.0
+    # Activation BUFFER 字节 (HBM 中的 X tensor 实际占地). 跟 a_byte 区分:
+    #   - dynamic fp8 量化: GEMM 输入 fp8 (a_byte=1) 但 buffer 短时 bf16 (base_a_byte=2)
+    #   - static fp8 / weight-only: 两个值相等
+    # 用于 estimate_activation_bytes (KV budget 计算需要 peak buffer 大小).
+    base_a_byte: float = 2.0
     # V4-specific: indexer K cache byte width. fp8 = 1.0 默认, fp4 = 0.5.
     # 从 vllm_config.attention_config.use_fp4_indexer_cache 推导(阶段 9 加).
     indexer_kv_byte: float = 1.0
+
+    # compressed-tensors / awq / gptq 的 `ignore` 或 `modules_to_not_convert`:
+    # 解析后的"已被 base 路径覆盖的" pattern (lm_head / embed / norm).
+    covered_non_quantized: list[str] = field(default_factory=list)
+    # 不在已知 base 集合里、需要用户关注的 pattern (例: 某层特定 Linear).
+    # 当前 sizing 不为这些做 bytes correction (需 per-Linear graph 才能精确),
+    # 用 list 记录 + extract 时 log warn, 让用户知道有 mismatch.
+    unhandled_non_quantized_modules: list[str] = field(default_factory=list)
 
     # Parallelism
     parallel: ParallelConfig = field(default_factory=ParallelConfig)

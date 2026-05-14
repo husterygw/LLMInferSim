@@ -23,7 +23,9 @@ from llm_infer_sim.core.ops.attention import (
     attention_decode_sparse,
     rope_kernel,
 )
-from llm_infer_sim.core.ops.normalization import norm_layer, residual_add, mlp_activation, hc_pre, hc_post
+from llm_infer_sim.core.ops.normalization import (
+    norm_layer, residual_add, mlp_activation, hc_pre, hc_post, activation_quantize,
+)
 from llm_infer_sim.core.ops.communication import allreduce_time, alltoall_time
 from llm_infer_sim.core.ops.embedding import embedding, lm_head
 from llm_infer_sim.core.cost_model.roofline import RooflineAnalyzer
@@ -50,6 +52,24 @@ def _comm_op(name: str, comm_bytes: float, comm_type: str) -> OperatorProfile:
         name=name, op_category="communication",
         comm_bytes=comm_bytes, comm_type=comm_type,
     )
+
+
+def _maybe_quant_op(
+    ops: list[OperatorProfile],
+    name: str,
+    tokens: int,
+    hidden_size: int,
+    deploy: DeployConfig,
+) -> None:
+    """如果 dynamic activation quant 启用 (a_byte < base_a_byte), 在 ops 后追加
+    activation_quantize op. 模型 lm_head/embed 不走这条路径, 只在 layer 内部的
+    norm → Linear 转换点插入。"""
+    if deploy.a_byte < deploy.base_a_byte:
+        ops.append(activation_quantize(
+            name, tokens, hidden_size,
+            base_a_byte=deploy.base_a_byte,
+            a_byte=deploy.a_byte,
+        ))
 
 
 def _append_attn_tail(
@@ -126,6 +146,7 @@ def _build_standard_attention_block(
     ops: list[OperatorProfile] = []
 
     ops.append(norm_layer("attn_norm", tokens, h, deploy.a_byte))
+    _maybe_quant_op(ops, "attn_input_quant", tokens, h, deploy)
 
     # 阶段 3: 标准 MHA/GQA 走 QKVParallelLinear fusion (详设 §4.7.1a (1))
     ops.append(fused_qkv_gemm(
@@ -220,6 +241,7 @@ def _build_mla_attention_block(
     q_head_dim = qk_nope + qk_rope  # 192 in V3 (128 nope + 64 rope)
 
     ops.append(norm_layer("attn_norm", tokens, h, deploy.a_byte))
+    _maybe_quant_op(ops, "attn_input_quant", tokens, h, deploy)
 
     # Q projection: 可选 LoRA 分解
     if model.q_lora_rank > 0:
@@ -403,6 +425,7 @@ def _build_v32_mla_sparse_attention_block(
     q_head_dim = qk_nope + qk_rope
 
     ops.append(norm_layer("attn_norm", tokens, h, deploy.a_byte))
+    _maybe_quant_op(ops, "attn_input_quant", tokens, h, deploy)
 
     # Q projection (LoRA decomposition, MLA standard)
     if model.q_lora_rank > 0:
@@ -496,6 +519,7 @@ def _build_v4_sparse_attention_block(
         ops.append(hc_pre("hc_attn_pre", tokens, h, model.hc_mult,
                           model.hc_sinkhorn_iters, deploy.a_byte, deploy.w_byte))
     ops.append(norm_layer("attn_norm", tokens, h, deploy.a_byte))
+    _maybe_quant_op(ops, "attn_input_quant", tokens, h, deploy)
 
     # Per-op precision: FP8 for non-expert linear ops when global quant is FP8
     op_prec = "fp8" if deploy.w_byte <= 1.0 else "fp16"
@@ -683,6 +707,7 @@ def _build_dense_ffn_block(
         ops.append(hc_pre("hc_ffn_pre", tokens, h, model.hc_mult,
                           model.hc_sinkhorn_iters, deploy.a_byte, deploy.w_byte))
     ops.append(norm_layer("mlp_norm", tokens, h, deploy.a_byte))
+    _maybe_quant_op(ops, "mlp_input_quant", tokens, h, deploy)
 
     # 阶段 3: Gate + Up 走 MergedColumnParallelLinear fusion (详设 §4.7.1a (2))
     ops.append(fused_gate_up_gemm(
@@ -746,6 +771,7 @@ def _build_moe_ffn_block(
         ops.append(hc_pre("hc_ffn_pre", tokens, h, model.hc_mult,
                           model.hc_sinkhorn_iters, deploy.a_byte, deploy.w_byte))
     ops.append(norm_layer("mlp_norm", tokens, h, deploy.a_byte))
+    _maybe_quant_op(ops, "mlp_input_quant", tokens, h, deploy)
 
     # Router gate (replicated, no comm).
     # 阶段 9 fix 13: V4 前 num_hash_layers 层用 tid2eid lookup (无 router GEMM),

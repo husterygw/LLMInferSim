@@ -316,3 +316,178 @@ def test_cache_dtype_auto_keeps_default():
 def test_cache_dtype_int8_switches_kv_byte():
     bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="int8"))
     assert bundle.deploy.kv_byte == 1.0
+
+
+# ---------------------------------------------------------------------------
+# base_w_byte / base_a_byte (non-quantized 层 dtype from model_config.dtype)
+# ---------------------------------------------------------------------------
+
+def _make_vllm_config_with_dtype(model_dtype, quant_cfg=None, cache_dtype=None):
+    """支持 model_config.dtype 的 helper."""
+    hf = SimpleNamespace(
+        model_type="qwen3",
+        num_attention_heads=32, num_key_value_heads=8,
+        hidden_size=2560, num_hidden_layers=36,
+        intermediate_size=9728, vocab_size=151936, head_dim=128,
+        quantization_config=quant_cfg,
+    )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf, model="dummy", dtype=model_dtype),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, data_parallel_size=1),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype) if cache_dtype else None,
+    )
+
+
+def test_base_dtype_bfloat16_gives_2_byte():
+    """model_config.dtype = torch.bfloat16 → base_w/a_byte = 2.0."""
+    import torch
+    bundle = extract_profile_bundle(_make_vllm_config_with_dtype(torch.bfloat16))
+    assert bundle.deploy.base_w_byte == 2.0
+    assert bundle.deploy.base_a_byte == 2.0
+
+
+def test_base_dtype_float16_gives_2_byte():
+    import torch
+    bundle = extract_profile_bundle(_make_vllm_config_with_dtype(torch.float16))
+    assert bundle.deploy.base_w_byte == 2.0
+
+
+def test_base_dtype_float32_gives_4_byte():
+    import torch
+    bundle = extract_profile_bundle(_make_vllm_config_with_dtype(torch.float32))
+    assert bundle.deploy.base_w_byte == 4.0
+
+
+def test_base_dtype_decouples_from_quant_method():
+    """关键: fp8 量化模型 lm_head/embed/norm 仍走 base = model dtype.
+
+    DeepSeek-V3 部署形态: dtype=bfloat16 + quant_method=fp8 →
+      w_byte=1.0 (主体 fp8)
+      base_w_byte=2.0 (lm_head/embed/norm 仍 bf16)
+      base_a_byte=2.0 (activation peak buffer 仍 bf16)
+    """
+    import torch
+    qcfg = {"quant_method": "fp8", "activation_scheme": "dynamic"}
+    vc = _make_vllm_config_with_dtype(torch.bfloat16, quant_cfg=qcfg)
+    bundle = extract_profile_bundle(vc)
+    assert bundle.deploy.w_byte == 1.0           # 主体 fp8
+    assert bundle.deploy.a_byte == 1.0           # GEMM input fp8
+    assert bundle.deploy.base_w_byte == 2.0      # lm_head/embed/norm bf16
+    assert bundle.deploy.base_a_byte == 2.0      # peak buffer bf16
+
+
+def test_base_dtype_none_fallback_to_2():
+    """model_config.dtype 缺失 (老 mock / 没 dtype) → fallback 2.0."""
+    bundle = extract_profile_bundle(_make_vllm_config_with())
+    assert bundle.deploy.base_w_byte == 2.0
+    assert bundle.deploy.base_a_byte == 2.0
+
+
+def test_torch_dtype_to_byte_helper():
+    """_torch_dtype_to_byte 直接覆盖各种 dtype 字符串."""
+    import torch
+    from llm_infer_sim.adapters.vllm.profile_extractor import _torch_dtype_to_byte
+    assert _torch_dtype_to_byte(torch.bfloat16) == 2.0
+    assert _torch_dtype_to_byte(torch.float16) == 2.0
+    assert _torch_dtype_to_byte(torch.float32) == 4.0
+    assert _torch_dtype_to_byte(torch.float64) == 4.0
+    assert _torch_dtype_to_byte(None) == 2.0     # default
+    assert _torch_dtype_to_byte(None, default=4.0) == 4.0
+
+
+def test_torch_dtype_to_byte_fp8_string_match():
+    """torch.float8_e4m3fn 等 fp8 dtype → 1.0."""
+    from llm_infer_sim.adapters.vllm.profile_extractor import _torch_dtype_to_byte
+    # 用字符串 (不所有 torch 版本都有 float8 类型)
+    assert _torch_dtype_to_byte("torch.float8_e4m3fn") == 1.0
+    assert _torch_dtype_to_byte("torch.int8") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Non-quantized modules 解析 (compressed-tensors.ignore + awq.modules_to_not_convert)
+# ---------------------------------------------------------------------------
+
+def test_classify_no_ignore_list():
+    """无 ignore/modules_to_not_convert → 空列表."""
+    from llm_infer_sim.adapters.vllm.profile_extractor import _classify_non_quantized_modules
+    qcfg = {"quant_method": "fp8"}
+    cov, unh = _classify_non_quantized_modules(qcfg)
+    assert cov == [] and unh == []
+
+
+def test_classify_compressed_tensors_ignore_lm_head():
+    """compressed-tensors ignore 含 "re:.*lm_head" → covered (已在 base 路径)."""
+    from llm_infer_sim.adapters.vllm.profile_extractor import _classify_non_quantized_modules
+    qcfg = {
+        "quant_method": "compressed-tensors",
+        "ignore": ["re:.*lm_head", "model.embed_tokens"],
+    }
+    cov, unh = _classify_non_quantized_modules(qcfg)
+    assert len(cov) == 2
+    assert unh == []
+
+
+def test_classify_awq_modules_to_not_convert():
+    """awq 用 modules_to_not_convert 字段 (不是 ignore)."""
+    from llm_infer_sim.adapters.vllm.profile_extractor import _classify_non_quantized_modules
+    qcfg = {"quant_method": "awq", "modules_to_not_convert": ["lm_head"]}
+    cov, unh = _classify_non_quantized_modules(qcfg)
+    assert cov == ["lm_head"]
+    assert unh == []
+
+
+def test_classify_unhandled_specific_linear():
+    """ignore 含特定 Linear (例某层 q_proj), 不在 base 集合 → unhandled."""
+    from llm_infer_sim.adapters.vllm.profile_extractor import _classify_non_quantized_modules
+    qcfg = {
+        "quant_method": "compressed-tensors",
+        "ignore": ["re:.*lm_head", "model.layers.0.self_attn.q_proj"],
+    }
+    cov, unh = _classify_non_quantized_modules(qcfg)
+    assert cov == ["re:.*lm_head"]
+    assert unh == ["model.layers.0.self_attn.q_proj"]
+
+
+def test_classify_norm_patterns():
+    """各种 norm 名称都应被识别为 covered."""
+    from llm_infer_sim.adapters.vllm.profile_extractor import _classify_non_quantized_modules
+    qcfg = {
+        "quant_method": "fp8",
+        "ignore": ["input_layernorm", "post_attention_layernorm", "rms_norm",
+                   "final_layernorm"],
+    }
+    cov, unh = _classify_non_quantized_modules(qcfg)
+    assert len(cov) == 4
+    assert unh == []
+
+
+def test_extractor_propagates_classification_to_deploy():
+    """profile_extractor 把分类结果填到 DeployConfig."""
+    import torch
+    qcfg = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "ignore": ["re:.*lm_head"],
+    }
+    vc = _make_vllm_config_with_dtype(torch.bfloat16, quant_cfg=qcfg)
+    bundle = extract_profile_bundle(vc)
+    assert "re:.*lm_head" in bundle.deploy.covered_non_quantized
+    assert bundle.deploy.unhandled_non_quantized_modules == []
+
+
+def test_extractor_warns_on_unhandled():
+    """unhandled pattern 触发 warning + 写入 deploy."""
+    import warnings
+    import torch
+    qcfg = {
+        "quant_method": "compressed-tensors",
+        "ignore": ["model.layers.5.mlp.gate_up_proj"],  # 不在 base 集合
+    }
+    vc = _make_vllm_config_with_dtype(torch.bfloat16, quant_cfg=qcfg)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        bundle = extract_profile_bundle(vc)
+        # 至少 1 个 warning 含 unhandled pattern
+        msgs = [str(item.message) for item in w]
+        assert any("model.layers.5.mlp.gate_up_proj" in m for m in msgs)
+    assert "model.layers.5.mlp.gate_up_proj" in bundle.deploy.unhandled_non_quantized_modules

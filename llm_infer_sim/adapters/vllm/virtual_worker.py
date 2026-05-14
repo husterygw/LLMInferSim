@@ -185,9 +185,14 @@ class VirtualWorker(WorkerBase):
         ep = deploy.ep
         # dtype-aware + EP-aware: routed expert 按 ep 切 + 用 expert_w_byte (V4 fp4=0.5).
         # expert_w_byte 在 per_rank_param_bytes 内部从 model.expert_fp4 推断.
-        weight_bytes = per_rank_param_bytes(model, deploy.w_byte, tp, ep_size=ep)
+        # base_w_byte 用于 embed/lm_head/norm (fp8 模型这些层仍是 bf16).
+        weight_bytes = per_rank_param_bytes(
+            model, deploy.w_byte, tp, ep_size=ep, base_w_byte=deploy.base_w_byte,
+        )
         max_batched = getattr(self.scheduler_config, "max_num_batched_tokens", 2048)
-        activation_bytes = estimate_activation_bytes(model, max_batched, deploy.a_byte)
+        # base_a_byte (不是 deploy.a_byte): activation buffer 是 peak bf16, fp8 GEMM
+        # 输入是 in-place quantize 出来的, peak 内存仍是 base dtype.
+        activation_bytes = estimate_activation_bytes(model, max_batched, deploy.base_a_byte)
 
         available = budget - weight_bytes - activation_bytes
         if available <= 0:

@@ -54,6 +54,45 @@ def mlp_activation(
     )
 
 
+def activation_quantize(
+    name: str,
+    tokens: int,
+    hidden_size: int,
+    base_a_byte: float,
+    a_byte: float,
+    block_size: int = 128,
+    scale_byte: float = 4.0,
+) -> OperatorProfile:
+    """Dynamic activation quantize op: bf16 → fp8 (+ scales).
+
+    建模 fp8 量化模型 (activation_scheme="dynamic" / "static") 的 quantize step:
+      - 读 bf16 X: tokens × hidden × base_a_byte
+      - 算 scale: max-reduce per group + cast (flops ~5/elem)
+      - 写 fp8 X_q: tokens × hidden × a_byte
+      - 写 scales: tokens × ceil(hidden/block_size) × scale_byte (fp32)
+
+    vLLM 默认 `fuse_norm_quant=True`, RMSNorm 与此 op 合体, 省 1 次 read.
+    我们不显式建模 fusion, 把 quant 独立计费, 总 bandwidth 略偏高 ~5-10%, 但比
+    完全忽略 (旧版本 deploy.a_byte=1 时 norm 自身 a_byte 实际是 fp8 的"伪压缩"读)
+    更接近真实。
+
+    Args:
+        base_a_byte: 输入 buffer dtype 字节 (一般 = deploy.base_a_byte = 2.0 bf16)
+        a_byte: 输出 quantized dtype 字节 (= deploy.a_byte = 1.0 fp8 / 0.5 fp4)
+        block_size: per-group scale block (vLLM default 128, DeepSeek-V3 = 128)
+        scale_byte: scale 张量 dtype (fp32 = 4.0)
+    """
+    elements = tokens * hidden_size
+    scale_groups = tokens * ((hidden_size + block_size - 1) // block_size)
+    return OperatorProfile(
+        name=name,
+        op_category="activation",
+        flops=elements * 5,
+        load_act=int(elements * base_a_byte),
+        store_act=int(elements * a_byte + scale_groups * scale_byte),
+    )
+
+
 def fused_add_rms_norm(
     name: str,
     tokens: int,

@@ -118,6 +118,52 @@ def test_ep_shard_equals_tp_shard_when_ep_eq_tp():
     assert tp_only == ep_eq_tp
 
 
+def test_base_w_byte_keeps_embed_lmhead_at_bf16_under_fp8():
+    """FP8 模型 (w_byte=1.0) 但 lm_head/embed/final_norm 保留 bf16 (base=2.0).
+
+    Qwen3-4B vocab=151936, hidden=2560: embed+lm_head = 2 × 151936 × 2560 = 778M params.
+    base_w_byte=2.0 时 778M × 2 = 1.55 GB; 跟 w_byte=1.0 一起算只有 0.78 GB. 差 0.78GB.
+    """
+    model = _qwen3_4b()
+    # 全 fp8 (旧行为, base 跟随 w)
+    all_fp8 = estimate_param_bytes(model, w_byte=1.0, base_w_byte=1.0)
+    # fp8 主体 + bf16 base (新行为)
+    mixed = estimate_param_bytes(model, w_byte=1.0, base_w_byte=2.0)
+    # 差 ≈ (embed + lm_head + norms) × 1 byte
+    h = 2560
+    embed_lmhead_norm_params = (
+        2 * 151936 * h + h        # embed + lm_head + final_norm
+        + 36 * 2 * h              # per-layer 2 RMSNorm
+    )
+    delta = mixed - all_fp8
+    expected_delta = embed_lmhead_norm_params  # × (2-1) = × 1
+    assert abs(delta - expected_delta) / expected_delta < 0.01, (
+        f"base bf16 vs fp8 delta {delta} 偏离预期 {expected_delta}"
+    )
+
+
+def test_base_w_byte_none_falls_back_to_w_byte():
+    """base_w_byte=None 时退化到 w_byte (向后兼容)."""
+    model = _qwen3_4b()
+    a = estimate_param_bytes(model, w_byte=1.0, base_w_byte=None)
+    b = estimate_param_bytes(model, w_byte=1.0, base_w_byte=1.0)
+    assert a == b
+
+
+def test_per_rank_base_w_byte_under_fp8():
+    """per_rank 也应用 base_w_byte 区分 lm_head/embed."""
+    model = _qwen3_4b()
+    fp8_only = per_rank_param_bytes(model, w_byte=1.0, tp_size=2)  # base=w default
+    mixed = per_rank_param_bytes(
+        model, w_byte=1.0, tp_size=2, base_w_byte=2.0,
+    )
+    assert mixed > fp8_only
+    # 都 / tp=2 后差距也 / 2
+    expected_delta_approx = (2 * 151936 * 2560 + 2560 + 36 * 2 * 2560) // 2
+    actual_delta = mixed - fp8_only
+    assert abs(actual_delta - expected_delta_approx) / expected_delta_approx < 0.02
+
+
 def test_dp_does_not_change_dense_per_rank():
     """Pure DP (tp=1, dp=N): 每个 DP rank 是独立完整副本, weights/rank 不随 dp 变.
 
