@@ -41,6 +41,10 @@ class GlobalStepWorkload:
     total_scheduled_tokens: int = 0
     num_prefill_requests: int = 0
     num_decode_requests: int = 0
+    # 本 step 中新到 prefill 请求已被 prefix-cache 命中, 因此本不需 forward 的 token 数。
+    # 仅统计 new_req.num_computed_tokens > 0 的情形 (cache 命中); 已存在的 cached_req
+    # 的 num_computed_tokens 来自先前 step 自然累加, 不算 prefix caching 节省。
+    num_prefix_cached_tokens: int = 0
 
     @property
     def max_context_len(self) -> int:

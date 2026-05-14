@@ -234,3 +234,85 @@ def test_extracted_backend_profile_for_no_attention_config():
     bundle = extract_profile_bundle(_make_vllm_config(hf))
     assert bundle.backend.name == "flash_attn_auto"
     assert bundle.backend.mixed_attention.mode == "unified_ragged"
+
+
+# ---------------------------------------------------------------------------
+# §10.5 8.5 FP8 / Quantization 解析 (quant_method + cache_dtype + activation_scheme)
+# ---------------------------------------------------------------------------
+
+def _make_vllm_config_with(quant_cfg=None, cache_dtype=None):
+    """带 quantization_config / cache_config 的 mock VllmConfig."""
+    hf = SimpleNamespace(
+        model_type="qwen3",
+        num_attention_heads=32, num_key_value_heads=8,
+        hidden_size=2560, num_hidden_layers=36,
+        intermediate_size=9728, vocab_size=151936, head_dim=128,
+        quantization_config=quant_cfg,
+    )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf, model="dummy"),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, data_parallel_size=1),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype) if cache_dtype else None,
+    )
+
+
+def test_quant_method_fp8_switches_w_byte_and_a_byte():
+    """quant_method 含 "fp8" + activation_scheme="dynamic" → w_byte=a_byte=1.0."""
+    qcfg = {"quant_method": "fp8", "activation_scheme": "dynamic"}
+    bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
+    assert bundle.deploy.w_byte == 1.0
+    assert bundle.deploy.a_byte == 1.0
+
+
+def test_quant_method_deepseek_v4_fp8_substring_match():
+    """vLLM 把 quant_method 改写成 "deepseek_v4_fp8", 子串匹配应仍切 w_byte=1.0."""
+    qcfg = {"quant_method": "deepseek_v4_fp8", "activation_scheme": "dynamic"}
+    bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
+    assert bundle.deploy.w_byte == 1.0
+    assert bundle.deploy.a_byte == 1.0
+
+
+def test_quant_method_fp4_overrides_w_a_byte():
+    """fp4 优先匹配 (避免 "fp4" 被 "fp8" 撞上, 子串顺序很关键)."""
+    qcfg = {"quant_method": "nvfp4", "activation_scheme": "dynamic"}
+    bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
+    assert bundle.deploy.w_byte == 0.5
+    assert bundle.deploy.a_byte == 0.5
+
+
+def test_no_quant_config_defaults_to_fp16():
+    """无 quantization_config → 默认 fp16 (w_byte=a_byte=2.0)."""
+    bundle = extract_profile_bundle(_make_vllm_config_with())
+    assert bundle.deploy.w_byte == 2.0
+    assert bundle.deploy.a_byte == 2.0
+
+
+def test_activation_scheme_missing_keeps_a_byte_default():
+    """quant_method=fp8 但无 activation_scheme → 只切 w_byte, a_byte 保留默认 (保守)."""
+    qcfg = {"quant_method": "fp8"}
+    bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
+    assert bundle.deploy.w_byte == 1.0
+    assert bundle.deploy.a_byte == 2.0
+
+
+def test_cache_dtype_fp8_switches_kv_byte():
+    """cache_config.cache_dtype="fp8" → kv_byte=1.0."""
+    bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="fp8"))
+    assert bundle.deploy.kv_byte == 1.0
+
+
+def test_cache_dtype_fp8_e4m3_substring_match():
+    """cache_dtype="fp8_e4m3" 子串匹配 → kv_byte=1.0."""
+    bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="fp8_e4m3"))
+    assert bundle.deploy.kv_byte == 1.0
+
+
+def test_cache_dtype_auto_keeps_default():
+    """cache_dtype="auto" → kv_byte 保持默认 fp16 (跟随 model dtype)."""
+    bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="auto"))
+    assert bundle.deploy.kv_byte == 2.0
+
+
+def test_cache_dtype_int8_switches_kv_byte():
+    bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="int8"))
+    assert bundle.deploy.kv_byte == 1.0

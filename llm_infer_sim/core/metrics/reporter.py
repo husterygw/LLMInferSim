@@ -11,13 +11,19 @@ from dataclasses import asdict
 from pathlib import Path
 
 from llm_infer_sim.core.metrics.collector import MetricsCollector
+from llm_infer_sim.core.simulation.kv_block_allocator import KVBlockAllocator
 
 
 class ReportGenerator:
     """从 MetricsCollector 生成可读 / 结构化报告。"""
 
-    def __init__(self, collector: MetricsCollector) -> None:
+    def __init__(
+        self,
+        collector: MetricsCollector,
+        block_allocator: KVBlockAllocator | None = None,
+    ) -> None:
         self.collector = collector
+        self.block_allocator = block_allocator
 
     def generate_console_report(self) -> str:
         s = self.collector.get_summary()
@@ -52,6 +58,30 @@ class ReportGenerator:
         ]
         for k in ("total_latency", "compute_time", "memory_time", "comm_time"):
             lines.append(f"  {k:<20}: {bd.get(k, 0.0)*1e3:8.3f}")
+
+        # ---- KV block / prefix cache stats (详设 §10.5 4.5) ----
+        if self.block_allocator is not None:
+            c = self.block_allocator.cumulative
+            lines += [
+                "",
+                "─── KV Block Allocator ───",
+                f"  Block size (tokens): {self.block_allocator.block_size}",
+                f"  Block bytes:         {self.block_allocator.block_bytes:,}",
+                f"  Total blocks:        {self.block_allocator.num_blocks_total:,}",
+                f"  Peak in-use:         {c.peak_blocks_in_use:,} "
+                f"({100.0 * c.peak_blocks_in_use / max(self.block_allocator.num_blocks_total, 1):.1f}%)",
+                f"  Steps over capacity: {c.num_steps_over_capacity}",
+                "",
+                "─── Prefix Cache ───",
+                f"  Cached tokens:       {c.cumulative_cached_tokens:,}",
+                f"  Total prompt tokens: {c.cumulative_total_prompt_tokens:,}",
+                f"  Hit rate (tokens):   {c.prefix_cache_hit_rate*100:6.2f}%",
+                f"  Hit rate (blocks):   {c.block_dedup_hit_rate*100:6.2f}%",
+                f"  Blocks alloc/dedup/freed: "
+                f"{c.cumulative_new_blocks_allocated:,} / "
+                f"{c.cumulative_blocks_dedup_hit:,} / "
+                f"{c.cumulative_blocks_freed:,}",
+            ]
         lines.append("=" * 70)
         return "\n".join(lines)
 

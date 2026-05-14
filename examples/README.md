@@ -66,6 +66,24 @@ python examples/run_qwen3_4b.py 2>&1 | tee /tmp/qwen3_dump.log
 
 加 `VLLM_LOGGING_LEVEL=DEBUG` 看 vLLM 内部 debug log。
 
+### `run_prefix_caching.py`
+验证 `enable_prefix_caching=True` 命中后 cost model 透明节省 prefill。Batch 1 跑
+冷 3500-tok prompt, Batch 2 跑同前缀 + 50 tail; 第二次的 prefill latency 应仅是
+第一次的 ~1/13, 自动通过 step_extractor 透传 `num_computed_tokens` 实现。
+step log 在命中时会追加 `cached=X computed=Y`。
+
+⚠️ **内存上限假设**: 我们的 `determine_available_memory` 不感知 PrefixCache
+block 共享, 真机相同 prefix 的多请求会复用同组 block, 实际容量比我们的估算更大。
+当前实现**保守偏差** (cost 不偏快, 吞吐 simulation 偏低), 准确建模需扩 KV
+block allocator (与 PD 分离 §10.5 7.6 共享一部分基建)。
+
+```bash
+VLLM_VIRTUAL_BACKEND=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_USE_V1=1 \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+LLM_INFER_SIM_TIME_MODE=instant \
+python examples/run_prefix_caching.py
+```
+
 ## 与 tests/ 的分工
 
 | 关注 | tests/ | examples/ |

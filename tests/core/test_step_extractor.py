@@ -86,6 +86,74 @@ def test_chunked_prefill_cached_continuation():
     assert r.is_chunked is True
 
 
+def test_num_prefix_cached_tokens_counted_only_on_new_req():
+    """GlobalStepWorkload.num_prefix_cached_tokens 只计 new_req.num_computed_tokens>0
+    的情况, cached_req 的 num_computed_tokens 是过往步骤累加, 不算 prefix cache 节省。"""
+    so = _so(
+        new_reqs=[
+            _new_req("p_cached", prompt_len=1000, computed=800),  # 命中 cache 800
+            _new_req("p_cold", prompt_len=500, computed=0),       # 冷
+        ],
+        cached=_cached(["d1"], num_computed=[200], num_output=[5]),  # decode, 不计入
+        num_scheduled={"p_cached": 200, "p_cold": 500, "d1": 1},
+        total_tokens=701,
+    )
+    wl = VllmStepExtractor.extract(so, step_id=1)
+    assert wl.num_prefix_cached_tokens == 800, "仅 p_cached 的 800 计入"
+
+
+def test_prefix_cache_hit_full_remaining_one_step():
+    """prefix caching: prompt=1000 命中 cache=800, 本 step 调度剩余 200, 不是 chunked。
+
+    验证: num_tokens=200 (只算未缓存), context_len=1000 (attention 仍按全长),
+    phase=PREFILL 不是 CHUNKED_PREFILL。
+    """
+    so = _so(
+        new_reqs=[_new_req("p1", prompt_len=1000, computed=800)],
+        cached=_cached([], [], []),
+        num_scheduled={"p1": 200},
+        total_tokens=200,
+    )
+    wl = VllmStepExtractor.extract(so, step_id=1)
+    r = wl.requests[0]
+    assert r.phase == StepPhase.PREFILL
+    assert r.is_chunked is False
+    assert r.num_tokens == 200, "只对未缓存的 200 token 计费"
+    assert r.context_len == 1000, "attention 仍按完整 prompt 长度"
+
+
+def test_prefix_cache_hit_remaining_still_chunked():
+    """prefix caching + chunked prefill: prompt=2000 命中 800, 剩余 1200 但 chunk=256。"""
+    so = _so(
+        new_reqs=[_new_req("p1", prompt_len=2000, computed=800)],
+        cached=_cached([], [], []),
+        num_scheduled={"p1": 256},
+        total_tokens=256,
+    )
+    wl = VllmStepExtractor.extract(so, step_id=1)
+    r = wl.requests[0]
+    assert r.phase == StepPhase.CHUNKED_PREFILL
+    assert r.is_chunked is True
+    assert r.chunk_size == 256
+    assert r.num_tokens == 256
+    assert r.context_len == 800 + 256, "context = already_computed + current_chunk"
+
+
+def test_prefix_cache_full_hit_zero_compute():
+    """极限场景: prompt 完全命中 cache, num_scheduled=0 (vLLM 实际可能跳过该 step,
+    但 extractor 必须能扛 0-token 输入不崩)。"""
+    so = _so(
+        new_reqs=[_new_req("p1", prompt_len=512, computed=512)],
+        cached=_cached([], [], []),
+        num_scheduled={"p1": 0},
+        total_tokens=0,
+    )
+    wl = VllmStepExtractor.extract(so, step_id=1)
+    r = wl.requests[0]
+    assert r.num_tokens == 0
+    assert r.context_len == 512
+
+
 def test_request_states_target_output_len_propagates():
     """cached step 没 sampling_params, 必须从 request_states 拿 target_output_len。"""
     request_states = {"d1": {"target_output_len": 200}}

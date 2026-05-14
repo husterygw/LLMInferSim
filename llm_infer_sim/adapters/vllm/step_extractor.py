@@ -41,6 +41,7 @@ class VllmStepExtractor:
 
         num_prefill_tokens = 0
         num_decode_tokens = 0
+        num_prefix_cached_tokens = 0
 
         # ---- 1. 新到 prefill 请求 ----
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -49,6 +50,9 @@ class VllmStepExtractor:
             prompt_len = len(new_req.prompt_token_ids or [])
             already_computed = new_req.num_computed_tokens
             target_max = _max_tokens_or_default(new_req.sampling_params)
+            # 新请求首次出现时 num_computed_tokens > 0 = prefix cache 命中
+            if already_computed > 0:
+                num_prefix_cached_tokens += already_computed
             # chunked prefill: 本 step 调度 token 数 < 剩余 prompt
             remaining_prompt = max(prompt_len - already_computed, 0)
             is_chunked = ntok < remaining_prompt
@@ -131,6 +135,7 @@ class VllmStepExtractor:
             num_decode_requests=sum(
                 1 for r in requests if r.phase == StepPhase.DECODE
             ),
+            num_prefix_cached_tokens=num_prefix_cached_tokens,
         )
 
 

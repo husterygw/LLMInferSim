@@ -25,7 +25,11 @@ from llm_infer_sim.core.profiles.backend_profile import (
     BackendExecutionProfile,
     MixedAttentionPolicy,
 )
-from llm_infer_sim.core.profiles.deploy import DeployConfig, ParallelConfig
+from llm_infer_sim.core.profiles.deploy import (
+    DeployConfig,
+    ParallelConfig,
+    PDDisaggConfig,
+)
 from llm_infer_sim.core.profiles.efficiency_profile import EfficiencyProfile
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 from llm_infer_sim.core.profiles.model_adapters import get_adapter
@@ -89,6 +93,22 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         if activation_scheme in ("dynamic", "static"):
             efficiency.a_byte = 1.0
 
+    # ---- 3.6. KV cache dtype 切 kv_byte ----
+    # vLLM `cache_config.cache_dtype`:
+    #   "auto"        → 跟 model dtype 走 (默认; 这里保留 efficiency.kv_byte 不变)
+    #   "fp8" / "fp8_e4m3" / "fp8_e5m2"  → 1 byte
+    #   "fp16" / "bfloat16"              → 2 bytes
+    #   "int8"                           → 1 byte
+    cc = getattr(vllm_config, "cache_config", None)
+    cache_dtype = (getattr(cc, "cache_dtype", "") or "").lower()
+    if "fp8" in cache_dtype or cache_dtype == "int8":
+        efficiency.kv_byte = 1.0
+    elif "fp4" in cache_dtype:
+        efficiency.kv_byte = 0.5
+    elif cache_dtype in ("fp16", "bfloat16", "float16"):
+        efficiency.kv_byte = 2.0
+    # "auto" 或空: 保留默认 (跟随 efficiency.kv_byte = 2.0 fp16)
+
     # ---- 4. HardwareConfig (默认 H100, env 可覆盖) ----
     hw_name = os.environ.get("LLM_INFER_SIM_HW", "H100")
     hw = get_hardware_profile(hw_name)
@@ -101,6 +121,9 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     use_fp4_indexer = bool(getattr(attn_cfg, "use_fp4_indexer_cache", False))
     indexer_kv_byte = 0.5 if use_fp4_indexer else 1.0
 
+    # ---- 5.5 PD 分离 (详设 §7.6) ----
+    pd_cfg = _extract_pd_config(vllm_config)
+
     deploy = DeployConfig(
         batch_size=1,                            # 占位
         input_len=1,                             # 占位
@@ -110,6 +133,7 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         kv_byte=efficiency.kv_byte,
         indexer_kv_byte=indexer_kv_byte,
         parallel=parallel,
+        pd=pd_cfg,
         use_flash_attention=True,                # 现代 vLLM 默认 flash
     )
 
@@ -324,6 +348,47 @@ def _extract_backend_profile(vllm_config) -> BackendExecutionProfile:
     return BackendExecutionProfile(
         name=name,
         mixed_attention=MixedAttentionPolicy(mode=mode),
+    )
+
+
+def _extract_pd_config(vllm_config) -> PDDisaggConfig:
+    """PD 分离 config — sim-only env 优先, 否则读 vllm_config.kv_transfer_config (详设 §7.6).
+
+    优先级:
+      1. `LLM_INFER_SIM_PD_ROLE=kv_producer|kv_consumer|kv_both`
+         + `LLM_INFER_SIM_PD_CONNECTOR=...` (可选, 默认 P2pNcclConnector)
+         **不触发 vLLM 真 connector**, 只走 cost path。推荐用此路径做 cost 评估。
+      2. vllm_config.kv_transfer_config — 用户已手动起 real connector (multi-proc PD).
+         **会同时触发 vLLM PD 真路径**, 我们叠加 cost; 但 vLLM 真路径需 msgpack
+         + connector class 可加载 + 多进程协调, 单进程 demo 通常不工作。
+    """
+    env_role = os.environ.get("LLM_INFER_SIM_PD_ROLE", "").strip()
+    if env_role in ("kv_producer", "kv_consumer", "kv_both"):
+        env_conn = os.environ.get(
+            "LLM_INFER_SIM_PD_CONNECTOR", "P2pNcclConnector"
+        ).strip()
+        env_bw = os.environ.get("LLM_INFER_SIM_PD_BANDWIDTH_GBPS")
+        env_lat = os.environ.get("LLM_INFER_SIM_PD_LATENCY_US")
+        return PDDisaggConfig(
+            role=env_role,
+            connector_name=env_conn,
+            kv_parallel_size=int(os.environ.get("LLM_INFER_SIM_PD_PARALLEL_SIZE", "1")),
+            connector_bandwidth_gbps=float(env_bw) if env_bw else None,
+            connector_latency_us=float(env_lat) if env_lat else None,
+        )
+
+    kvt = getattr(vllm_config, "kv_transfer_config", None)
+    if kvt is None:
+        return PDDisaggConfig()
+    role = getattr(kvt, "kv_role", None)
+    if role is None:
+        return PDDisaggConfig()
+    return PDDisaggConfig(
+        role=role,
+        connector_name=getattr(kvt, "kv_connector", None),
+        kv_parallel_size=int(getattr(kvt, "kv_parallel_size", 1) or 1),
+        connector_bandwidth_gbps=None,
+        connector_latency_us=None,
     )
 
 

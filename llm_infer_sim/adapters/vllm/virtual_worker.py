@@ -182,7 +182,10 @@ class VirtualWorker(WorkerBase):
         budget = int(hbm * utilization)
 
         tp = deploy.tp
-        weight_bytes = per_rank_param_bytes(model, deploy.w_byte, tp)
+        ep = deploy.ep
+        # dtype-aware + EP-aware: routed expert 按 ep 切 + 用 expert_w_byte (V4 fp4=0.5).
+        # expert_w_byte 在 per_rank_param_bytes 内部从 model.expert_fp4 推断.
+        weight_bytes = per_rank_param_bytes(model, deploy.w_byte, tp, ep_size=ep)
         max_batched = getattr(self.scheduler_config, "max_num_batched_tokens", 2048)
         activation_bytes = estimate_activation_bytes(model, max_batched, deploy.a_byte)
 
@@ -236,6 +239,15 @@ class VirtualWorker(WorkerBase):
             "VirtualWorker performs sampling inside execute_model"
         )
 
+    def execute_dummy_batch(self) -> None:
+        """vLLM v1 DP idle rank 同步用 dummy batch (详 vllm/v1/engine/core.py:1758).
+
+        当 DP 集群里某 rank 没活但其他 rank 有时, idle rank 会调这个 keep gloo
+        collective 同步。我们 cost model 不模拟 dummy batch (它在真实 GPU 上是空跑
+        kernel + 跨 rank allreduce, 时间近 0), 直接 noop。
+        """
+        return None
+
     # ------- 阶段 3 D 块: 报告抽取 (供 collective_rpc 调用) -------
 
     def _get_virtual_runner_report(self) -> str:
@@ -243,3 +255,42 @@ class VirtualWorker(WorkerBase):
         if self._virtual_model_runner is None:
             return "(runner not initialized — no steps executed)"
         return self._virtual_model_runner.get_report().generate_console_report()
+
+    def _get_pd_stats(self) -> dict:
+        """examples/run_pd_disagg_loopback.py 拉 PD 累计传输统计."""
+        if self._virtual_model_runner is None:
+            return {"pd_enabled": False}
+        return self._virtual_model_runner.get_pd_stats()
+
+    # ------- PD 分离 stub (详设 §7.6) -------
+
+    def get_kv_connector_handshake_metadata(self):
+        """vLLM v1 在 engine init 时通过 collective_rpc 拉 connector metadata.
+        我们不跑真 connector, 返回 None 让 engine 当作 no-op。"""
+        return None
+
+    def has_kv_connector(self) -> bool:
+        """配套 stub: 上游某些路径会查"我有 connector 吗"."""
+        return False
+
+    def _get_per_request_metrics(self) -> list[dict]:
+        """examples/run_prefix_caching.py 用: 拉每 request 的 ttft / arrival_time /
+        first_token_time 等 sim-time 指标, 供 batch 间对比验证 prefix caching 命中。"""
+        if self._virtual_model_runner is None:
+            return []
+        collector = self._virtual_model_runner.metrics
+        out: list[dict] = []
+        for rm in collector.requests.values():
+            out.append({
+                "request_id": rm.request_id,
+                "arrival_time": rm.arrival_time,
+                "first_token_time": rm.first_token_time,
+                "completion_time": rm.completion_time,
+                "ttft": rm.ttft,
+                "tpot": rm.tpot,
+                "e2e_latency": rm.e2e_latency,
+                "output_tokens": rm.output_tokens,
+                "completed": rm.completed,
+                "num_steps_scheduled": len(rm.per_token_latencies),
+            })
+        return out

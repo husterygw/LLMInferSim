@@ -211,3 +211,56 @@ def test_ep1_uses_allreduce_ep2_uses_alltoall():
     assert not _has_op(lr2, "routed_expert_allreduce")
     assert _has_op(lr2, "ep_alltoall_dispatch")
     assert _has_op(lr2, "ep_alltoall_combine")
+
+
+def test_dp_doubles_ep_world_passes_to_alltoall_time(monkeypatch):
+    """DP+EP 场景: tp=2 dp=1 ep=2  vs  tp=2 dp=2 ep=4. 验证 cost 路径里
+    `alltoall_time(bytes, n, hw)` 的 n 严格等于 ep_world = tp × dp, 不是 tp。
+
+    注: AllToAll cost 与 n 的关系并非单调 (大数据下 n² 项让带宽分摊更优, 总时间可
+    能反而降), 所以验证"参数值"而非"输出大小"。
+    """
+    import llm_infer_sim.core.cost_model.layer_builder as lb
+    captured: list[int] = []
+    original = lb.alltoall_time
+
+    def spy(bytes_, n, hw, **kw):
+        captured.append(n)
+        return original(bytes_, n, hw, **kw)
+
+    monkeypatch.setattr(lb, "alltoall_time", spy)
+
+    hf = SimpleNamespace(
+        model_type="qwen3_moe",
+        num_attention_heads=32, num_key_value_heads=4,
+        hidden_size=2048, num_hidden_layers=48,
+        intermediate_size=6144, vocab_size=151936, head_dim=128,
+        num_experts=128, num_experts_per_tok=8,
+        moe_intermediate_size=768, mlp_only_layers=[],
+    )
+
+    def _bundle(tp, dp):
+        vc = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=hf, model="x"),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=tp, data_parallel_size=dp,
+                enable_expert_parallel=True,
+            ),
+        )
+        return extract_profile_bundle(vc)
+
+    b_small = _bundle(tp=2, dp=1)  # ep_world=2
+    b_big = _bundle(tp=2, dp=2)    # ep_world=4
+    assert b_small.deploy.ep == 2 and b_big.deploy.ep == 4
+
+    captured.clear()
+    lr1 = moe_layer_time(0, "decode", 4, 128, b_small.model, b_small.deploy, b_small.hw)
+    lb._compute_layer_time(lr1.ops, b_small.hw, b_small.deploy)
+    n_used_small = set(captured)
+    assert n_used_small == {2}, f"ep_world=2 应调 alltoall_time(n=2), 实际 {n_used_small}"
+
+    captured.clear()
+    lr2 = moe_layer_time(0, "decode", 4, 128, b_big.model, b_big.deploy, b_big.hw)
+    lb._compute_layer_time(lr2.ops, b_big.hw, b_big.deploy)
+    n_used_big = set(captured)
+    assert n_used_big == {4}, f"ep_world=4 (=tp×dp) 应调 alltoall_time(n=4), 实际 {n_used_big}"

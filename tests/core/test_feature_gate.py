@@ -71,14 +71,46 @@ def test_logprobs_rejected():
         VirtualPlatform._check_unsupported_features(cfg)
 
 
-def test_kv_transfer_rejected_unless_env_set(monkeypatch):
-    cfg = _bare_config(kv_transfer_config=SimpleNamespace(kind="lookup"))
-    monkeypatch.delenv("VLLM_INFER_SIM_ALLOW_PD_DISAGG", raising=False)
-    with pytest.raises(ValueError, match="KV transfer"):
+def test_kv_transfer_valid_role_and_known_connector_allowed():
+    """PD 分离: 已知 connector + 合法 role 直接放行 (详设 §7.6)。"""
+    cfg = _bare_config(
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_producer", kv_connector="P2pNcclConnector",
+            kv_parallel_size=1,
+        ),
+    )
+    VirtualPlatform._check_unsupported_features(cfg)
+
+
+def test_kv_transfer_unknown_role_rejected():
+    cfg = _bare_config(
+        kv_transfer_config=SimpleNamespace(
+            kv_role="bogus_role", kv_connector="P2pNcclConnector",
+        ),
+    )
+    with pytest.raises(ValueError, match="unknown kv_role"):
         VirtualPlatform._check_unsupported_features(cfg)
 
-    # 环境变量显式设 1 后允许
-    monkeypatch.setenv("VLLM_INFER_SIM_ALLOW_PD_DISAGG", "1")
+
+def test_kv_transfer_unknown_connector_rejected_unless_override(monkeypatch):
+    cfg = _bare_config(
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_producer", kv_connector="UnknownConnectorXYZ",
+        ),
+    )
+    monkeypatch.delenv("VLLM_INFER_SIM_ALLOW_UNKNOWN_PD_CONNECTOR", raising=False)
+    with pytest.raises(ValueError, match="UnknownConnectorXYZ"):
+        VirtualPlatform._check_unsupported_features(cfg)
+
+    monkeypatch.setenv("VLLM_INFER_SIM_ALLOW_UNKNOWN_PD_CONNECTOR", "1")
+    VirtualPlatform._check_unsupported_features(cfg)
+
+
+def test_kv_transfer_role_none_is_noop():
+    """kv_transfer_config 存在但 kv_role=None (vLLM noop 形态), 不拦。"""
+    cfg = _bare_config(
+        kv_transfer_config=SimpleNamespace(kv_role=None, kv_connector=None),
+    )
     VirtualPlatform._check_unsupported_features(cfg)
 
 

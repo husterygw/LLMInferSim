@@ -152,16 +152,30 @@ class VirtualPlatform(Platform):
                 "top_k × bytes_per_logprob 估算 transfer 开销。"
             )
 
-        # ---- 6. KV connector / disaggregated prefill ----
-        if (
-            getattr(vllm_config, "kv_transfer_config", None) is not None
-            and os.environ.get("VLLM_INFER_SIM_ALLOW_PD_DISAGG", "0") != "1"
-        ):
-            errors.append(
-                "KV transfer (disaggregated PD) is partially supported but needs "
-                "explicit configuration (see 系方 §2.3.5)。"
-                "如确实要评估, 请设环境变量 VLLM_INFER_SIM_ALLOW_PD_DISAGG=1 显式启用。"
-            )
+        # ---- 6. KV connector / disaggregated prefill (详设 §7.6) ----
+        # MVP 已实现: P2pNcclConnector / LMCacheConnectorV1 / MooncakeConnector /
+        # NixlConnector / OffloadingConnector 等 (详 PD_CONNECTOR_PRESETS).
+        kvt = getattr(vllm_config, "kv_transfer_config", None)
+        if kvt is not None:
+            from llm_infer_sim.core.profiles.deploy import PD_CONNECTOR_PRESETS
+            role = getattr(kvt, "kv_role", None)
+            connector = getattr(kvt, "kv_connector", None)
+            if role is None:
+                # vLLM 允许 kv_transfer_config 但 role=None 当 noop; 我们也放行
+                pass
+            elif role not in ("kv_producer", "kv_consumer", "kv_both"):
+                errors.append(
+                    f"KV transfer: unknown kv_role={role!r}; 期望 "
+                    f"kv_producer / kv_consumer / kv_both。"
+                )
+            elif connector not in PD_CONNECTOR_PRESETS:
+                # 允许 env override 强行放行 (未知 connector 走 fallback 10 GB/s)
+                if os.environ.get("VLLM_INFER_SIM_ALLOW_UNKNOWN_PD_CONNECTOR", "0") != "1":
+                    errors.append(
+                        f"KV transfer connector={connector!r} 不在预设带宽表中: "
+                        f"{sorted(PD_CONNECTOR_PRESETS.keys())}; "
+                        f"设 VLLM_INFER_SIM_ALLOW_UNKNOWN_PD_CONNECTOR=1 走 fallback 带宽。"
+                    )
 
         # ---- 7. Unsupported attention backend (阶段 3.5, 详设 §4.8.1.1) ----
         # platform 启动期就拦, 比 cost model 内部 raise 更早, 错误信息更直接。

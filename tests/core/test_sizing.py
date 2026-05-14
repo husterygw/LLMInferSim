@@ -82,6 +82,92 @@ def test_per_rank_scales_with_tp():
     assert tp4 == total // 4
 
 
+def _v4_flash_like_moe() -> ModelConfig:
+    """近 V4-Flash MoE 配置 (fp4 expert), 用于 sizing dtype/EP-aware 测试."""
+    return ModelConfig(
+        name="V4-Flash-like",
+        hidden_dim=4096, num_heads=32, num_kv_heads=1, head_dim=128,
+        ffn_dim=0, num_layers=43, vocab_size=129280,
+        is_moe=True,
+        num_experts=128, num_activated_experts=4, expert_dim=2048,
+        num_shared_experts=1, moe_layer_freq=1, first_moe_layer=0,
+        expert_fp4=True,                  # ← 关键: 触发 routed expert fp4 路径
+    )
+
+
+def test_expert_fp4_halves_routed_bytes_vs_fp8():
+    """expert_fp4=True 时, routed expert 部分应按 0.5B/param 算, 非 expert 按 w_byte.
+
+    防回归: 旧 sizing 把所有 weight 按统一 w_byte 算, V4-Flash 高估 ~4× routed expert.
+    """
+    model = _v4_flash_like_moe()
+    # fp8 attention + fp4 expert (V4 production)
+    fp4_aware = estimate_param_bytes(model, w_byte=1.0)         # 自动 expert_w_byte=0.5
+    # 强制 routed expert 跟 attention 同 fp8
+    no_fp4 = estimate_param_bytes(model, w_byte=1.0, expert_w_byte=1.0)
+    # routed expert 在总 bytes 中占主导, fp4 vs fp8 应当显著小
+    assert fp4_aware < no_fp4 * 0.6, \
+        f"expert_fp4 应明显省字节; fp4_aware={fp4_aware:,} no_fp4={no_fp4:,}"
+
+
+def test_ep_shard_equals_tp_shard_when_ep_eq_tp():
+    """ep=tp 时 per-rank 应跟纯 TP 等价 (vLLM FusedMoE EP/TP-only 存储等价)."""
+    model = _v4_flash_like_moe()
+    tp_only = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=1)
+    ep_eq_tp = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=8)
+    assert tp_only == ep_eq_tp
+
+
+def test_dp_does_not_change_dense_per_rank():
+    """Pure DP (tp=1, dp=N): 每个 DP rank 是独立完整副本, weights/rank 不随 dp 变.
+
+    sizing.per_rank_param_bytes 不接 dp_size 参数, 因为 dp 不影响 per-rank 切分;
+    切分由 tp + ep 决定。`ep_size = tp × dp` (ParallelConfig.ep_size) 在 MoE+EP
+    下隐式带入 dp 信息, dense / no-EP 时 ep=1 → dp 无影响, 这是正确语义。
+    """
+    model = _qwen3_4b()
+    one_rank = per_rank_param_bytes(model, 2.0, tp_size=1, ep_size=1)
+    full = estimate_param_bytes(model, 2.0)
+    assert one_rank == full, "dp 不应切 dense weight"
+
+
+def test_dp_plus_tp_dense_divides_by_tp_only():
+    """DP+TP dense: tp=2 dp=4 → 每 rank weights = full / 2 (不 / 8)."""
+    model = _qwen3_4b()
+    full = estimate_param_bytes(model, 2.0)
+    tp2 = per_rank_param_bytes(model, 2.0, tp_size=2, ep_size=1)
+    # 允许 1% 误差 (int div 截断 + norm 处理)
+    assert abs(tp2 - full // 2) / full < 0.01
+
+
+def test_dp_plus_tp_plus_ep_moe_shards_routed_by_ep_world():
+    """DP+TP+EP MoE: 例 tp=8 dp=2 ep=16 → routed expert / 16, dense / 8.
+    V4-Pro / Qwen3-235B 多节点部署用此形态。
+    """
+    model = _v4_flash_like_moe()
+    tp_only = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=1)
+    # ep_size=16 模拟 tp=8 + dp=2 + enable_ep
+    tp_plus_dp_ep = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=16)
+    # MoE 主导, routed / 16 vs routed / 8: routed weight 部分应减半
+    assert tp_plus_dp_ep < tp_only
+    # 大致: 设 routed 占绝对主导, ratio ≈ 1/2 (16/8 倍切分)
+    ratio = tp_plus_dp_ep / tp_only
+    assert 0.4 < ratio < 0.95, f"ep_world 翻倍后 per-rank ratio {ratio} 应在 0.4-0.95"
+
+
+def test_v4_per_rank_fp4_aware_matches_expected():
+    """V4-Flash-like 总 weight ≈ 105B params; fp4 expert + fp8 attn / tp=8.
+    routed = 128 × 3 × 4096 × 2048 = 3.22G/layer × 43 layers = 138G params (fp4 → 69 GB)
+    fp4 / tp=8 ≈ 8.6 GB routed + 少量 attn/shared/embed; 总约 10-12 GB/rank.
+    旧公式 (无 fp4): ~22 GB/rank.
+    """
+    model = _v4_flash_like_moe()
+    fp4_aware = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=8) / 1e9
+    no_fp4 = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=8, expert_w_byte=1.0) / 1e9
+    assert fp4_aware < no_fp4 * 0.6
+    assert 8.0 < fp4_aware < 16.0, f"V4-Flash-like fp4 per-rank should be ~10-12 GB, got {fp4_aware:.2f}"
+
+
 def test_activation_scales_linearly():
     model = _qwen3_4b()
     a1 = estimate_activation_bytes(model, 1024, a_byte=2.0)
