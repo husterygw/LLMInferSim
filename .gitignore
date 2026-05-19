@@ -31,3 +31,7 @@ data/
 datasets/
 outputs/
 checkpoints/
+
+# collector data assets (large, regenerable)
+collector/data/operator_db/
+collector/data/**/operator_db/

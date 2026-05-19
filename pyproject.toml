@@ -16,4 +16,7 @@ virtual = "llm_infer_sim.adapters.vllm.virtual_platform:virtual_platform_plugin"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["llm_infer_sim*"]
+include = ["llm_infer_sim*", "collector*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "collector/tests"]

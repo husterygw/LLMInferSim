@@ -127,10 +127,9 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     hw_name = os.environ.get("LLM_INFER_SIM_HW", "H100")
     hw = get_hardware_profile(hw_name)
 
-    # ---- 4b. EfficiencyProfile YAML override (阶段 X.1 B.6) ----
-    # 如 configs/efficiency/{hw}.yaml 存在, 覆盖 placeholder efficiency.
-    # path 优先级: env LLM_INFER_SIM_EFFICIENCY_YAML > configs/efficiency/<hw>.yaml > none.
-    efficiency = _maybe_load_efficiency_yaml(hw_name, fallback=efficiency)
+    # ---- 4b. EfficiencyProfile apply (placeholder = 全 1.0 = pure roofline) ----
+    # 2026-05-18 起: 不再自动加载 YAML 校准。efficiency 默认 placeholder, 后续等
+    # MeasuredOperatorDB 落地后由 cost backend 替换。
     efficiency.apply_to(hw)
 
     # ---- 5. DeployConfig (跨 step 不变的部分; estimate() 时按 workload 覆盖) ----
@@ -469,59 +468,6 @@ def _infer_topology_hint() -> str:
     暂不解析 CUDA_VISIBLE_DEVICES + gpu_to_root (留 Phase 6).
     """
     return os.environ.get("LLM_INFER_SIM_NUMA_HINT", "concentrated")
-
-
-def _maybe_load_efficiency_yaml(hw_name: str, fallback: EfficiencyProfile) -> EfficiencyProfile:
-    """读 configs/efficiency/{hw_name 大小写多变体}.yaml. miss 时返 fallback (placeholder).
-
-    默认行为 (2026-05 起): **不自动加载校准 YAML**。原因:
-      - 校准 YAML 由一次特定模式 (eager / graph) 下的实测拟合而来, 隐式吸收了
-        模式相关 overhead。换 vLLM 模式 / 换模型 / 换硬件后, 这套数会反而拉偏。
-      - 在 Qwen3-4B/RTX 4090 上的对照实验显示: eager 模式下校准 "看起来准"
-        是 dispatch overhead 与 roofline 系统偏高互相抵消的巧合, graph 模式
-        下立刻偏 +60-90%。盲目应用校准弊大于利。
-      - 纯 roofline 上界(无校准)对主流硬件 + 主流 op 误差已经在 ±20% 内,
-        够用。校准应当作为"特定场景显式打开"的工具, 不是默认行为。
-
-    显式启用校准 (opt-in):
-        1. `LLM_INFER_SIM_EFFICIENCY_YAML=/path/to/yaml`  显式指路径
-        2. `LLM_INFER_SIM_USE_CALIBRATION=1`              触发按 hw_name 自动找
-
-    保留 fallback 的 w_byte/a_byte/kv_byte (extract 阶段已根据 quant config 切过),
-    只覆盖 efficiency 字段 (default_compute / default_mem / default_comm / entries).
-    """
-    from pathlib import Path
-    import logging
-    log = logging.getLogger(__name__)
-
-    candidates: list[Path] = []
-    env_path = os.environ.get("LLM_INFER_SIM_EFFICIENCY_YAML")
-    if env_path:
-        candidates.append(Path(env_path))
-
-    # 按 hw_name 自动找校准 YAML — 默认 off, 需 LLM_INFER_SIM_USE_CALIBRATION=1 显式打开
-    if os.environ.get("LLM_INFER_SIM_USE_CALIBRATION", "0") == "1":
-        base = Path(__file__).resolve().parent.parent.parent.parent / "configs" / "efficiency"
-        candidates.append(base / f"{hw_name}.yaml")
-        candidates.append(base / f"{hw_name.lower()}.yaml")
-
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            loaded = EfficiencyProfile.from_yaml(path)
-        except Exception as e:    # noqa: BLE001
-            log.warning("EfficiencyProfile YAML 加载失败 (%s), 用 placeholder: %s",
-                        path, e)
-            return fallback
-        # 保留 extract 阶段已切的 byte 值, 不让 YAML 覆盖
-        loaded.w_byte = fallback.w_byte
-        loaded.a_byte = fallback.a_byte
-        loaded.kv_byte = fallback.kv_byte
-        log.info("Loaded calibrated EfficiencyProfile from %s (%d entries)",
-                 path, len(loaded.entries))
-        return loaded
-    return fallback
 
 
 def _extract_pd_config(vllm_config) -> PDDisaggConfig:
