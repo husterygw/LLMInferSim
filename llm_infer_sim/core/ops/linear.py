@@ -11,6 +11,11 @@ memory access formulas as the original model_analyzer.py inline code.
 from llm_infer_sim.core.ops.base import OperatorProfile
 
 
+from llm_infer_sim.core.profiles.shape_buckets import (
+    OP_KIND_DENSE_GEMM, dense_efficiency_key,
+)
+
+
 def linear_layer(
     name: str,
     ic: int,
@@ -47,6 +52,7 @@ def linear_layer(
         store_act=0 if is_kv_proj else int(oc * tokens * out_a_byte),
         store_kv_cache=int(oc * tokens * kv_byte) if is_kv_proj else 0,
         op_precision=op_precision,
+        efficiency_key=dense_efficiency_key(OP_KIND_DENSE_GEMM, tokens),
     )
 
 
@@ -80,6 +86,7 @@ def fused_qkv_gemm(
         store_act=int(n_q * tokens * a_byte),           # Q 输出
         store_kv_cache=int(2 * n_kv * tokens * kv_byte),  # K + V → KV cache
         op_precision=op_precision,
+        efficiency_key=dense_efficiency_key(OP_KIND_DENSE_GEMM, tokens),
     )
 
 
@@ -107,4 +114,5 @@ def fused_gate_up_gemm(
         load_act=int(hidden * tokens * a_byte),
         store_act=int(n_total * tokens * a_byte),
         op_precision=op_precision,
+        efficiency_key=dense_efficiency_key(OP_KIND_DENSE_GEMM, tokens),
     )

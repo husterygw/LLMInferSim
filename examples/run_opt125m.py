@@ -31,6 +31,7 @@ def main() -> int:
         enforce_eager=True,           # 没真实模型, 也别走 cudagraph
         max_model_len=512,
         max_num_seqs=4,
+        max_logprobs=0,               # VirtualPlatform 不支持 logprobs (无真 logits)
         disable_log_stats=True,
     )
 

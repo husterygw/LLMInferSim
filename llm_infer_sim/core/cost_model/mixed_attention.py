@@ -40,6 +40,7 @@ class MixedAttentionEstimator:
         hw: HardwareConfig,
         deploy: DeployConfig,
         backend: BackendExecutionProfile,
+        efficiency_profile=None,   # EfficiencyProfile | None, B.6
     ) -> None:
         self.model = model
         self.hw = hw
@@ -50,6 +51,7 @@ class MixedAttentionEstimator:
             w_bit=int(deploy.w_byte * 8),
             a_bit=int(deploy.a_byte * 8),
             kv_bit=int(deploy.kv_byte * 8),
+            efficiency_profile=efficiency_profile,
         )
 
     def estimate(

@@ -68,6 +68,7 @@ def test_rope_kernel_inplace_bandwidth_only():
     expected_elements = tokens * (n_q + n_kv) * d
     assert op.load_act == int(expected_elements * a)
     assert op.store_act == int(expected_elements * a)
-    # 6 ops/element 是合理估算 (4 mul + 2 add)
-    assert op.flops == expected_elements * 6
+    # 3 ops/element (4 mul + 2 add per pair, 摊到 per element = 6/2 = 3)
+    # 旧值 6 是 "per pair" 当 "per element" 用, double-count, 已修 (复盘 2026-05-15)
+    assert op.flops == expected_elements * 3
     assert op.op_category == "activation"  # bandwidth-bound

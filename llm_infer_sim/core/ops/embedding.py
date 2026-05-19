@@ -1,6 +1,10 @@
 """Embedding and LM head operators."""
 
 from llm_infer_sim.core.ops.base import OperatorProfile
+from llm_infer_sim.core.profiles.shape_buckets import (
+    OP_KIND_DENSE_GEMM, OP_KIND_EMBEDDING,
+    dense_efficiency_key, per_seq_efficiency_key,
+)
 
 
 def embedding(
@@ -17,6 +21,7 @@ def embedding(
         flops=0,
         load_weight=int(vocab_size * hidden_dim * w_byte),
         store_act=int(tokens * hidden_dim * a_byte),
+        efficiency_key=dense_efficiency_key(OP_KIND_EMBEDDING, tokens),
     )
 
 
@@ -28,7 +33,11 @@ def lm_head(
     w_byte: float,
     a_byte: float,
 ) -> OperatorProfile:
-    """LM head projection: [tokens, h] -> [tokens, vocab_size]."""
+    """LM head projection: [tokens, h] -> [tokens, vocab_size].
+
+    tokens 在 per_sequence shot 里 = #sequences (每 seq 一个 output token),
+    用 per_seq_efficiency_key 而非 dense, 跟 fit 阶段 bucket 一致.
+    """
     oc = vocab_size // tp_size
     return OperatorProfile(
         name="lm_head",
@@ -37,4 +46,5 @@ def lm_head(
         load_weight=int(hidden_dim * oc * w_byte),
         load_act=int(tokens * hidden_dim * a_byte),
         store_act=int(tokens * oc * a_byte),
+        efficiency_key=per_seq_efficiency_key(OP_KIND_DENSE_GEMM, tokens),
     )

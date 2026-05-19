@@ -77,17 +77,22 @@ def test_opt125m_parse():
 
 
 def test_efficiency_placeholder_all_ones():
-    """阶段 1/2: EfficiencyProfile 全 1.0 (无 calibration)."""
+    """阶段 1/2: EfficiencyProfile placeholder 全 1.0 (无 calibration).
+
+    阶段 X.1 Plan B 后字段重命名 compute_efficiency → default_compute;
+    placeholder() 行为不变.
+    """
     hf = SimpleNamespace(
         model_type="opt",
         num_attention_heads=12, hidden_size=768, num_hidden_layers=12,
         ffn_dim=3072, vocab_size=50272,
     )
     bundle = extract_profile_bundle(_make_vllm_config(hf))
-    assert bundle.efficiency.compute_efficiency == 1.0
-    assert bundle.efficiency.mem_efficiency == 1.0
-    assert bundle.efficiency.comm_efficiency == 1.0
+    assert bundle.efficiency.default_compute == 1.0
+    assert bundle.efficiency.default_mem == 1.0
+    assert bundle.efficiency.default_comm == 1.0
     assert bundle.efficiency.w_byte == 2.0    # fp16
+    assert bundle.efficiency.entries == {}    # placeholder 不带 lookup entry
 
 
 def test_unsupported_model_raises():

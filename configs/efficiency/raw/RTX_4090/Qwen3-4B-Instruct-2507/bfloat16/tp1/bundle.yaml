@@ -1,0 +1,29 @@
+hardware: RTX_4090
+model:
+  name: Qwen3-4B-Instruct-2507
+  hidden_dim: 2560
+  num_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  ffn_dim: 9728
+  num_layers: 36
+  vocab_size: 151936
+  is_moe: false
+  num_experts: 0
+  num_activated_experts: 0
+  expert_dim: 0
+  num_shared_experts: 0
+  kv_lora_rank: 0
+  qk_nope_head_dim: 0
+  rope_head_dim: 0
+  v_head_dim: 0
+deploy:
+  tp: 1
+  dp: 1
+  ep: 1
+  w_byte: 2.0
+  a_byte: 2.0
+  kv_byte: 2.0
+  base_w_byte: 2.0
+  base_a_byte: 2.0
+  use_flash_attention: true

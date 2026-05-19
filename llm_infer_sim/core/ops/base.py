@@ -29,6 +29,11 @@ class OperatorProfile:
     comm_bytes: float = 0.0
     comm_type: str = ""  # allreduce|allgather|alltoall|p2p|""
 
+    # Efficiency lookup key — (op_kind, shape_key) tuple for RooflineAnalyzer 精化.
+    # None 表示用 hw 默认 efficiency 不查表 (向后兼容). 详 §9.4.2 B.6.
+    # 例: ("dense_gemm", "tokens<=128") / ("rmsnorm", "tokens<=1024") / ("attn", "decode|kv<=4k")
+    efficiency_key: tuple[str, str] | None = None
+
     @property
     def mem_bytes(self) -> int:
         return self.load_weight + self.load_act + self.store_act + self.load_kv_cache + self.store_kv_cache

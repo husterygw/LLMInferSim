@@ -52,6 +52,11 @@ def main() -> int:
     cfg.load_config = type("LC", (), {"load_format": "auto"})()
     cfg.compilation_config = type("CC", (), {"cudagraph_capture_sizes": [1, 2]})()
     cfg.scheduler_config = type("SC", (), {"async_scheduling": True})()
+    # _check_unsupported_features 访问 vllm_config.model_config.{is_multimodal_model, max_logprobs}
+    cfg.model_config = type("MC", (), {
+        "is_multimodal_model": False,
+        "max_logprobs": 0,
+    })()
     current_platform.check_and_update_config(cfg)
 
     print(f"[4] worker_cls after check_and_update_config = {pc.worker_cls!r}")

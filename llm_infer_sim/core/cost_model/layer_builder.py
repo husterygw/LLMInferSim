@@ -927,11 +927,19 @@ def _compute_layer_time(
     ops: list[OperatorProfile],
     hw: HardwareConfig,
     deploy: DeployConfig,
+    backend=None,
 ) -> tuple[float, float]:
-    """Compute total time for a list of ops, returning (t_compute, t_comm)."""
+    """Compute total time for a list of ops, returning (t_compute, t_comm).
+
+    Phase 5: backend (BackendExecutionProfile) 可选, 控制 execution_mode 跟
+    topology_hint 透传给 RooflineAnalyzer / comm 函数. None 时走 eager / concentrated 默认.
+    """
+    mode = getattr(backend, "execution_mode", "eager") if backend else "eager"
+    hint = getattr(backend, "topology_hint", "concentrated") if backend else "concentrated"
     analyzer = RooflineAnalyzer(hw,
         w_bit=int(deploy.w_byte * 8), a_bit=int(deploy.a_byte * 8),
-        kv_bit=int(deploy.kv_byte * 8))
+        kv_bit=int(deploy.kv_byte * 8),
+        execution_mode=mode)
     tp = deploy.tp
     ep = deploy.ep
 
@@ -941,9 +949,11 @@ def _compute_layer_time(
     for op in ops:
         if op.op_category == "communication":
             if op.comm_type == "allreduce":
-                t_comm += allreduce_time(op.comm_bytes, tp, hw)
+                t_comm += allreduce_time(op.comm_bytes, tp, hw,
+                                          mode=mode, topology_hint=hint)
             elif op.comm_type == "alltoall":
-                t_comm += alltoall_time(op.comm_bytes, ep, hw)
+                t_comm += alltoall_time(op.comm_bytes, ep, hw,
+                                         mode=mode, topology_hint=hint)
         else:
             result = analyzer.analyze(op)
             t_compute += result.total_time
@@ -959,13 +969,14 @@ def dense_layer_time(
     model: ModelConfig,
     deploy: DeployConfig,
     hw: HardwareConfig,
+    backend=None,                      # Phase 5: BackendExecutionProfile, optional
 ) -> LayerResult:
     """Compute timing for a Dense transformer layer (§8.5.1)."""
     ops = []
     ops.extend(_build_attention_block(stage, tokens, ctx_len, model, deploy, hw, layer_idx))
     ops.extend(_build_dense_ffn_block(tokens, model, deploy))
 
-    t_compute, t_comm = _compute_layer_time(ops, hw, deploy)
+    t_compute, t_comm = _compute_layer_time(ops, hw, deploy, backend=backend)
 
     return LayerResult(
         layer_idx=layer_idx,
@@ -986,6 +997,7 @@ def moe_layer_time(
     deploy: DeployConfig,
     hw: HardwareConfig,
     moe_routing_skew: float = 0.0,
+    backend=None,                      # Phase 5: BackendExecutionProfile, optional
 ) -> LayerResult:
     """Compute timing for a MoE transformer layer (§8.5.2).
 
@@ -995,7 +1007,7 @@ def moe_layer_time(
     ops.extend(_build_attention_block(stage, tokens, ctx_len, model, deploy, hw, layer_idx))
     ops.extend(_build_moe_ffn_block(tokens, model, deploy, hw, moe_routing_skew, layer_idx))
 
-    t_compute, t_comm = _compute_layer_time(ops, hw, deploy)
+    t_compute, t_comm = _compute_layer_time(ops, hw, deploy, backend=backend)
 
     return LayerResult(
         layer_idx=layer_idx,

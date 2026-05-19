@@ -26,12 +26,18 @@ def rope_kernel(
       - bandwidth-bound, FLOPs 微小 (cos/sin lookup + 2 mul + 1 add 每对元素)
     """
     qk_elements = tokens * (num_q_heads_per_tp + num_kv_heads_per_tp) * head_dim
+    from llm_infer_sim.core.profiles.shape_buckets import (
+        OP_KIND_ROPE, dense_efficiency_key,
+    )
+    # Per element FLOPs: 3 (RoPE rotates 2 元素一对, 每对 4 mul + 2 add = 6 ops,
+    # 摊到每元素 = 3 ops). 历史: 旧值 6 把 "per pair" 当 "per element" 算, double-count.
     return OperatorProfile(
         name=name,
         op_category="activation",
-        flops=qk_elements * 6,                           # 4 mul + 2 add per pair
+        flops=qk_elements * 3,
         load_act=int(qk_elements * a_byte),              # in-place: 读 Q+K
         store_act=int(qk_elements * a_byte),             # in-place: 写 Q+K
+        efficiency_key=dense_efficiency_key(OP_KIND_ROPE, tokens),
     )
 
 

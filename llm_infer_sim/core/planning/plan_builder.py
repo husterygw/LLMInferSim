@@ -84,6 +84,7 @@ def build_mixed_plan(
         hw=hw,
         deploy=deploy_merged,
         backend=bundle.backend,
+        efficiency_profile=bundle.efficiency,    # B.6: per-op lookup 精化
     )
     attn_cost = estimator.estimate(
         num_prefill_tokens=workload.num_prefill_tokens,

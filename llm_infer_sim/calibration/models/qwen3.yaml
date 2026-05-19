@@ -1,0 +1,78 @@
+# Qwen3 dense decoder catalog (Layer 1 microbench, 详设 §9.4.2 B.1).
+#
+# 覆盖: Qwen3-0.6B / 1.7B / 4B / 8B / 14B / 32B 等所有 dense (非 MoE).
+# Qwen3 引入 per-head QK norm (Q 和 K 各一个 RMSNorm 在 rotary 之前), 用
+# `within: Qwen3Attention` 区分 attn 内部 QK-norm 跟外层 DecoderLayer 的 RMSNorm.
+#
+# canonical 名跟 vLLM 模块属性名对齐 (vllm/model_executor/models/qwen3.py).
+# op_kind 决定 efficiency lookup 走哪个桶 (跟 RooflineAnalyzer 的 efficiency_key 对应).
+
+model_type: qwen3
+description: Qwen3 dense GQA decoder family
+
+entries:
+  # ---- prologue ----
+  embedding:
+    vllm: VocabParallelEmbedding
+    op_kind: embedding
+
+  # ---- decoder layer (× num_layers) ----
+  # 外层 RMSNorm: input_layernorm + post_attention_layernorm 都进这条
+  layernorm:
+    vllm: RMSNorm
+    within: Qwen3DecoderLayer
+    op_kind: rmsnorm
+
+  # Attention block 内部
+  qkv_proj:
+    vllm: QKVParallelLinear
+    op_kind: dense_gemm
+
+  # Qwen3 QK-norm (Q 和 K 各一个 RMSNorm, vLLM 都标 RMSNorm + within Qwen3Attention)
+  qk_norm:
+    vllm: RMSNorm
+    within: Qwen3Attention
+    op_kind: rmsnorm
+
+  rotary_emb:
+    vllm: RotaryEmbedding
+    op_kind: rope
+
+  # FlashAttention / unified ragged path (vLLM Attention wrapper)
+  attention:
+    vllm: Attention
+    within: Qwen3Attention
+    op_kind: attn
+
+  o_proj:
+    vllm: RowParallelLinear
+    within: Qwen3Attention
+    op_kind: dense_gemm
+
+  # MLP block
+  gate_up_proj:
+    vllm: MergedColumnParallelLinear
+    op_kind: dense_gemm
+
+  act_fn:
+    vllm: SiluAndMul
+    op_kind: swiglu
+
+  down_proj:
+    vllm: RowParallelLinear
+    within: Qwen2MLP        # Qwen3 复用 Qwen2MLP 类
+    op_kind: dense_gemm
+
+  # ---- head ----
+  final_layernorm:
+    vllm: RMSNorm
+    within: Qwen3ForCausalLM   # final norm 直接挂在顶层 ForCausalLM 下, 无 Qwen3Model 中间层
+    op_kind: rmsnorm
+
+  lm_head:
+    # vLLM V1: lm_head matmul 实际跑在 LogitsProcessor 顶层节点下 (Qwen3ForCausalLM 的
+    # sibling, 不是 child), ParallelLMHead 模块虽存在但没有独立 nn.Module 时间记录。
+    # cuda_time 是单 cublasGemvTensorStridedBatched (batch=1 决码场景), 含 lm_head 全部
+    # GEMV; 不含 sampler 的 top-k/top-p (后者在 Sampler 模块, 单独节点)。
+    vllm: LogitsProcessor
+    op_kind: dense_gemm

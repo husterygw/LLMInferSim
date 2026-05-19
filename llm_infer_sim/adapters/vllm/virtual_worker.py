@@ -26,7 +26,13 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+from vllm.v1.worker.worker_base import WorkerBase
+# CompilationTimes 在 vLLM 0.20+ 才引入, 0.19.x compile_or_warm_up_model() 返 float.
+# 兼容两者: 优先 import 真类, 不存在则用 float 别名.
+try:
+    from vllm.v1.worker.worker_base import CompilationTimes  # type: ignore
+except ImportError:
+    CompilationTimes = float  # type: ignore
 
 
 def _log(msg: str) -> None:
@@ -219,8 +225,13 @@ class VirtualWorker(WorkerBase):
             f"kv_cache_config accepted (num_blocks={kv_cache_config.num_blocks}, no tensor allocated)"
         )
 
-    def compile_or_warm_up_model(self) -> CompilationTimes:
-        return CompilationTimes(language_model=0.0, encoder=0.0)
+    def compile_or_warm_up_model(self):
+        """返 0 总编译时间. 0.20+ 期望 CompilationTimes(language_model=..., encoder=...);
+        0.19.x 期望 float. 用 try fallback 兼容."""
+        try:
+            return CompilationTimes(language_model=0.0, encoder=0.0)
+        except TypeError:
+            return 0.0
 
     def get_supported_tasks(self) -> tuple[str, ...]:
         # vLLM 0.20 通过 collective_rpc 询问支持的 task 类型

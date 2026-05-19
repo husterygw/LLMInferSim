@@ -1,0 +1,16 @@
+layer,sequences,time_us
+lm_head,1,813.286
+lm_head,1,813.19
+lm_head,1,813.094
+lm_head,2,820.166
+lm_head,2,820.55
+lm_head,2,820.902
+lm_head,4,825.447
+lm_head,4,825.638
+lm_head,4,824.582
+lm_head,8,830.79
+lm_head,8,832.55
+lm_head,8,830.983
+lm_head,16,840.422
+lm_head,16,841.094
+lm_head,16,840.39

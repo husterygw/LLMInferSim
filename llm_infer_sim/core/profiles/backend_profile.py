@@ -74,6 +74,17 @@ class BackendExecutionProfile:
     dense_gemm: DenseGemmPolicy = field(default_factory=DenseGemmPolicy)
     # 阶段 5-δ: MoE 路由建模 (默认 skew=0.0 = uniform, 阶段 X calibrate)
     moe_routing: MoERoutingPolicy = field(default_factory=MoERoutingPolicy)
+    # Phase 5 (通信建模):
+    # execution_mode 控制是否加 framework_call_overhead (通信) / kernel_overhead (计算).
+    #   "eager"     — 加 per-op dispatch overhead
+    #   "cudagraph" — 整图一次 launch, 加 0
+    # 从 vllm_config.enforce_eager / compilation_config.cudagraph_mode 推断.
+    execution_mode: str = "eager"
+    # topology_hint 控制 PCIe 拓扑下 effective_intra_bw 怎么缩.
+    #   "concentrated" — n 张卡都在同一 root (默认 / 保守)
+    #   "balanced"     — n 张卡均匀分布跨 root
+    # 从 LLM_INFER_SIM_NUMA_HINT env 或 CUDA_VISIBLE_DEVICES + gpu_to_root 推断.
+    topology_hint: str = "concentrated"
 
 
 def default_backend_profile() -> BackendExecutionProfile:

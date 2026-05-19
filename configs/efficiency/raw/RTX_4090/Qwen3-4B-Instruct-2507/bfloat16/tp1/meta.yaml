@@ -1,0 +1,13 @@
+model: /data/ygw/models/Qwen3-4B-Instruct-2507
+model_type: qwen3
+hardware: RTX_4090
+dtype: bfloat16
+tp: 1
+iterations: 3
+captured_at: '2026-05-15T07:20:02.098964+00:00'
+python_version: 3.12.13 | packaged by Anaconda, Inc. | (main, Mar 19 2026, 20:20:58)
+  [GCC 14.3.0]
+platform: Linux-5.4.0-216-generic-x86_64-with-glibc2.35
+torch_version: 2.10.0+cu128
+cuda_version: '12.8'
+vllm_version: 0.19.1

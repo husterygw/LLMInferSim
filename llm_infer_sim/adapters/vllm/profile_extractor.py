@@ -126,6 +126,11 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # ---- 4. HardwareConfig (默认 H100, env 可覆盖) ----
     hw_name = os.environ.get("LLM_INFER_SIM_HW", "H100")
     hw = get_hardware_profile(hw_name)
+
+    # ---- 4b. EfficiencyProfile YAML override (阶段 X.1 B.6) ----
+    # 如 configs/efficiency/{hw}.yaml 存在, 覆盖 placeholder efficiency.
+    # path 优先级: env LLM_INFER_SIM_EFFICIENCY_YAML > configs/efficiency/<hw>.yaml > none.
+    efficiency = _maybe_load_efficiency_yaml(hw_name, fallback=efficiency)
     efficiency.apply_to(hw)
 
     # ---- 5. DeployConfig (跨 step 不变的部分; estimate() 时按 workload 覆盖) ----
@@ -422,10 +427,10 @@ def _vllm_backend_to_mode(backend) -> tuple[str, str]:
 
 
 def _extract_backend_profile(vllm_config) -> BackendExecutionProfile:
-    """从 vllm_config.attention_config 推断 BackendExecutionProfile。
+    """从 vllm_config 推断 BackendExecutionProfile (含 Phase 5 通信建模字段)。
 
-    阶段 3.5 范围: 仅推断 mixed_attention.mode 与 name;
-    其他字段 (flash_attn_version / use_cudnn_prefill 等) 沿用默认, 推到阶段 X。
+    阶段 3.5: mixed_attention.mode + name
+    Phase 5: execution_mode (eager/cudagraph), topology_hint (concentrated/balanced)
 
     Raises:
         NotImplementedError: 命中 _VLLM_UNSUPPORTED_BACKENDS 或未列出的 enum。
@@ -436,7 +441,87 @@ def _extract_backend_profile(vllm_config) -> BackendExecutionProfile:
     return BackendExecutionProfile(
         name=name,
         mixed_attention=MixedAttentionPolicy(mode=mode),
+        execution_mode=_infer_execution_mode(vllm_config),
+        topology_hint=_infer_topology_hint(),
     )
+
+
+def _infer_execution_mode(vllm_config) -> str:
+    """从 vllm_config 推 execution_mode (Phase 5)。
+
+    enforce_eager=True → "eager"
+    compilation_config.cudagraph_mode in {None, NONE} → "eager"
+    其他 → "cudagraph"
+    """
+    if getattr(vllm_config, "enforce_eager", False):
+        return "eager"
+    cc = getattr(vllm_config, "compilation_config", None)
+    if cc is not None:
+        cgm = getattr(cc, "cudagraph_mode", None)
+        if cgm is None or str(cgm).endswith("NONE"):
+            return "eager"
+    return "cudagraph"
+
+
+def _infer_topology_hint() -> str:
+    """从 env (LLM_INFER_SIM_NUMA_HINT) 推 topology_hint (Phase 5).
+
+    暂不解析 CUDA_VISIBLE_DEVICES + gpu_to_root (留 Phase 6).
+    """
+    return os.environ.get("LLM_INFER_SIM_NUMA_HINT", "concentrated")
+
+
+def _maybe_load_efficiency_yaml(hw_name: str, fallback: EfficiencyProfile) -> EfficiencyProfile:
+    """读 configs/efficiency/{hw_name 大小写多变体}.yaml. miss 时返 fallback (placeholder).
+
+    默认行为 (2026-05 起): **不自动加载校准 YAML**。原因:
+      - 校准 YAML 由一次特定模式 (eager / graph) 下的实测拟合而来, 隐式吸收了
+        模式相关 overhead。换 vLLM 模式 / 换模型 / 换硬件后, 这套数会反而拉偏。
+      - 在 Qwen3-4B/RTX 4090 上的对照实验显示: eager 模式下校准 "看起来准"
+        是 dispatch overhead 与 roofline 系统偏高互相抵消的巧合, graph 模式
+        下立刻偏 +60-90%。盲目应用校准弊大于利。
+      - 纯 roofline 上界(无校准)对主流硬件 + 主流 op 误差已经在 ±20% 内,
+        够用。校准应当作为"特定场景显式打开"的工具, 不是默认行为。
+
+    显式启用校准 (opt-in):
+        1. `LLM_INFER_SIM_EFFICIENCY_YAML=/path/to/yaml`  显式指路径
+        2. `LLM_INFER_SIM_USE_CALIBRATION=1`              触发按 hw_name 自动找
+
+    保留 fallback 的 w_byte/a_byte/kv_byte (extract 阶段已根据 quant config 切过),
+    只覆盖 efficiency 字段 (default_compute / default_mem / default_comm / entries).
+    """
+    from pathlib import Path
+    import logging
+    log = logging.getLogger(__name__)
+
+    candidates: list[Path] = []
+    env_path = os.environ.get("LLM_INFER_SIM_EFFICIENCY_YAML")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    # 按 hw_name 自动找校准 YAML — 默认 off, 需 LLM_INFER_SIM_USE_CALIBRATION=1 显式打开
+    if os.environ.get("LLM_INFER_SIM_USE_CALIBRATION", "0") == "1":
+        base = Path(__file__).resolve().parent.parent.parent.parent / "configs" / "efficiency"
+        candidates.append(base / f"{hw_name}.yaml")
+        candidates.append(base / f"{hw_name.lower()}.yaml")
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            loaded = EfficiencyProfile.from_yaml(path)
+        except Exception as e:    # noqa: BLE001
+            log.warning("EfficiencyProfile YAML 加载失败 (%s), 用 placeholder: %s",
+                        path, e)
+            return fallback
+        # 保留 extract 阶段已切的 byte 值, 不让 YAML 覆盖
+        loaded.w_byte = fallback.w_byte
+        loaded.a_byte = fallback.a_byte
+        loaded.kv_byte = fallback.kv_byte
+        log.info("Loaded calibrated EfficiencyProfile from %s (%d entries)",
+                 path, len(loaded.entries))
+        return loaded
+    return fallback
 
 
 def _extract_pd_config(vllm_config) -> PDDisaggConfig:

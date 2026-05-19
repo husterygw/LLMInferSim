@@ -4,6 +4,9 @@ Formulas extracted verbatim from model_analyzer.py.
 """
 
 from llm_infer_sim.core.ops.base import OperatorProfile
+from llm_infer_sim.core.profiles.shape_buckets import (
+    OP_KIND_RMSNORM, OP_KIND_SWIGLU, dense_efficiency_key,
+)
 
 
 def norm_layer(
@@ -12,13 +15,23 @@ def norm_layer(
     hidden_size: int,
     a_byte: float,
 ) -> OperatorProfile:
-    """Norm layer (RMSNorm/LayerNorm): 7 ops/element (sum sub pow sum div mul add)."""
+    """RMSNorm: y = x / sqrt(mean(x^2) + eps) * weight.
+
+    Per-element FLOPs (4):
+      1 mul (x²) + 1 add (reduce 累加) + 1 mul (× rsqrt) + 1 mul (× weight) = 4
+    Per-row global ops (sqrt / 1/x / eps / /N ≈ 4) 对 hidden_size 摊销 ≈ 0, 忽略.
+
+    历史: 旧值 7 沿用 llm-viewer "sum sub pow sum div mul add" 字面计数, 重复算了
+    pow + sub + div + sum 这些其实不是 RMSNorm 真实做的事. 改成 4 跟 PyTorch /
+    Triton 实际 kernel 计数一致.
+    """
     return OperatorProfile(
         name=name,
         op_category="norm",
-        flops=tokens * hidden_size * 7,
+        flops=tokens * hidden_size * 4,
         load_act=int(tokens * hidden_size * a_byte),
         store_act=int(tokens * hidden_size * a_byte),
+        efficiency_key=dense_efficiency_key(OP_KIND_RMSNORM, tokens),
     )
 
 
@@ -44,13 +57,23 @@ def mlp_activation(
     hidden_size: int,
     a_byte: float,
 ) -> OperatorProfile:
-    """MLP activation (SiLU/GeLU): 2 ops/element, reads 2x (from gate+up)."""
+    """SwiGLU activation: out = silu(x) * gate, where silu(x) = x * sigmoid(x).
+
+    Per output-element FLOPs (5):
+      1 exp(-x) + 1 add (1+exp) + 1 reciprocal (1/_) + 1 mul (x * σ) + 1 mul (× gate) = 5
+    (transcendentals like exp 算 1 op 是标准约定)
+
+    历史: 旧值 2 严重低估 (只算了 mul + 1). hidden_size 这里是 intermediate dim,
+    输出元素数 = tokens × hidden_size; 输入读 2× (gate + up). 改 5 跟 vLLM SiluAndMul
+    实际 op count 对齐.
+    """
     return OperatorProfile(
         name=name,
         op_category="activation",
-        flops=tokens * hidden_size * 2,
+        flops=tokens * hidden_size * 5,
         load_act=int(tokens * hidden_size * a_byte * 2),
         store_act=int(tokens * hidden_size * a_byte),
+        efficiency_key=dense_efficiency_key(OP_KIND_SWIGLU, tokens),
     )
 
 

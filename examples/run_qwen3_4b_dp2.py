@@ -1,7 +1,19 @@
 """DP G3 spike: Qwen3-4B + dp=2 + tp=1 — 验证 DP step latency = max(per-rank).
 
+⚠️ DEPRECATED (vLLM 0.19.1+):
+   此 example 当前跑不通。vLLM 0.19.1 起 `LLM(data_parallel_size>1)` 单进程模式
+   被禁用 (会 raise "not supported for single-process usage")。
+   要跑 DP, 必须用 vLLM 的显式多进程模板:
+
+       https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
+
+   迁移路径: 把本文件改成 spawn N 个 EngineCore 子进程, 每个独立 LLM(),
+   用 multiprocessing 协调。LLMInferSim VirtualPlatform 在多进程模式下零侵入工作
+   (每 rank 独立 simulate own scheduler), 框架代码不用改。
+   暂时保留本文件作为单进程 DP 接口演进的参考。
+
 ═══════════════════════════════════════════════════════════════════════════════
-                                  怎么跑
+                                  怎么跑 (旧版本 vLLM, 已失效)
 ═══════════════════════════════════════════════════════════════════════════════
 
    conda activate llm_sim

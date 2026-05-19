@@ -50,11 +50,25 @@ Phase 2: Adds efficiency calibration, vector_flops/tensor_flops distinction,
 class RooflineAnalyzer:
     """Roofline model analyzer."""
 
-    def __init__(self, hw: HardwareConfig, w_bit: int = 16, a_bit: int = 16, kv_bit: int = 16):
+    def __init__(
+        self,
+        hw: HardwareConfig,
+        w_bit: int = 16,
+        a_bit: int = 16,
+        kv_bit: int = 16,
+        efficiency_profile=None,    # EfficiencyProfile | None — 详 §9.4.2 B.6
+        execution_mode: str = "eager",   # "eager" | "cudagraph"
+    ):
         self.hw = hw
         self.w_bit = w_bit
         self.a_bit = a_bit
         self.kv_bit = kv_bit
+        # 阶段 X.1 起: 可选传 EfficiencyProfile, 走 per-op lookup_entry 精化.
+        # None 时维持 hw scalar (compute_efficiency / mem_efficiency) 全局默认.
+        self.efficiency_profile = efficiency_profile
+        # Phase 5: cudagraph 模式下 kernel_overhead = 0 (跟通信侧 framework_oh 对称).
+        # eager 模式按 hw.kernel_overhead 加 per-op dispatch 开销.
+        self.execution_mode = execution_mode
 
     def _select_peak(self, op: "OperatorProfile") -> float:
         """Select peak performance based on op precision and category.
@@ -94,7 +108,13 @@ class RooflineAnalyzer:
         return self.hw.effective_peak_flops
 
     def _get_kernel_overhead(self, op_category: str) -> float:
-        """Get kernel launch overhead for this op category."""
+        """Get kernel launch overhead for this op category.
+
+        Phase 5: cudagraph 模式下返 0 (跟通信 framework_call_overhead 对称).
+        eager 模式下查 hw.kernel_overhead 表(典型 2 µs/op).
+        """
+        if self.execution_mode == "cudagraph":
+            return 0.0
         overheads = self.hw.kernel_overhead
         if not overheads:
             return 0.0
@@ -133,6 +153,14 @@ class RooflineAnalyzer:
         t_memory = mem_bytes / bandwidth if bandwidth > 0 else 0.0
         k_overhead = self._get_kernel_overhead(op.op_category)
 
+        # 阶段 X.1 B.6: per-op efficiency 精化 (calibrated 模式)
+        if self.efficiency_profile is not None and op.efficiency_key is not None:
+            ratio = self._efficiency_refine_ratio(op)
+            if ratio is not None and ratio > 0:
+                t_compute *= ratio
+                t_memory *= ratio
+                inference_time *= ratio
+
         return RooflineResult(
             name=op.name,
             flops=flops,
@@ -153,5 +181,51 @@ class RooflineAnalyzer:
             store_kv_cache=op.store_kv_cache,
         )
 
+    def _efficiency_refine_ratio(self, op: OperatorProfile) -> float | None:
+        """计算 per-op efficiency 精化比例.
+
+        raw_time 已经按 hw scalar default 算了 (hw.effective_* 内含 compute_efficiency).
+        如 entry 命中, 我们要把 raw_time 调整到使用 entry.efficiency 的水平:
+            actual_time = raw_time * (hw_default / entry.efficiency)
+
+        Returns:
+            ratio (float) 用作 t_compute / t_memory / inference_time 的乘数;
+            None 表示没命中 entry, 保持 raw (hw default).
+        """
+        if op.efficiency_key is None or self.efficiency_profile is None:
+            return None
+        op_kind, shape_key = op.efficiency_key
+        dtype = _dtype_from_bits(self.w_bit, self.a_bit)
+        entry = self.efficiency_profile.lookup_entry(op_kind, dtype, shape_key)
+        if entry is None or entry.efficiency <= 0:
+            return None
+        # hw default 当前 scalar:
+        #   compute: hw.compute_efficiency  (默认 1.0, 或被 apply_to 设到 default_compute)
+        #   memory: hw.mem_efficiency
+        # 算 ratio 时按 op_category 选 compute / memory bottleneck 还需要更细;
+        # B.6 v1 简化: 单 ratio 整体 scale, 使用 compute_efficiency 当 default.
+        default_eff = (
+            self.hw.compute_efficiency
+            if op.op_category != "communication"
+            else self.hw.comm_efficiency
+        )
+        if default_eff <= 0:
+            default_eff = 1.0
+        return default_eff / entry.efficiency
+
     def analyze_batch(self, ops: list[OperatorProfile]) -> list[RooflineResult]:
         return [self.analyze(op) for op in ops]
+
+
+def _dtype_from_bits(w_bit: int, a_bit: int) -> str:
+    """w_bit/a_bit → dtype 字符串, 跟 fit.py 桶 key 对齐."""
+    # 取 weight / activation 中精度较高的当 dtype (cost 主导项)
+    # bf16 默认 16, fp8 默认 8, fp4 默认 4
+    width = max(w_bit, a_bit)
+    if width >= 32:
+        return "fp32"
+    if width >= 16:
+        return "bfloat16"
+    if width >= 8:
+        return "fp8"
+    return "fp4"

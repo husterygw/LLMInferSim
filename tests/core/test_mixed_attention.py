@@ -114,17 +114,20 @@ def test_unified_ragged_merged_op_consistency(qwen3_4b_bundle):
 
 
 def test_unified_equals_split_when_both_same_bound(qwen3_4b_bundle):
-    """阶段 0-9 placeholder 哲学 (sync=0, efficiency=1) 下: 两段同 bound 时,
-    split = max(c_pf, m_pf) + max(c_dc, m_dc) 与 unified = max(Σc, Σm) 数学恒等。
+    """两段同 bound 时, split = max(c_pf, m_pf) + max(c_dc, m_dc) ; unified = max(Σc, Σm).
 
-    Qwen3-4B + 200 prefill + 4 decode(ctx=512) 实测两段都 memory-bound, 应严格相等。
+    Qwen3-4B + 200 prefill + 4 decode(ctx=512) 实测两段都 memory-bound, 数学上相等,
+    但 split 比 unified 多注入 1 个 kernel_overhead (split 把 attention 拆 2 个 op),
+    所以差应严格 == 一个 overhead (默认 2 µs).
     """
     est_split = _make_estimator(qwen3_4b_bundle, "split_kernels")
     est_unified = _make_estimator(qwen3_4b_bundle, "unified_ragged")
     t_split = est_split.estimate(**_TYPICAL_MIXED)["per_layer_time"]
     t_unified = est_unified.estimate(**_TYPICAL_MIXED)["per_layer_time"]
     assert t_split > 0 and t_unified > 0
-    assert t_split == pytest.approx(t_unified, rel=1e-9)
+    # 差等于 split 多注入的一个 overhead (default 2 µs = 2e-6 s)
+    overhead = qwen3_4b_bundle.hw.kernel_overhead.get("default", 0)
+    assert t_split == pytest.approx(t_unified + overhead, rel=1e-9)
 
 
 def test_unified_le_split_always(qwen3_4b_bundle):

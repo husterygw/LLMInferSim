@@ -79,11 +79,14 @@ class ModelCoreCostModel:
         self.hw = profile_bundle.hw
         self.eff = profile_bundle.efficiency
         self.model_cfg = profile_bundle.model
+        self.backend = profile_bundle.backend
         self.analyzer = RooflineAnalyzer(
             self.hw,
             w_bit=self.eff.w_bit,
             a_bit=self.eff.a_bit,
             kv_bit=self.eff.kv_bit,
+            efficiency_profile=self.eff,    # 阶段 X.1 B.6: per-op lookup 精化
+            execution_mode=self.backend.execution_mode,   # Phase 5: mode-aware kernel_overhead
         )
 
     # ------- public API -------
@@ -150,7 +153,7 @@ class ModelCoreCostModel:
                 res = self.analyzer.analyze(op)
                 t_layer_compute += res.t_compute
                 t_layer_memory += res.t_memory
-                op_time = max(res.t_compute, res.t_memory)
+                op_time = res.total_time  # 含 kernel_overhead, 跟 layer_builder._compute_layer_time 一致
                 per_op_breakdown.append({
                     "scope": f"layer{lr.layer_idx}",
                     "name": op.name,
@@ -237,7 +240,7 @@ class ModelCoreCostModel:
             res = self.analyzer.analyze(op)
             total_compute += res.t_compute
             total_memory += res.t_memory
-            op_time = max(res.t_compute, res.t_memory)
+            op_time = res.total_time  # 含 kernel_overhead, 跟 layer_builder._compute_layer_time 一致
             per_op_breakdown.append({
                 "scope": scope,
                 "name": op.name,
@@ -325,10 +328,12 @@ class ModelCoreCostModel:
             if self.model_cfg.is_moe_layer(layer_idx):
                 lr = moe_layer_time(layer_idx, stage, tokens_for_stage,
                                     ctx_len, self.model_cfg, deploy, self.hw,
-                                    moe_routing_skew=moe_routing.get_skew_for_layer(layer_idx))
+                                    moe_routing_skew=moe_routing.get_skew_for_layer(layer_idx),
+                                    backend=self.backend)
             else:
                 lr = dense_layer_time(layer_idx, stage, tokens_for_stage,
-                                      ctx_len, self.model_cfg, deploy, self.hw)
+                                      ctx_len, self.model_cfg, deploy, self.hw,
+                                      backend=self.backend)
 
             # llm-viewer LayerResult: t_compute / t_comm / t_total / ops (op list)
             # llm-viewer 的 t_compute 实际是 sum(per-op result.total_time), 把 compute
@@ -342,7 +347,7 @@ class ModelCoreCostModel:
                 res = self.analyzer.analyze(op)
                 t_layer_compute += res.t_compute
                 t_layer_memory += res.t_memory
-                op_time = max(res.t_compute, res.t_memory)
+                op_time = res.total_time  # 含 kernel_overhead, 跟 layer_builder._compute_layer_time 一致
                 per_op_breakdown.append(
                     {
                         "scope": f"layer{layer_idx}",
@@ -422,7 +427,7 @@ class ModelCoreCostModel:
             res = self.analyzer.analyze(op)
             total_compute += res.t_compute
             total_memory += res.t_memory
-            op_time = max(res.t_compute, res.t_memory)
+            op_time = res.total_time  # 含 kernel_overhead, 跟 layer_builder._compute_layer_time 一致
             total_time += op_time
             per_op_breakdown.append(
                 {
