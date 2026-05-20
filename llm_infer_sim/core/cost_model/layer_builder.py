@@ -30,7 +30,7 @@ from llm_infer_sim.core.ops.communication import allreduce_time, alltoall_time
 from llm_infer_sim.core.ops.embedding import embedding, lm_head
 from llm_infer_sim.core.cost_model.roofline import RooflineAnalyzer
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
-from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.profiles.deploy import LegacyDeployConfig
 from llm_infer_sim.core.profiles.model_config import ModelConfig
 
 
@@ -59,7 +59,7 @@ def _maybe_quant_op(
     name: str,
     tokens: int,
     hidden_size: int,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
 ) -> None:
     """如果 dynamic activation quant 启用 (a_byte < base_a_byte), 在 ops 后追加
     activation_quantize op. 模型 lm_head/embed 不走这条路径, 只在 layer 内部的
@@ -98,7 +98,7 @@ def _build_attention_block(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
     layer_idx: int = 0,
 ) -> list[OperatorProfile]:
@@ -130,7 +130,7 @@ def _build_standard_attention_block(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
 ) -> list[OperatorProfile]:
     """标准 MHA/GQA attention block (LLaMA / Qwen / OPT 等)。
@@ -211,7 +211,7 @@ def _build_mla_attention_block(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
 ) -> list[OperatorProfile]:
     """V3 MLA attention block (DeepSeek-V2/V3, 详设 §4.1.4 + 阶段 8-β 修正)。
@@ -312,7 +312,7 @@ def _build_mla_attention_block(
 def _build_v32_indexer_ops(
     tokens: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
 ) -> list[OperatorProfile]:
     """V3.2 DSA lightning indexer 子块 (4 个 ops + 1 个 quant).
 
@@ -364,7 +364,7 @@ def _build_v32_sparse_attn_indexer_op(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
 ) -> OperatorProfile:
     """V3.2 sparse_attn_indexer custom kernel: Q×K_cache → scores → top-k indices.
 
@@ -398,7 +398,7 @@ def _build_v32_mla_sparse_attention_block(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
 ) -> list[OperatorProfile]:
     """V3.2 DSA attention block (DeepSeek-V3.2-Exp).
@@ -497,7 +497,7 @@ def _build_v4_sparse_attention_block(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
     layer_idx: int,
 ) -> list[OperatorProfile]:
@@ -599,7 +599,7 @@ def _build_v4_compressor_ops(
     ctx_len: int,
     compress_ratio: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     op_prec: str,
 ) -> list[OperatorProfile]:
     """V4 compressor + indexer 子块 (compress_ratio > 0 时调用)。
@@ -694,7 +694,7 @@ def _build_v4_compressor_ops(
 def _build_dense_ffn_block(
     tokens: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
 ) -> list[OperatorProfile]:
     """Build dense FFN sub-block operators."""
     tp = deploy.tp
@@ -747,7 +747,7 @@ def _build_dense_ffn_block(
 def _build_moe_ffn_block(
     tokens: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
     moe_routing_skew: float = 0.0,
     layer_idx: int = -1,
@@ -926,7 +926,7 @@ def _build_moe_ffn_block(
 def _compute_layer_time(
     ops: list[OperatorProfile],
     hw: HardwareConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     backend=None,
 ) -> tuple[float, float]:
     """Compute total time for a list of ops, returning (t_compute, t_comm).
@@ -967,7 +967,7 @@ def dense_layer_time(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
     backend=None,                      # Phase 5: BackendExecutionProfile, optional
 ) -> LayerResult:
@@ -994,7 +994,7 @@ def moe_layer_time(
     tokens: int,
     ctx_len: int,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
     moe_routing_skew: float = 0.0,
     backend=None,                      # Phase 5: BackendExecutionProfile, optional
@@ -1022,7 +1022,7 @@ def moe_layer_time(
 def model_inference_time(
     stage: str,
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
     ctx_len: int = 0,
 ) -> tuple[float, list[LayerResult]]:
@@ -1073,7 +1073,7 @@ def model_inference_time(
 
 def compute_metrics(
     model: ModelConfig,
-    deploy: DeployConfig,
+    deploy: LegacyDeployConfig,
     hw: HardwareConfig,
 ) -> dict:
     """Compute end-to-end inference metrics (TTFT, TPOT, throughput).

@@ -17,7 +17,7 @@ from llm_infer_sim.core.profiles.backend_profile import (
     BackendExecutionProfile,
     default_backend_profile,
 )
-from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.profiles.deploy import LegacyDeployConfig
 from llm_infer_sim.core.profiles.efficiency_profile import EfficiencyProfile
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
 from llm_infer_sim.core.profiles.model_adapters import UnsupportedModelError
@@ -35,7 +35,7 @@ class ProfileBundle:
     """
 
     model: ModelConfig
-    deploy: DeployConfig
+    deploy: LegacyDeployConfig
     hw: HardwareConfig
     efficiency: EfficiencyProfile
     backend: BackendExecutionProfile = field(default_factory=default_backend_profile)

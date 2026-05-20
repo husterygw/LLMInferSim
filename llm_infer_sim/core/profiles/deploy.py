@@ -131,7 +131,7 @@ class ParallelConfig:
 
 
 @dataclass
-class DeployConfig:
+class LegacyDeployConfig:
     """Runtime deployment configuration."""
 
     batch_size: int = 1
@@ -184,3 +184,24 @@ class DeployConfig:
     @property
     def ep(self) -> int:
         return self.parallel.ep_size
+
+
+@dataclass(frozen=True)
+class DeployConfig:
+    """V3 §4.6 minimal deployment config (search-ready)."""
+
+    tp_size: int = 1
+    pp_size: int = 1
+    dp_size: int = 1
+    ep_size: int = 1
+    moe_tp_size: int = 1
+    moe_ep_size: int = 1
+
+    max_num_batched_tokens: int | None = None
+    max_num_seqs: int | None = None
+    block_size: int = 16
+    num_gpu_blocks: int | None = None
+
+    execution_mode: str = "eager"
+    backend: str = "vllm"
+    backend_version: str | None = None

@@ -55,7 +55,7 @@ def build_mixed_plan(
             mixed_mode=bundle.backend.mixed_attention.mode,
         )
 
-    # 临时 DeployConfig: batch_size=1, input_len=total_tokens (merged GEMM 形状)
+    # 临时 LegacyDeployConfig: batch_size=1, input_len=total_tokens (merged GEMM 形状)
     deploy_merged = _override_deploy(deploy_template, batch_size=1, input_len=total_tokens)
 
     layer_results_dense: list[LayerResult] = []
@@ -133,12 +133,12 @@ def _strip_attention(lr: LayerResult, analyzer: RooflineAnalyzer) -> LayerResult
 
 
 def _override_deploy(template, batch_size: int, input_len: int):
-    """复制一份 DeployConfig, 覆盖 batch_size / input_len。
+    """复制一份 LegacyDeployConfig, 覆盖 batch_size / input_len。
 
     output_len 不动, 因为 cost path 不依赖。parallel/dtype 沿用。
     """
-    from llm_infer_sim.core.profiles.deploy import DeployConfig
-    return DeployConfig(
+    from llm_infer_sim.core.profiles.deploy import LegacyDeployConfig
+    return LegacyDeployConfig(
         batch_size=batch_size,
         input_len=input_len,
         output_len=template.output_len,

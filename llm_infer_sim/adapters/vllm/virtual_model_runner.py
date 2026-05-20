@@ -2,7 +2,7 @@
 
 阶段 2 增量 (vs 阶段 1):
   - 用 adapters/vllm/profile_extractor.extract_profile_bundle 一次构造 ProfileBundle
-    (ModelConfig + DeployConfig + HardwareConfig + EfficiencyProfile)
+    (ModelConfig + LegacyDeployConfig + HardwareConfig + EfficiencyProfile)
   - 弃用阶段 1 手写的 model_meta 抽取 (只 7 个字段, 漏 head_dim explicit / MLA / MoE)
   - ModelCoreCostModel 改接 ProfileBundle, 内部走 llm-viewer dense/moe_layer_time
 
@@ -48,7 +48,7 @@ class VirtualModelRunner:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
 
-        # ---- 1. ProfileBundle (ModelConfig + DeployConfig + hw + efficiency) ----
+        # ---- 1. ProfileBundle (ModelConfig + LegacyDeployConfig + hw + efficiency) ----
         self.bundle = extract_profile_bundle(vllm_config)
 
         # ---- 2. cost model (走 llm-viewer dense/moe_layer_time) ----

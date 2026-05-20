@@ -467,7 +467,7 @@ def test_classify_norm_patterns():
 
 
 def test_extractor_propagates_classification_to_deploy():
-    """profile_extractor 把分类结果填到 DeployConfig."""
+    """profile_extractor 把分类结果填到 LegacyDeployConfig."""
     import torch
     qcfg = {
         "quant_method": "fp8",

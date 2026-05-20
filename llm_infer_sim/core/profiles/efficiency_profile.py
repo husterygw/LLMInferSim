@@ -53,7 +53,7 @@ class EfficiencyProfile:
     default_comm: float = 1.0
 
     # bytes per element (跟随系统量化设置, 默认 fp16=2.0)
-    # extract_profile_bundle 用这些字段决定 DeployConfig.w_byte/a_byte/kv_byte。
+    # extract_profile_bundle 用这些字段决定 LegacyDeployConfig.w_byte/a_byte/kv_byte。
     w_byte: float = 2.0
     a_byte: float = 2.0
     kv_byte: float = 2.0

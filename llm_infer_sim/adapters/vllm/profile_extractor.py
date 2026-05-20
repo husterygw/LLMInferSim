@@ -5,7 +5,7 @@
 
 职责:
   1. extract_profile_bundle(vllm_config): 从 vllm.config.VllmConfig 抽取
-     ModelConfig + DeployConfig + HardwareConfig + EfficiencyProfile +
+     ModelConfig + LegacyDeployConfig + HardwareConfig + EfficiencyProfile +
      BackendExecutionProfile, 打包成框架无关的 ProfileBundle 返回。
   2. vLLM AttentionBackendEnum → BackendExecutionProfile 映射表
      (_VLLM_BACKEND_MODE_MAP / _VLLM_UNSUPPORTED_BACKENDS, 详设 §4.8.1.1)。
@@ -26,7 +26,7 @@ from llm_infer_sim.core.profiles.backend_profile import (
     MixedAttentionPolicy,
 )
 from llm_infer_sim.core.profiles.deploy import (
-    DeployConfig,
+    LegacyDeployConfig,
     ParallelConfig,
     PDDisaggConfig,
 )
@@ -132,7 +132,7 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # MeasuredOperatorDB 落地后由 cost backend 替换。
     efficiency.apply_to(hw)
 
-    # ---- 5. DeployConfig (跨 step 不变的部分; estimate() 时按 workload 覆盖) ----
+    # ---- 5. LegacyDeployConfig (跨 step 不变的部分; estimate() 时按 workload 覆盖) ----
     # V4 indexer K cache dtype: 从 attention_config.use_fp4_indexer_cache 推
     # (option C, 阶段 9-β). use_fp4_indexer_cache=True → 0.5B (MXFP4), 默认 1.0B (FP8).
     attn_cfg = getattr(vllm_config, "attention_config", None)
@@ -147,7 +147,7 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # ---- 5.5 PD 分离 (详设 §7.6) ----
     pd_cfg = _extract_pd_config(vllm_config)
 
-    deploy = DeployConfig(
+    deploy = LegacyDeployConfig(
         batch_size=1,                            # 占位
         input_len=1,                             # 占位
         output_len=1,                            # 占位

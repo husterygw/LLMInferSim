@@ -56,7 +56,7 @@ def _has_op(lr, name) -> bool:
 
 def test_profile_extractor_reads_enable_expert_parallel(qwen3_30b_a3b_ep2_bundle):
     """profile_extractor 应该把 vllm_config.parallel_config.enable_expert_parallel
-    透传到 ParallelConfig.enable_ep / DeployConfig.ep。"""
+    透传到 ParallelConfig.enable_ep / LegacyDeployConfig.ep。"""
     deploy = qwen3_30b_a3b_ep2_bundle.deploy
     assert deploy.parallel.enable_ep is True
     assert deploy.ep == 2   # ep = tp × dp = 2 × 1 = 2

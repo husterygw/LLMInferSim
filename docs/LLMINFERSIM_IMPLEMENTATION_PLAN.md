@@ -115,6 +115,126 @@ AIC-style static envelope
 top-K live validation 自动闭环
 ```
 
+### 0.6 测试策略: roofline-first, staged
+
+测试不等全部重构完成后再补, 而是随每个阶段一起落地。当前工程主线是
+roofline 层, 因此测试目标不是一开始追求端到端精确拟合, 而是先保证:
+
+```text
+公式正确
+图构建正确
+roofline lower bound 正确
+实测差距可解释
+```
+
+测试分四类:
+
+| 类型 | 是否需要芯片 | 进入普通 CI | 目的 |
+|---|---:|---:|---|
+| 架构/公式单测 | 否 | 是 | 锁住 VirtualOp、StepShape、RooflineBackend、DeployConfig 边界 |
+| 模型图/step 单测 | 否 | 是 | 验证 Qwen/后续 MoE 的 op list、shape、parallel/runtime metadata |
+| 算子级实测对比 | 是 | 否, 标记 hardware/integration | 生成 roofline gap, 对齐 collector 与 OperatorSignature |
+| 模型级实测对比 | 是 | 否, 标记 hardware/integration | 对比 StepCostTrace 与真实 benchmark/profiler, 做误差归因 |
+
+#### 测试随阶段安排
+
+```text
+阶段 1:
+  DeployConfig / VirtualOp / StepShape / RooflineBackend 单测
+  Qwen3-4B prefill/decode StepCostEngine smoke
+
+阶段 2:
+  OperatorSignature canonicalize 单测
+  runtime VirtualOp 与 collector case 生成同一 signature
+
+阶段 3:
+  OperatorDB exact hit / miss fallback 单测
+  GEMM roofline vs real compare report, hardware/integration
+
+阶段 4:
+  Qwen3-30B MoE graph / routing / fused_moe roofline 单测
+  fused_moe roofline vs real compare report, hardware/integration
+
+阶段 5:
+  collective signature / communication formula 单测
+  NCCL/collective roofline/formula vs real compare report, hardware/integration
+
+阶段 6/7:
+  Qwen3-4B 模型级 StepCostTrace vs real step/profiler 对比
+  单请求 TTFT/TPOT smoke compare report
+
+阶段 10:
+  正式真实芯片校准回归, 输出稳定误差指标和补采建议
+```
+
+#### 第一批必须随阶段 1 一起加的测试
+
+```text
+tests/core/graph/test_virtual_op.py
+tests/core/graph/test_step_shape.py
+tests/core/profiles/test_deploy_config.py
+tests/core/cost/test_roofline_backend.py
+tests/core/cost/test_step_cost_engine_qwen.py
+tests/core/models/test_qwen_dense_template.py
+```
+
+首批 smoke shapes 控制在 3 个:
+
+```text
+i128_o128      baseline
+i2048_o128     prefill scaling
+i128_o2048     decode scaling
+```
+
+#### 算子级实测对比报告
+
+算子级对比不作为普通 CI 硬门槛, 先生成报告:
+
+```text
+OperatorRooflineCompareReport
+  op_signature
+  op_kind / op_subtype
+  shape / dtype / parallel / runtime
+  roofline_us
+  real_p50_us
+  real_p90_us
+  gap = real_p50_us / roofline_us
+  bottleneck = compute / memory
+  arithmetic_intensity
+  pass_level
+```
+
+首版 sanity:
+
+```text
+roofline_us <= real_p50_us * 1.1
+```
+
+如果 roofline 明显比真实还慢, 优先检查公式、bytes、硬件峰值和 dtype。
+如果 gap 很大, 不立刻修正掉, 先作为 kernel efficiency / launch / layout /
+routing / data movement 的诊断信号。
+
+#### 模型级实测对比报告
+
+模型级对比分两层:
+
+```text
+Step/device-level:
+  StepCostTrace roofline total
+  vs real profiler 中对应 step 的 GPU kernel sum
+
+Serving-metrics-level:
+  sim TTFT / TPOT / E2E
+  vs vLLM/sglang benchmark TTFT / TPOT / E2E
+```
+
+roofline-only 阶段的验收口径:
+
+```text
+不要求端到端精确。
+要求趋势正确、拆解正确、lower bound 正确、误差可归因。
+```
+
 ## 1. 阶段 1: 图表示最小闭环
 
 ### 1.1 目标
@@ -1791,6 +1911,14 @@ StepCostTrace
 6. 新建 `core/ops/factories/attention.py` minimal。
 7. 新建 `core/models/qwen.py`。
 8. 新建 `StepCostEngine`。
-9. 写 Qwen3-4B prefill/decode 功能测试和量级 sanity check。
+9. 同步写第一批测试:
+   - `tests/core/graph/test_virtual_op.py`
+   - `tests/core/graph/test_step_shape.py`
+   - `tests/core/profiles/test_deploy_config.py`
+   - `tests/core/cost/test_roofline_backend.py`
+   - `tests/core/cost/test_step_cost_engine_qwen.py`
+   - `tests/core/models/test_qwen_dense_template.py`
+10. 用 `i128_o128`、`i2048_o128`、`i128_o2048` 做 Qwen3-4B
+    prefill/decode smoke 和量级 sanity check。
 
 这一步完成后, 再进入 Operator Schema 和 OperatorDB。

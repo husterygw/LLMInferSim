@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.profiles.deploy import LegacyDeployConfig
 from llm_infer_sim.core.ops.base import OperatorProfile
 from llm_infer_sim.core.ops.embedding import embedding, lm_head
 from llm_infer_sim.core.cost_model.layer_builder import dense_layer_time, moe_layer_time
@@ -302,8 +302,8 @@ class ModelCoreCostModel:
 
     def _per_step_cost(self, stage: str, batch: int, seqlen: int, ctx_len: int):
         """走 llm-viewer dense_layer_time / moe_layer_time 链路。"""
-        # 构造 step-specific DeployConfig (parallel + dtype 沿用 bundle, 覆盖 batch/seqlen)
-        deploy = DeployConfig(
+        # 构造 step-specific LegacyDeployConfig (parallel + dtype 沿用 bundle, 覆盖 batch/seqlen)
+        deploy = LegacyDeployConfig(
             batch_size=batch,
             input_len=seqlen,
             output_len=1,

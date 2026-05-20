@@ -23,7 +23,7 @@ from llm_infer_sim.core.ops.attention import (
 )
 from llm_infer_sim.core.ops.base import OperatorProfile
 from llm_infer_sim.core.profiles.backend_profile import BackendExecutionProfile
-from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.profiles.deploy import LegacyDeployConfig
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
 from llm_infer_sim.core.profiles.model_config import ModelConfig
 
@@ -38,7 +38,7 @@ class MixedAttentionEstimator:
         self,
         model: ModelConfig,
         hw: HardwareConfig,
-        deploy: DeployConfig,
+        deploy: LegacyDeployConfig,
         backend: BackendExecutionProfile,
         efficiency_profile=None,   # EfficiencyProfile | None, B.6
     ) -> None:

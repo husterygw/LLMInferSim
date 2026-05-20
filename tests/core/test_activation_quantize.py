@@ -14,7 +14,7 @@ from llm_infer_sim.core.cost_model.layer_builder import (
     dense_layer_time, moe_layer_time,
 )
 from llm_infer_sim.core.ops.normalization import activation_quantize
-from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.profiles.deploy import LegacyDeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 from llm_infer_sim.core.profiles.model_config import ModelConfig
 
@@ -40,15 +40,15 @@ def _qwen3_30b_a3b() -> ModelConfig:
     )
 
 
-def _fp16_deploy() -> DeployConfig:
+def _fp16_deploy() -> LegacyDeployConfig:
     """无 quant 部署: a_byte=base_a_byte=2.0."""
-    return DeployConfig(w_byte=2.0, a_byte=2.0, kv_byte=2.0,
+    return LegacyDeployConfig(w_byte=2.0, a_byte=2.0, kv_byte=2.0,
                         base_w_byte=2.0, base_a_byte=2.0)
 
 
-def _fp8_deploy() -> DeployConfig:
+def _fp8_deploy() -> LegacyDeployConfig:
     """Dynamic fp8 部署: a_byte=1.0, base_a_byte=2.0."""
-    return DeployConfig(w_byte=1.0, a_byte=1.0, kv_byte=1.0,
+    return LegacyDeployConfig(w_byte=1.0, a_byte=1.0, kv_byte=1.0,
                         base_w_byte=2.0, base_a_byte=2.0)
 
 
