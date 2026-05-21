@@ -20,7 +20,7 @@ from llm_infer_sim.core.profiles.deploy import DeployConfig
 
 
 class CollectiveOpFactory:
-    """生成 collective VirtualOp. 不算 latency (留给 Stage 5 backend)."""
+    """生成 CollectiveOp. 不算 latency (留给 Stage 5 backend)."""
 
     def __init__(
         self,

@@ -1,6 +1,6 @@
 """V4 sparse attention factory — fused_wqa_wkv / compressor / sparse attention / wo_a/wo_b.
 
-参考旧 cost_model.layer_builder._build_v4_sparse_attention_block + _build_v4_compressor_ops.
+公式参考 DeepSeek-V4 论文 + vLLM `DeepseekV4Attention` (sliding window + compressed + indexer).
 
 V4 attention block (per layer):
     [hc_attn_pre] → attn_norm

@@ -1,9 +1,6 @@
-"""ModelConfig — 模型架构参数 dataclass.
+"""ModelConfig — 模型架构参数 dataclass (框架无关, V3 §4.1).
 
-来源: 复制自 llm-viewer models/parallel.py (ModelConfig 部分),
-拆分时把 layer_time / model_inference_time 函数留在 cost_model/layer_builder.py。
-
-ops/ 只放算子, profiles/ 放配置 dataclass —— 阶段 2 重构时确立的边界。
+profiles/ 放配置 dataclass; layer 顺序 / 公式由 core/models/ 模板生成.
 """
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
-"""阶段 6: Expert Parallelism (EP) cost 公式一致性.
+"""Expert Parallelism (EP) cost 公式一致性.
 
-迁移自旧 cost_model/layer_builder.moe_layer_time. 现在跑的是新 MoE / Collective 链路.
+链路: MoEOpFactory + CollectiveOpFactory (ep_alltoall_dispatch / combine).
 
 固化以下:
   1. ep>1 时 expert_dim_per_device = expert_dim (不切 tp), 跟 ep=1 时反着

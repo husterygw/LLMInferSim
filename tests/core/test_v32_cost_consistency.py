@@ -1,9 +1,7 @@
-"""阶段 9.1: DeepSeek-V3.2-Exp DSA cost 公式手算 vs actual (新架构).
+"""DeepSeek-V3.2-Exp DSA cost 公式手算 vs actual.
 
 V3.2 = V3 MLA backbone + DSA lightning indexer + sparse-attended MLA kernel.
-
-迁移自旧 cost_model.layer_builder._build_v32_mla_sparse_attention_block. 现在跑的是
-DeepSeekModelTemplate (auto-detect index_topk > 0 走 V3.2 sparse path).
+链路: DeepSeekModelTemplate (auto-detect index_topk > 0 走 V3.2 sparse path).
 """
 from __future__ import annotations
 

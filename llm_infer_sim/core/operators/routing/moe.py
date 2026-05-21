@@ -1,4 +1,4 @@
-"""MoE router 行为建模 — 从旧 core/cost_model/moe_routing.py 迁过来.
+"""MoE router 行为建模.
 
 阶段 5-δ 公式 (V3 §4.7.1, IMPL_PLAN §4.2):
     E[distinct] = N × (1 − (1 − top_k/N)^T) × (1 − skew) + top_k × skew

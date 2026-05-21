@@ -1,21 +1,18 @@
-"""MetricsCollector — 详设 §4.10.1。
+"""MetricsCollector — 详设 §4.10.1.
 
-阶段 3 设计要点:
-  - 时间一律用 **simulator time** (累加 cost.total_latency), 不用 wall-clock。
-    instant TimeEmulator 模式下 wall-clock 几乎为零, 用它会污染指标。
-  - per-request 生命周期: arrival → first_token → 后续 token → completion
-    * arrival_time 在 request 第一次出现时记录
-    * first_token 在该 request 第一次 generated_tokens >= 1 的 step 上记录
-    * per_token_latencies 累加每个调度 step 的 cost.total_latency
-    * completion_time 在 request_id 进入 SchedulerOutput.finished_req_ids 时记录
-  - step-level breakdown 记录: total_latency, compute_time, memory_time, comm_time
-    + bottleneck / phase / num_tokens / batch / sim_time。
+Step 4 严格迁移后直接消费 StepCostTrace (V3 §4.5), 不再走 GlobalStepCost.
+
+设计要点:
+  - 时间一律用 simulator time (累加 trace.total_latency_s), 不用 wall-clock.
+  - per-request 生命周期: arrival → first_token → 后续 token → completion.
+  - step-level breakdown: total_latency / compute_time / memory_time / comm_time
+    + bottleneck / phase / num_tokens / batch / sim_time.
 """
 from __future__ import annotations
 
 from typing import Iterable
 
-from llm_infer_sim.core.cost.legacy import GlobalStepCost
+from llm_infer_sim.core.cost.trace import StepCostTrace
 from llm_infer_sim.core.workload.request_state import RequestMetrics, SystemMetrics
 from llm_infer_sim.core.workload.workload import GlobalStepWorkload, StepPhase
 
@@ -47,31 +44,20 @@ class MetricsCollector:
     def record_step(
         self,
         workload: GlobalStepWorkload,
-        cost: GlobalStepCost,
+        trace: StepCostTrace,
         finished_req_ids: Iterable[str] = (),
     ) -> None:
-        """记录一个 step。
-
-        约定:
-          - sim_time 在 step 调度发生时取当前值 (即"step 开始时间")
-          - per_token_latencies 把本 step 的 cost.total_latency 计入所有
-            被调度到的 request (mixed 时多个 request 共享 step 时间, 这是
-            serving simulator 的近似)
-          - first_token: 当 request 在本 step 进入 DECODE phase (即 prefill 完成)
-            或 generated_tokens 在本 step 增加到 ≥1, 记录 first_token_time
-            = sim_time + cost.total_latency (即"first token 出炉时间")
-          - completion: finished_req_ids 中的 req_id 在本 step 末尾完成
-        """
+        """记录一个 step (吃 V3 StepCostTrace)."""
         step_start_sim = self.sim_time
-        step_end_sim = self.sim_time + cost.total_latency
+        step_end_sim = self.sim_time + trace.total_latency_s
 
         self.step_records.append({
-            "step_id": cost.step_id,
-            "phase": cost.phase,
-            "total_latency": cost.total_latency,
-            "compute_time": cost.compute_time,
-            "memory_time": cost.memory_time,
-            "comm_time": cost.comm_time,
+            "step_id": trace.step_id,
+            "phase": trace.phase,
+            "total_latency": trace.total_latency_s,
+            "compute_time": trace.compute_time_s,
+            "memory_time": trace.memory_time_s,
+            "comm_time": trace.comm_time_s,
             "num_tokens": workload.total_scheduled_tokens,
             "batch_size": workload.batch_size,
             "sim_time_start": step_start_sim,
@@ -88,7 +74,7 @@ class MetricsCollector:
                 )
                 self.requests[req.request_id] = rm
 
-            rm.per_token_latencies.append(cost.total_latency)
+            rm.per_token_latencies.append(trace.total_latency_s)
 
             # first_token: 进入 DECODE 或 generated_tokens 已 >=1 都说明 prefill 已完成
             # 这个 step 之后的 sim_time_end 就是 first token 出炉时间

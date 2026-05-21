@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from llm_infer_sim.core.cost_model.moe_routing import MoERoutingPolicy
+from llm_infer_sim.core.operators.routing import MoERoutingProfile
 
 
 @dataclass
@@ -73,7 +73,7 @@ class BackendExecutionProfile:
     mixed_attention: MixedAttentionPolicy = field(default_factory=MixedAttentionPolicy)
     dense_gemm: DenseGemmPolicy = field(default_factory=DenseGemmPolicy)
     # 阶段 5-δ: MoE 路由建模 (默认 skew=0.0 = uniform, 阶段 X calibrate)
-    moe_routing: MoERoutingPolicy = field(default_factory=MoERoutingPolicy)
+    moe_routing: MoERoutingProfile = field(default_factory=MoERoutingProfile.balanced)
     # Phase 5 (通信建模):
     # execution_mode 控制是否加 framework_call_overhead (通信) / kernel_overhead (计算).
     #   "eager"     — 加 per-op dispatch overhead

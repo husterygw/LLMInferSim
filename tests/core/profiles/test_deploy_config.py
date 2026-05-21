@@ -1,10 +1,9 @@
-"""V3 §4.6 DeployConfig 单测 — 阶段 1 Step 1.0.
+"""V3 §4.6 DeployConfig 单测.
 
 锁住:
-  - 字段集 (最小集, 不带 batch/isl/osl/w_byte/pd/...)
+  - 字段集 (V3 §4.6 13 个字段 + pd 扩展)
   - 默认值
   - frozen + hashable (供 OperatorDB key / search 用)
-  - 与 LegacyDeployConfig 隔离 (两个不同类)
 """
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ import dataclasses
 
 import pytest
 
-from llm_infer_sim.core.profiles.deploy import DeployConfig, LegacyDeployConfig
+from llm_infer_sim.core.profiles.deploy import DeployConfig
 
 
 def test_default_values():
@@ -33,7 +32,7 @@ def test_default_values():
 
 
 def test_field_set_is_minimal():
-    """V3 §4.6 限定 13 个字段, 任何膨胀都需要重新对齐 OperatorDB key 设计."""
+    """V3 §4.6 13 字段 + pd 扩展."""
     names = {f.name for f in dataclasses.fields(DeployConfig)}
     expected = {
         "tp_size", "pp_size", "dp_size", "ep_size",
@@ -41,6 +40,7 @@ def test_field_set_is_minimal():
         "max_num_batched_tokens", "max_num_seqs",
         "block_size", "num_gpu_blocks",
         "execution_mode", "backend", "backend_version",
+        "pd",
     }
     assert names == expected
 
@@ -64,13 +64,6 @@ def test_different_instances_have_different_hash():
     b = DeployConfig(tp_size=2)
     assert a != b
     assert hash(a) != hash(b)
-
-
-def test_independent_from_legacy_class():
-    """新 DeployConfig 与 LegacyDeployConfig 不是同一类, 避免误用."""
-    assert DeployConfig is not LegacyDeployConfig
-    cfg = DeployConfig()
-    assert not isinstance(cfg, LegacyDeployConfig)
 
 
 def test_execution_mode_choices_are_strings():

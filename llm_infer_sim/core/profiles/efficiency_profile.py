@@ -9,14 +9,12 @@
     填入真测数据。当前默认 placeholder() = 全 1.0 = pure roofline 上界。
 
 调用方:
-  - `core/cost_model/roofline.py` 在 `analyze(op)` 后用 lookup_entry() 查 efficiency
-    并 multiply 到 t_compute/t_memory/inference_time。
-  - 当前所有 entry dict 为空, lookup_entry() 总返 None, roofline 走纯公式路径。
+  - `core/cost/roofline_analyzer.py` 在 `analyze(name, formula)` 后用 lookup_entry()
+    查 efficiency 并 multiply 到 t_compute / t_memory / inference_time.
+  - 当前所有 entry dict 为空, lookup_entry() 总返 None, roofline 走纯公式路径.
 
-未来扩展(Operator DB 集成):
-  - 当 MeasuredOperatorDB 落地时, 由它 populate self.entries (而非 YAML);
-  - 或者 cost_model 路径直接 query MeasuredOperatorDB 拿 absolute latency,
-    跳过 efficiency ratio 中间层。
+未来扩展 (OperatorDB 集成):
+  - 当 OperatorDB exact hit 时直接用真 latency, 跳过 efficiency ratio 中间层.
 """
 from __future__ import annotations
 
@@ -53,7 +51,7 @@ class EfficiencyProfile:
     default_comm: float = 1.0
 
     # bytes per element (跟随系统量化设置, 默认 fp16=2.0)
-    # extract_profile_bundle 用这些字段决定 LegacyDeployConfig.w_byte/a_byte/kv_byte。
+    # extract_profile_bundle 从 quantization_config 推导 w_byte/a_byte/kv_byte 填到这里.
     w_byte: float = 2.0
     a_byte: float = 2.0
     kv_byte: float = 2.0

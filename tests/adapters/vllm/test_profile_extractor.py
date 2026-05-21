@@ -265,62 +265,62 @@ def test_quant_method_fp8_switches_w_byte_and_a_byte():
     """quant_method 含 "fp8" + activation_scheme="dynamic" → w_byte=a_byte=1.0."""
     qcfg = {"quant_method": "fp8", "activation_scheme": "dynamic"}
     bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
-    assert bundle.deploy.w_byte == 1.0
-    assert bundle.deploy.a_byte == 1.0
+    assert bundle.efficiency.w_byte == 1.0
+    assert bundle.efficiency.a_byte == 1.0
 
 
 def test_quant_method_deepseek_v4_fp8_substring_match():
     """vLLM 把 quant_method 改写成 "deepseek_v4_fp8", 子串匹配应仍切 w_byte=1.0."""
     qcfg = {"quant_method": "deepseek_v4_fp8", "activation_scheme": "dynamic"}
     bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
-    assert bundle.deploy.w_byte == 1.0
-    assert bundle.deploy.a_byte == 1.0
+    assert bundle.efficiency.w_byte == 1.0
+    assert bundle.efficiency.a_byte == 1.0
 
 
 def test_quant_method_fp4_overrides_w_a_byte():
     """fp4 优先匹配 (避免 "fp4" 被 "fp8" 撞上, 子串顺序很关键)."""
     qcfg = {"quant_method": "nvfp4", "activation_scheme": "dynamic"}
     bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
-    assert bundle.deploy.w_byte == 0.5
-    assert bundle.deploy.a_byte == 0.5
+    assert bundle.efficiency.w_byte == 0.5
+    assert bundle.efficiency.a_byte == 0.5
 
 
 def test_no_quant_config_defaults_to_fp16():
     """无 quantization_config → 默认 fp16 (w_byte=a_byte=2.0)."""
     bundle = extract_profile_bundle(_make_vllm_config_with())
-    assert bundle.deploy.w_byte == 2.0
-    assert bundle.deploy.a_byte == 2.0
+    assert bundle.efficiency.w_byte == 2.0
+    assert bundle.efficiency.a_byte == 2.0
 
 
 def test_activation_scheme_missing_keeps_a_byte_default():
     """quant_method=fp8 但无 activation_scheme → 只切 w_byte, a_byte 保留默认 (保守)."""
     qcfg = {"quant_method": "fp8"}
     bundle = extract_profile_bundle(_make_vllm_config_with(quant_cfg=qcfg))
-    assert bundle.deploy.w_byte == 1.0
-    assert bundle.deploy.a_byte == 2.0
+    assert bundle.efficiency.w_byte == 1.0
+    assert bundle.efficiency.a_byte == 2.0
 
 
 def test_cache_dtype_fp8_switches_kv_byte():
     """cache_config.cache_dtype="fp8" → kv_byte=1.0."""
     bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="fp8"))
-    assert bundle.deploy.kv_byte == 1.0
+    assert bundle.efficiency.kv_byte == 1.0
 
 
 def test_cache_dtype_fp8_e4m3_substring_match():
     """cache_dtype="fp8_e4m3" 子串匹配 → kv_byte=1.0."""
     bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="fp8_e4m3"))
-    assert bundle.deploy.kv_byte == 1.0
+    assert bundle.efficiency.kv_byte == 1.0
 
 
 def test_cache_dtype_auto_keeps_default():
     """cache_dtype="auto" → kv_byte 保持默认 fp16 (跟随 model dtype)."""
     bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="auto"))
-    assert bundle.deploy.kv_byte == 2.0
+    assert bundle.efficiency.kv_byte == 2.0
 
 
 def test_cache_dtype_int8_switches_kv_byte():
     bundle = extract_profile_bundle(_make_vllm_config_with(cache_dtype="int8"))
-    assert bundle.deploy.kv_byte == 1.0
+    assert bundle.efficiency.kv_byte == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -343,49 +343,9 @@ def _make_vllm_config_with_dtype(model_dtype, quant_cfg=None, cache_dtype=None):
     )
 
 
-def test_base_dtype_bfloat16_gives_2_byte():
-    """model_config.dtype = torch.bfloat16 → base_w/a_byte = 2.0."""
-    import torch
-    bundle = extract_profile_bundle(_make_vllm_config_with_dtype(torch.bfloat16))
-    assert bundle.deploy.base_w_byte == 2.0
-    assert bundle.deploy.base_a_byte == 2.0
-
-
-def test_base_dtype_float16_gives_2_byte():
-    import torch
-    bundle = extract_profile_bundle(_make_vllm_config_with_dtype(torch.float16))
-    assert bundle.deploy.base_w_byte == 2.0
-
-
-def test_base_dtype_float32_gives_4_byte():
-    import torch
-    bundle = extract_profile_bundle(_make_vllm_config_with_dtype(torch.float32))
-    assert bundle.deploy.base_w_byte == 4.0
-
-
-def test_base_dtype_decouples_from_quant_method():
-    """关键: fp8 量化模型 lm_head/embed/norm 仍走 base = model dtype.
-
-    DeepSeek-V3 部署形态: dtype=bfloat16 + quant_method=fp8 →
-      w_byte=1.0 (主体 fp8)
-      base_w_byte=2.0 (lm_head/embed/norm 仍 bf16)
-      base_a_byte=2.0 (activation peak buffer 仍 bf16)
-    """
-    import torch
-    qcfg = {"quant_method": "fp8", "activation_scheme": "dynamic"}
-    vc = _make_vllm_config_with_dtype(torch.bfloat16, quant_cfg=qcfg)
-    bundle = extract_profile_bundle(vc)
-    assert bundle.deploy.w_byte == 1.0           # 主体 fp8
-    assert bundle.deploy.a_byte == 1.0           # GEMM input fp8
-    assert bundle.deploy.base_w_byte == 2.0      # lm_head/embed/norm bf16
-    assert bundle.deploy.base_a_byte == 2.0      # peak buffer bf16
-
-
-def test_base_dtype_none_fallback_to_2():
-    """model_config.dtype 缺失 (老 mock / 没 dtype) → fallback 2.0."""
-    bundle = extract_profile_bundle(_make_vllm_config_with())
-    assert bundle.deploy.base_w_byte == 2.0
-    assert bundle.deploy.base_a_byte == 2.0
+# base_dtype / base_w_byte / base_a_byte tests removed in Step 4.5:
+# V3 DeployConfig 不带 base_*; norm/embed/lm_head 通过对应 factory 自己用 a_byte=2.0
+# 表达 "non-quantized layer" 字节. quant 主体仍由 efficiency.w_byte/a_byte 表达.
 
 
 def test_torch_dtype_to_byte_helper():
@@ -466,20 +426,6 @@ def test_classify_norm_patterns():
     assert unh == []
 
 
-def test_extractor_propagates_classification_to_deploy():
-    """profile_extractor 把分类结果填到 LegacyDeployConfig."""
-    import torch
-    qcfg = {
-        "quant_method": "fp8",
-        "activation_scheme": "dynamic",
-        "ignore": ["re:.*lm_head"],
-    }
-    vc = _make_vllm_config_with_dtype(torch.bfloat16, quant_cfg=qcfg)
-    bundle = extract_profile_bundle(vc)
-    assert "re:.*lm_head" in bundle.deploy.covered_non_quantized
-    assert bundle.deploy.unhandled_non_quantized_modules == []
-
-
 def test_extractor_warns_on_unhandled():
     """unhandled pattern 触发 warning + 写入 deploy."""
     import warnings
@@ -491,8 +437,7 @@ def test_extractor_warns_on_unhandled():
     vc = _make_vllm_config_with_dtype(torch.bfloat16, quant_cfg=qcfg)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        bundle = extract_profile_bundle(vc)
+        extract_profile_bundle(vc)
         # 至少 1 个 warning 含 unhandled pattern
         msgs = [str(item.message) for item in w]
         assert any("model.layers.5.mlp.gate_up_proj" in m for m in msgs)
-    assert "model.layers.5.mlp.gate_up_proj" in bundle.deploy.unhandled_non_quantized_modules

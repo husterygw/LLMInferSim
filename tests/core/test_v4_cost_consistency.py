@@ -1,7 +1,6 @@
-"""阶段 9-δ: DeepSeek-V4 cost 公式手算 vs actual (新架构).
+"""DeepSeek-V4 cost 公式手算 vs actual.
 
-迁移自旧 cost_model.layer_builder._build_v4_sparse_attention_block + _build_v4_compressor_ops.
-现在跑 DeepSeekModelTemplate (auto-detect window_size>0 AND o_groups>0 走 V4 path).
+链路: DeepSeekModelTemplate (auto-detect window_size>0 AND o_groups>0 走 V4 path).
 
 覆盖 V4-Flash:
   - fused_wqa_wkv / fused_compress_wkv_wgate / fused_index_compress_wkv_wgate

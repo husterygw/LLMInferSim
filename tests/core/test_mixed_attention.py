@@ -1,7 +1,6 @@
-"""阶段 3d: mixed step (prefill+decode 同 step) attention 拆解.
+"""mixed step (prefill+decode 同 step) attention 拆解.
 
-迁移自旧 cost_model.mixed_attention.MixedAttentionEstimator. 新架构在
-AttentionOpFactory.mixed_attention() 实现 split_kernels (V3 §4.7.1b),
+链路: AttentionOpFactory.mixed_attention() 实现 split_kernels (V3 §4.7.1b),
 返 2 个 AttentionOp (prefill 段 + decode 段).
 
 阶段 3d 范围 (split_kernels only):

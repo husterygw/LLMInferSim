@@ -1,7 +1,6 @@
-"""阶段 8-β: MLA cost 公式手算 vs actual 对照 (V3 §4.1.4 + DeepSeekModelTemplate).
+"""MLA cost 公式手算 vs actual 对照 (V3 §4.1.4 + DeepSeekModelTemplate).
 
-迁移自旧 cost_model.layer_builder._build_mla_attention_block. 现在跑的是
-DeepSeekModelTemplate._build_mla_attn_block + DenseOpFactory.linear() + AttentionOpFactory.mla_attention.
+链路: DeepSeekModelTemplate._build_mla_attn_block + DenseOpFactory.linear() + AttentionOpFactory.mla_attention.
 
 覆盖 5 个 MLA 核心 op 公式 (DeepSeek-V3 tp=8 decode tokens=1):
   1. q_a_proj:           h → q_lora_rank

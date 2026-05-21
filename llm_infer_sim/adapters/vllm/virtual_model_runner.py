@@ -1,19 +1,14 @@
-"""VirtualModelRunner — 阶段 2: 接 llm-viewer builder。
+"""VirtualModelRunner — V3 StepCostEngine 唯一路径.
 
-阶段 2 增量 (vs 阶段 1):
-  - 用 adapters/vllm/profile_extractor.extract_profile_bundle 一次构造 ProfileBundle
-    (ModelConfig + LegacyDeployConfig + HardwareConfig + EfficiencyProfile)
-  - 弃用阶段 1 手写的 model_meta 抽取 (只 7 个字段, 漏 head_dim explicit / MLA / MoE)
-  - ModelCoreCostModel 改接 ProfileBundle, 内部走 llm-viewer dense/moe_layer_time
+链路:
+  vllm SchedulerOutput
+    → VllmStepExtractor → GlobalStepWorkload (框架无关)
+    → StepCostEngine → StepCostTrace
+    → VirtualTimeEmulator + MetricsCollector
+    → ModelRunnerOutput (fake token)
 
-阶段 3.5 重构:
-  - ProfileManager.from_vllm_config 改名为 extract_profile_bundle, 实现搬到
-    adapters/vllm/profile_extractor.py (core 完全框架无关, 详设 §1.1)
-
-阶段 3+ 起:
-  - chunked prefill mixed step (MixedAttentionEstimator)
-  - 阶段 4: TP cost 聚合
-  - 阶段 5/6/8: 自动 (因为 dense/moe_layer_time 已支持 MoE / MLA / V4)
+ProfileBundle (ModelConfig + DeployConfig + HardwareConfig + EfficiencyProfile)
+由 extract_profile_bundle 构造, core 完全框架无关 (V3 §1.1).
 """
 from __future__ import annotations
 
@@ -26,17 +21,17 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
 from llm_infer_sim.adapters.vllm.step_extractor import VllmStepExtractor
-from llm_infer_sim.core.cost.compat import step_cost_trace_to_global
+import dataclasses
+
 from llm_infer_sim.core.cost.engine import (
     build_deepseek_roofline_engine,
     build_qwen_roofline_engine,
 )
-from llm_infer_sim.core.cost.legacy import GlobalStepCost
-from llm_infer_sim.core.cost_model.model_core import ModelCoreCostModel
+from llm_infer_sim.core.cost.trace import StepCostTrace
 from llm_infer_sim.core.metrics.breakdown import format_step_breakdown
 from llm_infer_sim.core.metrics.collector import MetricsCollector
 from llm_infer_sim.core.metrics.reporter import ReportGenerator
-from llm_infer_sim.core.ops.kv_transfer import kv_transfer_time
+from llm_infer_sim.core.cost.formulas.kv_transfer import kv_transfer_time
 from llm_infer_sim.core.simulation.kv_block_allocator import KVBlockAllocator
 from llm_infer_sim.core.simulation.output_generator import FakeTokenGenerator
 from llm_infer_sim.core.simulation.time_emulator import VirtualTimeEmulator
@@ -53,23 +48,12 @@ class VirtualModelRunner:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
 
-        # ---- 1. ProfileBundle (ModelConfig + LegacyDeployConfig + V3 DeployConfig + hw + efficiency) ----
+        # ---- 1. ProfileBundle (ModelConfig + DeployConfig + hw + efficiency) ----
         self.bundle = extract_profile_bundle(vllm_config)
 
-        # ---- 2. cost model
-        # Step 4.4: 默认走新 StepCostEngine. LLM_INFER_SIM_USE_V3_ENGINE=0 显式 opt-out 走旧 ModelCoreCostModel.
-        self._use_v3_engine = (
-            os.environ.get("LLM_INFER_SIM_USE_V3_ENGINE", "1") == "1"
-            and self.bundle.deploy_v3 is not None
-        )
-        if self._use_v3_engine:
-            self.v3_engine = self._build_v3_engine()
-            self.model_cost = None
-            _log(f"using V3 StepCostEngine (template={type(self.v3_engine.template).__name__})")
-        else:
-            self.v3_engine = None
-            self.model_cost = ModelCoreCostModel(self.bundle)
-            _log("using legacy ModelCoreCostModel (LLM_INFER_SIM_USE_V3_ENGINE=0)")
+        # ---- 2. cost engine (V3 §4 StepCostEngine, 唯一路径) ----
+        self.cost_engine = self._build_cost_engine()
+        _log(f"cost engine: {type(self.cost_engine.template).__name__}")
 
         # ---- 3. time emulator (realtime by default) ----
         mode = os.environ.get("LLM_INFER_SIM_TIME_MODE", "realtime")
@@ -109,7 +93,9 @@ class VirtualModelRunner:
         self._block_allocator: KVBlockAllocator | None = None
 
         # ---- 9. PD 分离 (详设 §7.6) ----
-        self._pd_cfg = self.bundle.deploy.pd
+        # V3 DeployConfig.pd 可能 None (standalone 构造时); profile_extractor 总是设置.
+        from llm_infer_sim.core.profiles.deploy import PDDisaggConfig
+        self._pd_cfg = self.bundle.deploy.pd or PDDisaggConfig()
         self._pd_total_transfer_time: float = 0.0   # 累计 (供 aggregate 报告)
         self._pd_total_transfer_bytes: int = 0
         self._pd_num_transfers: int = 0
@@ -158,14 +144,10 @@ class VirtualModelRunner:
                 scheduler_output
             )
             if pd_extra_time > 0:
-                cost = GlobalStepCost(
-                    step_id=cost.step_id,
-                    phase=cost.phase,
-                    total_latency=cost.total_latency + pd_extra_time,
-                    compute_time=cost.compute_time,
-                    memory_time=cost.memory_time,
-                    comm_time=cost.comm_time + pd_extra_time,
-                    per_layer=cost.per_layer,
+                cost = dataclasses.replace(
+                    cost,
+                    total_latency_s=cost.total_latency_s + pd_extra_time,
+                    comm_time_s=cost.comm_time_s + pd_extra_time,
                 )
 
         step_line = format_step_breakdown(cost)
@@ -188,23 +170,14 @@ class VirtualModelRunner:
             )
         # ---- DP 同步 (详设 §10.5 G3): step latency = max(per-rank cost) ----
         # vLLM v1 DP 用 padding token 强同步, 慢者拖快者. 没这一步, 各 rank 独立 sleep
-        # 会让 batch 不均时 sim 偏快。dp_size=1 时跳过。
-        synced_latency = self._sync_dp_latency(cost.total_latency)
-        if synced_latency != cost.total_latency:
+        # 会让 batch 不均时 sim 偏快. dp_size=1 时跳过.
+        synced_latency = self._sync_dp_latency(cost.total_latency_s)
+        if synced_latency != cost.total_latency_s:
             step_line += (
                 f" | dp_sync max={synced_latency*1e3:.2f}ms "
-                f"(local={cost.total_latency*1e3:.2f}ms)"
+                f"(local={cost.total_latency_s*1e3:.2f}ms)"
             )
-            # 把同步后的 max latency 反写回 cost, 让 metrics 也按 max 算
-            cost = GlobalStepCost(
-                step_id=cost.step_id,
-                phase=cost.phase,
-                total_latency=synced_latency,
-                compute_time=cost.compute_time,
-                memory_time=cost.memory_time,
-                comm_time=cost.comm_time,
-                per_layer=cost.per_layer,
-            )
+            cost = dataclasses.replace(cost, total_latency_s=synced_latency)
 
         _log(step_line)
         self._maybe_dump_requests(workload)
@@ -215,7 +188,7 @@ class VirtualModelRunner:
             finished_req_ids=scheduler_output.finished_req_ids,
         )
 
-        self.time_emulator.simulate(cost.total_latency)
+        self.time_emulator.simulate(cost.total_latency_s)
 
         return self._build_model_runner_output(scheduler_output)
 
@@ -380,26 +353,13 @@ class VirtualModelRunner:
 
     # ------- internals -------
 
-    def _estimate_cost(self, workload: GlobalStepWorkload) -> GlobalStepCost:
-        if self.v3_engine is not None:
-            trace = self.v3_engine.estimate(workload)
-            return step_cost_trace_to_global(trace)
-        result = self.model_cost.estimate(workload)
-        self._maybe_dump_ops(workload, result)
-        return GlobalStepCost(
-            step_id=workload.step_id,
-            phase=workload.phase.value,
-            total_latency=result["total_time"],
-            compute_time=result["compute_time"],
-            memory_time=result["memory_time"],
-            comm_time=result["comm_time"],
-            per_layer=result.get("per_layer", []),
-        )
+    def _estimate_cost(self, workload: GlobalStepWorkload) -> StepCostTrace:
+        return self.cost_engine.estimate(workload)
 
-    def _build_v3_engine(self):
+    def _build_cost_engine(self):
         """选 Qwen / DeepSeek template 装配 StepCostEngine."""
         m = self.bundle.model
-        deploy = self.bundle.deploy_v3
+        deploy = self.bundle.deploy
         hw = self.bundle.hw
         # DeepSeek family: 有 MLA (kv_lora_rank > 0) 或 V4 (window_size > 0)
         if m.kv_lora_rank > 0 or m.window_size > 0:

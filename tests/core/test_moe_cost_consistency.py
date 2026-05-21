@@ -1,7 +1,6 @@
-"""阶段 5-β: MoE cost 公式数字一致性 (V3 §5.2 + IMPL_PLAN §4 routed_experts 语义).
+"""MoE cost 公式数字一致性 (V3 §5.2 + IMPL_PLAN §4 routed_experts 语义).
 
-迁移自旧 cost_model/layer_builder.moe_layer_time. 现在跑的是
-QwenModelGraphTemplate._build_moe_layer + MoEOpFactory + CollectiveOpFactory.
+链路: QwenModelGraphTemplate._build_moe_layer + MoEOpFactory + CollectiveOpFactory.
 
 固化以下关键正确性:
   1. routed_experts.flops = tokens × top_k × 3 × 2 × h × expert_dim_per_device

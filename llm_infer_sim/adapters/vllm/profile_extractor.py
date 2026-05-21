@@ -1,21 +1,15 @@
-"""vLLM → ProfileBundle 提取 (详设 §4.8.1.1 + §4.8.3)。
+"""vLLM → ProfileBundle 提取 (V3 §4.8.1.1 + §4.8.3).
 
-阶段 3.5 重构: 把"读 vllm_config 形状"的全部代码搬到 adapter 层, 与 core/profiles
-解耦 (详设 §1.1 架构分层: "core 完全框架无关")。
+把"读 vllm_config 形状"的全部代码集中在 adapter 层, 与 core/profiles 解耦
+(V3 §1.1 架构分层: core 完全框架无关).
 
 职责:
   1. extract_profile_bundle(vllm_config): 从 vllm.config.VllmConfig 抽取
-     ModelConfig + LegacyDeployConfig + HardwareConfig + EfficiencyProfile +
-     BackendExecutionProfile, 打包成框架无关的 ProfileBundle 返回。
+     ModelConfig + DeployConfig + HardwareConfig + EfficiencyProfile +
+     BackendExecutionProfile, 打包成框架无关的 ProfileBundle 返回.
   2. vLLM AttentionBackendEnum → BackendExecutionProfile 映射表
-     (_VLLM_BACKEND_MODE_MAP / _VLLM_UNSUPPORTED_BACKENDS, 详设 §4.8.1.1)。
-  3. vLLM hf_config → 框架无关 ModelConfig 字段抽取。
-
-对应详设引用:
-  §1.1   架构分层: core 不 import vllm, vllm 形状只在 adapter
-  §4.8.1 BackendExecutionProfile (core 数据类)
-  §4.8.1.1 vLLM Backend → mixed_mode 映射 (本文件实现)
-  §4.8.3 ProfileManager (重命名为 extract_profile_bundle, 实现在 adapter)
+     (_VLLM_BACKEND_MODE_MAP / _VLLM_UNSUPPORTED_BACKENDS, V3 §4.8.1.1).
+  3. vLLM hf_config → 框架无关 ModelConfig 字段抽取.
 """
 from __future__ import annotations
 
@@ -25,12 +19,7 @@ from llm_infer_sim.core.profiles.backend_profile import (
     BackendExecutionProfile,
     MixedAttentionPolicy,
 )
-from llm_infer_sim.core.profiles.deploy import (
-    DeployConfig,
-    LegacyDeployConfig,
-    ParallelConfig,
-    PDDisaggConfig,
-)
+from llm_infer_sim.core.profiles.deploy import DeployConfig, PDDisaggConfig
 from llm_infer_sim.core.profiles.efficiency_profile import EfficiencyProfile
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 from llm_infer_sim.core.profiles.model_adapters import get_adapter
@@ -57,15 +46,12 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     model_id = mc.model
     model_config = _extract_model_config(model_id, adapter, hf)
 
-    # ---- 2. ParallelConfig (阶段 4 起 tp>1, 阶段 6 起 ep>1) ----
+    # ---- 2. Parallelism (tp / dp / ep) ----
     pc = vllm_config.parallel_config
-    parallel = ParallelConfig(
-        tp_size=pc.tensor_parallel_size,
-        dp_size=getattr(pc, "data_parallel_size", 1) or 1,
-        # vLLM ParallelConfig.enable_expert_parallel: bool, 默认 False
-        # 当 True 时, EP group = TP × DP (单节点下 = TP)
-        enable_ep=bool(getattr(pc, "enable_expert_parallel", False)),
-    )
+    tp = int(pc.tensor_parallel_size)
+    dp = int(getattr(pc, "data_parallel_size", 1) or 1)
+    # vLLM: enable_expert_parallel=True 时 ep = tp × dp; 否则 ep = 1
+    ep = (tp * dp) if bool(getattr(pc, "enable_expert_parallel", False)) else 1
 
     # ---- 3. EfficiencyProfile (placeholder 全 1.0) ----
     efficiency = EfficiencyProfile.placeholder()
@@ -133,44 +119,13 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # MeasuredOperatorDB 落地后由 cost backend 替换。
     efficiency.apply_to(hw)
 
-    # ---- 5. LegacyDeployConfig (跨 step 不变的部分; estimate() 时按 workload 覆盖) ----
-    # V4 indexer K cache dtype: 从 attention_config.use_fp4_indexer_cache 推
-    # (option C, 阶段 9-β). use_fp4_indexer_cache=True → 0.5B (MXFP4), 默认 1.0B (FP8).
-    attn_cfg = getattr(vllm_config, "attention_config", None)
-    use_fp4_indexer = bool(getattr(attn_cfg, "use_fp4_indexer_cache", False))
-    indexer_kv_byte = 0.5 if use_fp4_indexer else 1.0
-
-    # ---- 5.4 base dtype (非量化层 + activation buffer) ----
-    # 从 model_config.dtype (torch.dtype) 推: bf16/fp16=2.0, fp32=4.0, fp8=1.0.
-    # 即使 quant_method=fp8, lm_head / embed / final_norm / per-layer norm 仍走基础 dtype.
-    base_dtype_byte = _torch_dtype_to_byte(getattr(mc, "dtype", None), default=2.0)
-
-    # ---- 5.5 PD 分离 (详设 §7.6) ----
+    # ---- 5. PD 分离 (详设 §7.6) ----
     pd_cfg = _extract_pd_config(vllm_config)
-
-    deploy = LegacyDeployConfig(
-        batch_size=1,                            # 占位
-        input_len=1,                             # 占位
-        output_len=1,                            # 占位
-        w_byte=efficiency.w_byte,
-        a_byte=efficiency.a_byte,
-        kv_byte=efficiency.kv_byte,
-        base_w_byte=base_dtype_byte,
-        base_a_byte=base_dtype_byte,
-        indexer_kv_byte=indexer_kv_byte,
-        covered_non_quantized=covered_non_quantized,
-        unhandled_non_quantized_modules=unhandled_non_quantized,
-        parallel=parallel,
-        pd=pd_cfg,
-        use_flash_attention=True,                # 现代 vLLM 默认 flash
-    )
 
     # ---- 6. BackendExecutionProfile (阶段 3.5: 从 attention_config 推导) ----
     backend = _extract_backend_profile(vllm_config)
 
-    # ---- 7. V3 §4.6 DeployConfig (新 StepCostEngine 路径) ----
-    # ep_size: vLLM 约定 enable_expert_parallel=True 时 ep = tp * dp, 否则 ep=1.
-    # 跟 LegacyDeployConfig.parallel.ep_size property 同义.
+    # ---- 7. V3 §4.6 DeployConfig ----
     cache_cfg = getattr(vllm_config, "cache_config", None)
     block_size = int(getattr(cache_cfg, "block_size", 16)) if cache_cfg else 16
     sched_cfg = getattr(vllm_config, "scheduler_config", None)
@@ -189,13 +144,13 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     except Exception:
         pass
 
-    deploy_v3 = DeployConfig(
-        tp_size=parallel.tp_size,
+    deploy = DeployConfig(
+        tp_size=tp,
         pp_size=1,
-        dp_size=parallel.dp_size,
-        ep_size=parallel.ep_size,
-        moe_tp_size=parallel.tp_size,
-        moe_ep_size=parallel.ep_size,
+        dp_size=dp,
+        ep_size=ep,
+        moe_tp_size=tp,
+        moe_ep_size=ep,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
         block_size=block_size,
@@ -203,6 +158,7 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         execution_mode="cudagraph",   # vLLM v1 default
         backend="vllm",
         backend_version=backend_version,
+        pd=pd_cfg,
     )
 
     return ProfileBundle(
@@ -211,7 +167,6 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
         hw=hw,
         efficiency=efficiency,
         backend=backend,
-        deploy_v3=deploy_v3,
     )
 
 

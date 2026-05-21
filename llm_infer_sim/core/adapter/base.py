@@ -3,7 +3,7 @@
 各框架适配器负责三件事:
   1. 把框架的 step 调度上下文转换为 GlobalStepWorkload (框架无关)
   2. 向框架注入虚拟执行后端 (接管 model execution)
-  3. 把 GlobalStepCost 翻译为框架期望的输出格式 (fake output)
+  3. 把 StepCostTrace 翻译为框架期望的输出格式 (fake output)
 
 阶段 0 spike: 建好接口契约, 暂无具体实现者 (vLLM 路径直接走
 VirtualPlatform → VirtualWorker, 不走 VllmAdapter)。后续阶段 (尤其
@@ -14,8 +14,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from llm_infer_sim.core.cost.trace import StepCostTrace
 from llm_infer_sim.core.workload.workload import GlobalStepWorkload
-from llm_infer_sim.core.cost.legacy import GlobalStepCost
 
 
 class IFrameworkAdapter(ABC):
@@ -67,9 +67,9 @@ class IFrameworkAdapter(ABC):
 
     @abstractmethod
     def emit_result(
-        self, workload: GlobalStepWorkload, result: GlobalStepCost
+        self, workload: GlobalStepWorkload, result: StepCostTrace
     ) -> Any:
-        """把 GlobalStepCost 翻译为框架期望的输出格式并返回。
+        """把 StepCostTrace 翻译为框架期望的输出格式并返回.
 
         - vLLM   : 返 ModelRunnerOutput (req_ids, sampled_token_ids, ...)
         - SGLang : 返 BatchTokenIdOut

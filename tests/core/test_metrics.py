@@ -1,5 +1,5 @@
-"""阶段 3 D 块: MetricsCollector + ReportGenerator 行为回归。"""
-from llm_infer_sim.core.cost_model.cost_result import GlobalStepCost
+"""MetricsCollector + ReportGenerator 行为回归 (V3 StepCostTrace)."""
+from llm_infer_sim.core.cost.trace import StepCostTrace
 from llm_infer_sim.core.metrics.collector import MetricsCollector, _percentile
 from llm_infer_sim.core.metrics.reporter import ReportGenerator
 from llm_infer_sim.core.workload.workload import (
@@ -19,11 +19,20 @@ def _wl(step_id, phase, requests, total_tokens, n_pref_req, n_dec_req,
     )
 
 
-def _cost(step_id, phase, latency, compute=0.0, memory=0.0, comm=0.0):
-    return GlobalStepCost(
-        step_id=step_id, phase=phase.value if hasattr(phase, "value") else phase,
-        total_latency=latency,
-        compute_time=compute, memory_time=memory, comm_time=comm,
+def _cost(step_id, phase, latency, compute=0.0, memory=0.0, comm=0.0) -> StepCostTrace:
+    """手造一个 StepCostTrace 用于 metrics 回归 (entries 空)."""
+    if compute >= memory:
+        bottleneck = "compute" if compute > 0 else "memory"
+    else:
+        bottleneck = "memory"
+    return StepCostTrace(
+        step_id=step_id,
+        phase=phase.value if hasattr(phase, "value") else phase,
+        total_latency_s=latency,
+        compute_time_s=compute, memory_time_s=memory,
+        comm_time_s=comm, runtime_time_s=0.0,
+        entries=(),
+        bottleneck=bottleneck,
     )
 
 
