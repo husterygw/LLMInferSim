@@ -1,7 +1,7 @@
 """V3 §7.3 RooflineBackend + Step 1.6 CostRouter 单测.
 
 锁住:
-  - VirtualOp.formula -> OperatorProfile 转换正确
+  - Operator.formula -> OperatorFormula 转换正确
   - estimate() 返 CostTraceEntry, source=roofline, match_type=fallback
   - 大 GEMM (compute-bound) / 小 GEMM (memory-bound) bottleneck 区分
   - CostRouter aggregate StepOpPlan -> StepCostTrace
@@ -15,7 +15,8 @@ from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.router import CostRouter
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
 from llm_infer_sim.core.graph.step_plan import StepOpPlan
-from llm_infer_sim.core.graph.virtual_op import VirtualOp
+from llm_infer_sim.core.operators.ops import CollectiveOp, GemmOp
+from llm_infer_sim.core.operators.specs import OperatorFormula
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 
@@ -40,25 +41,14 @@ def backend_eager(hw, deploy_eager):
     return RooflineBackend(hw, deploy_eager)
 
 
-def _gemm_op(m: int, n: int, k: int, name: str = "qkv_proj") -> VirtualOp:
-    """构 GEMM op: flops=2*m*n*k, weight bytes=n*k*2, act in=m*k*2, act out=m*n*2."""
-    return VirtualOp(
-        name=name, op_kind="gemm", op_subtype=name,
+def _gemm_op(m: int, n: int, k: int, name: str = "qkv_proj") -> GemmOp:
+    """构 GEMM op: gemm_formula() 算出 flops=2*m*n*k + 2-byte loads (bf16)."""
+    return GemmOp(
+        name=name, op_subtype=name,
         phase="prefill", layer_idx=0, dtype="bf16",
-        shape={"m": m, "n": n, "k": k},
-        parallel={"tp": 1},
-        runtime={
-            "framework": "vllm", "framework_version": "0.20.1",
-            "execution_mode": "eager", "kernel_source": "vllm_default",
-        },
-        formula={
-            "flops": 2 * m * n * k,
-            "load_weight": n * k * 2,
-            "load_act": m * k * 2,
-            "store_act": m * n * 2,
-            "op_precision": "bf16",
-            "op_category": "matmul",
-        },
+        m=m, n=n, k=k, tp=1,
+        framework="vllm", framework_version="0.20.1",
+        execution_mode="eager", kernel_source="vllm_default",
     )
 
 
@@ -139,14 +129,17 @@ def test_router_aggregates_step_plan(backend_eager):
 def test_router_skips_collective_in_stage_1(backend_eager):
     """阶段 5 才接 communication backend, 阶段 1 collective op 直接跳过不入 trace."""
     gemm = _gemm_op(m=128, n=6144, k=2560)
-    coll = VirtualOp(
+    coll = CollectiveOp(
         name="attn_allreduce", op_kind="collective", op_subtype="allreduce",
         phase="prefill", layer_idx=0, dtype="bf16",
-        shape={"message_bytes": 128 * 2560 * 2},
-        parallel={"world_size": 2, "tp": 2},
-        runtime={"backend": "nccl"},
-        formula={"comm_bytes": 128 * 2560 * 2, "comm_type": "allreduce",
-                 "op_category": "communication"},
+        shape_fields={"message_bytes": 128 * 2560 * 2},
+        parallel_fields={"world_size": 2, "tp": 2},
+        runtime_fields={"backend": "nccl"},
+        formula_value=OperatorFormula(
+            comm_bytes=128 * 2560 * 2,
+            comm_type="allreduce",
+            op_category="communication",
+        ),
     )
     plan = StepOpPlan(step_id=0, phase="prefill", ops=(gemm, coll))
     router = CostRouter(backend_eager)

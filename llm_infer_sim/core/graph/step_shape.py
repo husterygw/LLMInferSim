@@ -2,9 +2,9 @@
 
 从 GlobalStepWorkload 派生, 加入 graph/cudagraph 和 cost 相关字段.
 
-阶段 1 范围:
-    PREFILL / DECODE 两个 phase.
-    MIXED / CHUNKED_PREFILL 抛 NotImplementedError, 后续阶段补充.
+阶段 1:    PREFILL / DECODE.
+阶段 3d:   MIXED — prefill seqs + decode seqs 同 step (chunked prefill).
+            num_prefill_tokens > 0 AND num_decode_requests > 0 → phase="mixed".
 """
 from __future__ import annotations
 
@@ -41,10 +41,10 @@ class StepShape:
             if isinstance(workload.phase, StepPhase)
             else str(workload.phase)
         )
-        if phase_str not in ("prefill", "decode"):
+        if phase_str not in ("prefill", "decode", "mixed", "chunked_prefill"):
             raise NotImplementedError(
-                f"StepShape stage-1 只支持 prefill / decode, got {phase_str!r}. "
-                "MIXED / CHUNKED_PREFILL 推到后续阶段."
+                f"StepShape only supports prefill / decode / mixed / chunked_prefill, "
+                f"got {phase_str!r}."
             )
         return cls(
             step_id=workload.step_id,

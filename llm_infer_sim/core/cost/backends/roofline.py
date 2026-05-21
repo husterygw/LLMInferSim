@@ -1,14 +1,11 @@
-"""RooflineBackend — VirtualOp -> roofline latency.
-
-V3 §7.3: 不让 RooflineAnalyzer 直接读 VirtualOp; 转换 (formula → OperatorProfile)
-集中在 backend 内部.
-"""
+"""RooflineBackend — Operator -> roofline latency."""
 from __future__ import annotations
 
+from typing import Any
+
+from llm_infer_sim.core.cost.roofline_analyzer import RooflineAnalyzer
 from llm_infer_sim.core.cost.trace import CostTraceEntry
-from llm_infer_sim.core.cost_model.roofline import RooflineAnalyzer
-from llm_infer_sim.core.graph.virtual_op import VirtualOp
-from llm_infer_sim.core.ops.base import OperatorProfile
+from llm_infer_sim.core.operators.specs import OperatorFormula
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
 
@@ -37,9 +34,9 @@ class RooflineBackend:
             execution_mode=deploy.execution_mode,
         )
 
-    def estimate(self, op: VirtualOp) -> CostTraceEntry:
-        profile = self._to_operator_profile(op)
-        result = self.analyzer.analyze(profile)
+    def estimate(self, op: Any) -> CostTraceEntry:
+        formula = self._formula(op)
+        result = self.analyzer.analyze(op.name, formula)
         return CostTraceEntry(
             op_name=op.name,
             op_kind=op.op_kind,
@@ -63,10 +60,14 @@ class RooflineBackend:
         )
 
     @staticmethod
-    def _to_operator_profile(op: VirtualOp) -> OperatorProfile:
-        f = op.formula
-        return OperatorProfile(
-            name=op.name,
+    def _formula(op: Any) -> OperatorFormula:
+        formula_attr = getattr(op, "formula")
+        formula = formula_attr() if callable(formula_attr) else formula_attr
+        if isinstance(formula, OperatorFormula):
+            return formula
+
+        f = formula
+        return OperatorFormula(
             op_category=f.get("op_category", "matmul"),
             flops=int(f.get("flops", 0)),
             load_weight=int(f.get("load_weight", 0)),

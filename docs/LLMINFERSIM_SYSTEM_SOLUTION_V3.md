@@ -1199,14 +1199,17 @@ collector vllm_gemm record
 - execution_mode 区分 framework overhead。
 - topology/algo/protocol 进入 runtime。
 
-### 阶段 5: Attention / ModuleProfile
+### 阶段 5: Attention / Mixed 基础
 
 目标:
 
 - attention op-level profile
-- mixed attention module profile
-- ModuleProfileBackend
+- mixed attention VirtualOp
+- attention OperatorDB / roofline fallback
 - derived profile / step cost cache
+
+ModuleProfileBackend 不作为本阶段目标。module profile 采集方式不同于算子级
+OperatorDB, 后置为可选增强。
 
 ### 阶段 6: 配置搜索
 
@@ -1223,8 +1226,9 @@ collector vllm_gemm record
 
 - 迁移 collector 到自研芯片 runtime。
 - 采 OperatorDB。
-- 建 ModuleProfile。
 - 与真实 serving benchmark 做误差闭环。
+- 如果算子级 OperatorDB + timeline 修正后仍存在稳定系统性偏差, 再补建
+  ModuleProfile。
 
 验收:
 
@@ -1261,7 +1265,7 @@ collector vllm_gemm record
 
 应对:
 
-- 引入 ModuleProfileBackend。
+- 后置引入 ModuleProfileBackend, 不作为首轮 roofline/OperatorDB 对比前置条件。
 - 支持 fused VirtualOp。
 - 用 E2E benchmark 校准。
 

@@ -26,6 +26,7 @@ from llm_infer_sim.core.profiles.backend_profile import (
     MixedAttentionPolicy,
 )
 from llm_infer_sim.core.profiles.deploy import (
+    DeployConfig,
     LegacyDeployConfig,
     ParallelConfig,
     PDDisaggConfig,
@@ -167,12 +168,50 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # ---- 6. BackendExecutionProfile (阶段 3.5: 从 attention_config 推导) ----
     backend = _extract_backend_profile(vllm_config)
 
+    # ---- 7. V3 §4.6 DeployConfig (新 StepCostEngine 路径) ----
+    # ep_size: vLLM 约定 enable_expert_parallel=True 时 ep = tp * dp, 否则 ep=1.
+    # 跟 LegacyDeployConfig.parallel.ep_size property 同义.
+    cache_cfg = getattr(vllm_config, "cache_config", None)
+    block_size = int(getattr(cache_cfg, "block_size", 16)) if cache_cfg else 16
+    sched_cfg = getattr(vllm_config, "scheduler_config", None)
+    max_num_batched_tokens = (
+        int(sched_cfg.max_num_batched_tokens)
+        if sched_cfg and getattr(sched_cfg, "max_num_batched_tokens", None) else None
+    )
+    max_num_seqs = (
+        int(sched_cfg.max_num_seqs)
+        if sched_cfg and getattr(sched_cfg, "max_num_seqs", None) else None
+    )
+    backend_version = None
+    try:
+        import vllm as _vllm
+        backend_version = str(_vllm.__version__)
+    except Exception:
+        pass
+
+    deploy_v3 = DeployConfig(
+        tp_size=parallel.tp_size,
+        pp_size=1,
+        dp_size=parallel.dp_size,
+        ep_size=parallel.ep_size,
+        moe_tp_size=parallel.tp_size,
+        moe_ep_size=parallel.ep_size,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
+        block_size=block_size,
+        num_gpu_blocks=None,
+        execution_mode="cudagraph",   # vLLM v1 default
+        backend="vllm",
+        backend_version=backend_version,
+    )
+
     return ProfileBundle(
         model=model_config,
         deploy=deploy,
         hw=hw,
         efficiency=efficiency,
         backend=backend,
+        deploy_v3=deploy_v3,
     )
 
 

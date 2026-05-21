@@ -163,6 +163,9 @@ roofline lower bound 正确
   Qwen3-4B 模型级 StepCostTrace vs real step/profiler 对比
   单请求 TTFT/TPOT smoke compare report
 
+阶段 8+:
+  module_profile 仅作为后置可选增强; 不作为首轮 roofline vs real compare 前置条件
+
 阶段 10:
   正式真实芯片校准回归, 输出稳定误差指标和补采建议
 ```
@@ -1310,11 +1313,15 @@ collective op 可由 formula backend 估算
 trace source=comm_formula 或 operator_db
 ```
 
-## 6. 阶段 6: Attention / Mixed / ModuleProfile
+## 6. 阶段 6: Attention / Mixed 基础
 
 ### 6.1 目标
 
-把 attention 从临时公式迁到标准 VirtualOp / ModuleProfile 路线。
+把 attention 从临时公式迁到标准 VirtualOp / OperatorDB / roofline 路线。
+
+本阶段不实现 `ModuleProfileBackend`。module profile 需要框架内整段插桩,
+采集方式与算子级 OperatorDB 不同, 会引入额外 schema / store / router 优先级。
+为了先保证 roofline 主线和算子级实测对比闭环, module profile 后置为可选增强。
 
 覆盖:
 
@@ -1322,7 +1329,7 @@ trace source=comm_formula 或 operator_db
 - decode attention
 - mixed split
 - mixed unified/ragged
-- module profile backend
+- attention OperatorDB signature / roofline fallback
 
 ### 6.2 具体步骤
 
@@ -1355,16 +1362,38 @@ AttentionOpFactory builds mixed attention VirtualOp(s)
 CostRouter estimates them
 ```
 
-#### Step 6.3 ModuleProfile 数据模型
+#### Step 6.3 Attention OperatorDB / roofline 路径
 
-新增:
+策略:
+
+```text
+operator_db_first:
+  if attention exact hit -> source=operator_db
+  else -> source=roofline
+```
+
+mixed attention 首版可先展开为 split/unified `VirtualOp`, 不引入 module-level
+profile 覆盖整段 attention module。
+
+### 6.3 后置可选: ModuleProfile
+
+后续在以下条件满足后再引入:
+
+```text
+算子级 OperatorDB + roofline 汇总
+与真实 TTFT/TPOT 仍有稳定系统性偏差,
+并且偏差无法由 communication / launch timeline / cudagraph 建模解释。
+```
+
+届时再新增:
 
 ```text
 core/cost/backends/module_profile.py
 core/profiles/module_profile.py
+collector/module/
 ```
 
-支持:
+支持对象:
 
 ```text
 attention module profile
@@ -1373,9 +1402,7 @@ dense block profile
 runtime profile
 ```
 
-#### Step 6.4 CostRouter module priority
-
-策略:
+CostRouter 可再增加:
 
 ```text
 module_profile_first:
@@ -1384,24 +1411,21 @@ module_profile_first:
   else roofline
 ```
 
-首版可以先只支持 attention module profile。
-
-### 6.3 测试
+### 6.4 测试
 
 新增:
 
 ```text
 tests/core/ops/test_attention_factory.py
-tests/core/cost/test_module_profile_backend.py
 tests/core/cost/test_mixed_attention_v2.py
 ```
 
-### 6.4 验收标准
+### 6.5 验收标准
 
 ```text
 mixed workload 可通过 StepCostEngine 估算 attention
 trace 可区分 split/unified
-attention source 可为 module_profile/operator_db/roofline
+attention source 可为 operator_db/roofline
 ```
 
 ## 6.5 阶段 6.5: Eager/CUDAGraph Timeline 增强
@@ -1878,16 +1902,18 @@ source coverage report 可解释主要 miss
 5. 阶段 5: Collective 与 NCCL Profile
 6. 阶段 7: vLLM Adapter 接新引擎
 7. 阶段 8: Collector 覆盖率闭环
-8. 阶段 6: Attention / ModuleProfile
+8. 阶段 6: Attention / Mixed 基础
 9. 阶段 6.5: Eager/CUDAGraph Timeline 增强
 10. 阶段 9: 配置搜索
 11. 阶段 10: 真实芯片校准
+12. 后置可选: ModuleProfileBackend
 ```
 
 注意:
 
 - 如果想尽快跑 vLLM 端到端, 先做阶段 7。
-- 如果想先完善模型精度, 先做阶段 6。
+- 如果想先完善模型精度, 先做阶段 6 的 attention/mixed 基础。
+- ModuleProfileBackend 后置; 不作为阶段 3-8 的 roofline vs real compare 前置条件。
 - 阶段 6.5 建议放在初版 TTFT baseline 之后, 用于比较 timeline 模型带来的修正。
 
 ## 12. 第一轮建议任务包

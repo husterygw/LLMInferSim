@@ -92,15 +92,36 @@ def test_from_decode_workload():
     assert shape.execution_mode == "cudagraph"
 
 
-def test_mixed_phase_not_implemented():
-    wl = GlobalStepWorkload(step_id=0, phase=StepPhase.MIXED)
+def test_mixed_phase_now_supported():
+    """3d 起 StepShape 接受 mixed phase (prefill+decode 同 step)."""
+    wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.MIXED,
+        num_prefill_tokens=128, num_decode_tokens=4,
+        total_scheduled_tokens=132,
+        num_prefill_requests=1, num_decode_requests=4,
+    )
     deploy = DeployConfig()
-    with pytest.raises(NotImplementedError, match="prefill / decode"):
-        StepShape.from_workload(wl, deploy)
+    shape = StepShape.from_workload(wl, deploy)
+    assert shape.phase == "mixed"
+    assert shape.num_prefill_tokens == 128
+    assert shape.num_decode_requests == 4
 
 
-def test_chunked_prefill_not_implemented():
-    wl = GlobalStepWorkload(step_id=0, phase=StepPhase.CHUNKED_PREFILL)
+def test_chunked_prefill_now_supported():
+    """3d 起 chunked_prefill 也接受 (跟 mixed 同语义,只是 phase label 不同)."""
+    wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.CHUNKED_PREFILL,
+        num_prefill_tokens=128, total_scheduled_tokens=128,
+        num_prefill_requests=1,
+    )
+    deploy = DeployConfig()
+    shape = StepShape.from_workload(wl, deploy)
+    assert shape.phase == "chunked_prefill"
+
+
+def test_unknown_phase_raises():
+    """非 prefill/decode/mixed/chunked_prefill 仍 raise."""
+    wl = GlobalStepWorkload(step_id=0, phase="weird")
     deploy = DeployConfig()
     with pytest.raises(NotImplementedError):
         StepShape.from_workload(wl, deploy)

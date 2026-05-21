@@ -17,7 +17,7 @@ from llm_infer_sim.core.profiles.backend_profile import (
     BackendExecutionProfile,
     default_backend_profile,
 )
-from llm_infer_sim.core.profiles.deploy import LegacyDeployConfig
+from llm_infer_sim.core.profiles.deploy import DeployConfig, LegacyDeployConfig
 from llm_infer_sim.core.profiles.efficiency_profile import EfficiencyProfile
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
 from llm_infer_sim.core.profiles.model_adapters import UnsupportedModelError
@@ -32,6 +32,10 @@ class ProfileBundle:
       - adapters/vllm/profile_extractor.extract_profile_bundle(vllm_config)
       - (将来) adapters/sglang/profile_extractor.extract_profile_bundle(sgl_config)
       - 直接 ProfileBundle(...) 用于 standalone / 测试
+
+    Step 4 起:
+      - deploy: LegacyDeployConfig — 旧 cost_model 路径 (退役中)
+      - deploy_v3: DeployConfig | None — V3 §4.6 最小集, 新 StepCostEngine 用
     """
 
     model: ModelConfig
@@ -39,6 +43,7 @@ class ProfileBundle:
     hw: HardwareConfig
     efficiency: EfficiencyProfile
     backend: BackendExecutionProfile = field(default_factory=default_backend_profile)
+    deploy_v3: DeployConfig | None = None
 
 
 __all__ = ["ProfileBundle", "UnsupportedModelError"]

@@ -26,6 +26,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
 from llm_infer_sim.adapters.vllm.step_extractor import VllmStepExtractor
+from llm_infer_sim.core.cost.compat import step_cost_trace_to_global
+from llm_infer_sim.core.cost.engine import (
+    build_deepseek_roofline_engine,
+    build_qwen_roofline_engine,
+)
 from llm_infer_sim.core.cost_model.cost_result import GlobalStepCost
 from llm_infer_sim.core.cost_model.model_core import ModelCoreCostModel
 from llm_infer_sim.core.metrics.breakdown import format_step_breakdown
@@ -48,11 +53,20 @@ class VirtualModelRunner:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
 
-        # ---- 1. ProfileBundle (ModelConfig + LegacyDeployConfig + hw + efficiency) ----
+        # ---- 1. ProfileBundle (ModelConfig + LegacyDeployConfig + V3 DeployConfig + hw + efficiency) ----
         self.bundle = extract_profile_bundle(vllm_config)
 
-        # ---- 2. cost model (走 llm-viewer dense/moe_layer_time) ----
-        self.model_cost = ModelCoreCostModel(self.bundle)
+        # ---- 2. cost model
+        # 默认仍走旧 ModelCoreCostModel (向后兼容).
+        # 设置 LLM_INFER_SIM_USE_V3_ENGINE=1 切到新 StepCostEngine (Step 4 渐进迁移).
+        self._use_v3_engine = os.environ.get("LLM_INFER_SIM_USE_V3_ENGINE", "0") == "1"
+        if self._use_v3_engine and self.bundle.deploy_v3 is not None:
+            self.v3_engine = self._build_v3_engine()
+            self.model_cost = None
+            _log(f"using V3 StepCostEngine (template={type(self.v3_engine.template).__name__})")
+        else:
+            self.v3_engine = None
+            self.model_cost = ModelCoreCostModel(self.bundle)
 
         # ---- 3. time emulator (realtime by default) ----
         mode = os.environ.get("LLM_INFER_SIM_TIME_MODE", "realtime")
@@ -364,6 +378,9 @@ class VirtualModelRunner:
     # ------- internals -------
 
     def _estimate_cost(self, workload: GlobalStepWorkload) -> GlobalStepCost:
+        if self.v3_engine is not None:
+            trace = self.v3_engine.estimate(workload)
+            return step_cost_trace_to_global(trace)
         result = self.model_cost.estimate(workload)
         self._maybe_dump_ops(workload, result)
         return GlobalStepCost(
@@ -375,6 +392,16 @@ class VirtualModelRunner:
             comm_time=result["comm_time"],
             per_layer=result.get("per_layer", []),
         )
+
+    def _build_v3_engine(self):
+        """选 Qwen / DeepSeek template 装配 StepCostEngine."""
+        m = self.bundle.model
+        deploy = self.bundle.deploy_v3
+        hw = self.bundle.hw
+        # DeepSeek family: 有 MLA (kv_lora_rank > 0) 或 V4 (window_size > 0)
+        if m.kv_lora_rank > 0 or m.window_size > 0:
+            return build_deepseek_roofline_engine(m, deploy, hw)
+        return build_qwen_roofline_engine(m, deploy, hw)
 
     def _maybe_dump_requests(self, workload: GlobalStepWorkload) -> None:
         """每 step per-request 调度细节: req_id / phase / num_tokens / ctx_len / generated."""

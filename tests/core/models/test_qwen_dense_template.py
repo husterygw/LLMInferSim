@@ -11,15 +11,16 @@ from __future__ import annotations
 import pytest
 
 from llm_infer_sim.core.graph.step_shape import StepShape
-from llm_infer_sim.core.graph.virtual_op import VirtualOp
 from llm_infer_sim.core.models.qwen import QwenModelGraphTemplate
-from llm_infer_sim.core.ops.factories import (
+from llm_infer_sim.core.operators.factories import (
     AttentionOpFactory,
     DenseOpFactory,
     EmbeddingOpFactory,
     FactoryBundle,
     NormalizationOpFactory,
 )
+from llm_infer_sim.core.operators.ops import GemmOp
+from llm_infer_sim.core.operators.specs import Operator
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 from llm_infer_sim.core.profiles.model_config import ModelConfig
@@ -145,6 +146,7 @@ def test_qkv_proj_shape_matches_gqa():
     qkv_ops = [op for op in plan.ops if op.op_subtype == "qkv_proj"]
     assert qkv_ops, "no qkv_proj op generated"
     op = qkv_ops[0]
+    assert isinstance(op, GemmOp)
     assert op.shape["m"] == 128
     assert op.shape["k"] == model.hidden_dim
     # Q dim = 32 × 128 = 4096, K = V = 8 × 128 = 1024; total n = 4096 + 2*1024 = 6144
@@ -221,13 +223,13 @@ def test_tp_affects_qkv_shape():
 
 
 def test_all_ops_have_required_metadata():
-    """所有 VirtualOp 必含 op_kind/op_subtype/shape/parallel/runtime/formula."""
+    """所有 runtime op 必含 op_kind/op_subtype/shape/parallel/runtime/formula."""
     model = _qwen3_4b()
     deploy = DeployConfig()
     factories = _make_factories(model, deploy)
     plan = QwenModelGraphTemplate(model).build_step(_prefill_step(), factories)
     for op in plan.ops:
-        assert isinstance(op, VirtualOp)
+        assert isinstance(op, Operator)
         assert op.op_kind and op.op_subtype
         assert op.shape, f"{op.name} no shape"
         assert op.parallel, f"{op.name} no parallel"

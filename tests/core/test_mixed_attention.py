@@ -1,213 +1,215 @@
-"""阶段 3.5: MixedAttentionEstimator 数值与一致性测试 (详设 §4.7.1b)。
+"""阶段 3d: mixed step (prefill+decode 同 step) attention 拆解.
 
-覆盖:
-  1. split_kernels 与 unified_ragged 都返回合法 dict 与正时间
-  2. unified_ragged merged op flops/bytes = 子段 flops/bytes 之和 (一致性)
-  3. unified vs split: roofline 取 max 次序不同, 时间数字应不同 (典型 mixed batch)
-  4. 空 workload → 0 时间
-  5. ragged_efficiency 反比例影响 unified_ragged 时间
-  6. chunked_prefill_interleaved / decode_priority_prefill_append 仍 raise
+迁移自旧 cost_model.mixed_attention.MixedAttentionEstimator. 新架构在
+AttentionOpFactory.mixed_attention() 实现 split_kernels (V3 §4.7.1b),
+返 2 个 AttentionOp (prefill 段 + decode 段).
+
+阶段 3d 范围 (split_kernels only):
+  - prefill 段公式 = AttentionOpFactory.attention(prefill substep)
+  - decode 段公式 = AttentionOpFactory.attention(decode substep)
+  - 总成本 = sum (split_kernels) — CostRouter 不另算 sync overhead
+
+未实现:
+  - unified_ragged (FA varlen / FlashInfer 单 kernel ragged)  → Stage 6 ModuleProfile
+  - chunked_prefill_interleaved / decode_priority_prefill_append → 后续阶段
 """
-from types import SimpleNamespace
+from __future__ import annotations
 
 import pytest
 
-from llm_infer_sim.core.cost_model.mixed_attention import (
-    MixedAttentionEstimator,
-    _merge_ops,
+from llm_infer_sim.core.cost.engine import build_qwen_dense_roofline_engine
+from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.profiles.hardware import get_hardware_profile
+from llm_infer_sim.core.profiles.model_config import ModelConfig
+from llm_infer_sim.core.workload.workload import (
+    GlobalStepWorkload, RequestWorkload, StepPhase,
 )
-from llm_infer_sim.core.profiles.backend_profile import (
-    BackendExecutionProfile,
-    MixedAttentionPolicy,
-)
-from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
 
 
-def _make_vllm_config(hf, model_id="dummy"):
-    """与 test_cost_model 一致: 不含 attention_config (自动 None → flash_attn_auto)。"""
-    return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=hf, model=model_id),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=1, data_parallel_size=1,
+def _qwen3_4b() -> ModelConfig:
+    return ModelConfig(
+        name="Qwen3-4B",
+        hidden_dim=2560, num_heads=32, num_kv_heads=8, head_dim=128,
+        ffn_dim=9728, num_layers=36, vocab_size=151936,
+    )
+
+
+def _build_engine():
+    return build_qwen_dense_roofline_engine(
+        _qwen3_4b(), DeployConfig(), get_hardware_profile("RTX_4090"),
+    )
+
+
+def _mixed_step(*, isl=200, n_decode=4, ctx_decode=512) -> StepShape:
+    requests = [
+        RequestWorkload(
+            request_id="p0", phase=StepPhase.PREFILL,
+            num_tokens=isl, context_len=0,
         ),
-    )
-
-
-@pytest.fixture
-def qwen3_4b_bundle():
-    hf = SimpleNamespace(
-        model_type="qwen3",
-        num_attention_heads=32, num_key_value_heads=8,
-        hidden_size=2560, num_hidden_layers=36,
-        intermediate_size=9728, vocab_size=151936, head_dim=128,
-    )
-    return extract_profile_bundle(_make_vllm_config(hf, "Qwen3-4B"))
-
-
-def _make_estimator(bundle, mode: str, ragged_efficiency: float = 1.0):
-    backend = BackendExecutionProfile(
-        name=f"test_{mode}",
-        mixed_attention=MixedAttentionPolicy(
-            mode=mode,
-            ragged_efficiency=ragged_efficiency,
-        ),
-    )
-    return MixedAttentionEstimator(
-        model=bundle.model,
-        hw=bundle.hw,
-        deploy=bundle.deploy,
-        backend=backend,
-    )
-
-
-# 典型 mixed step: 1 个 prefill 请求 (200 tokens) + 4 个 decode (ctx=512)
-_TYPICAL_MIXED = dict(
-    num_prefill_tokens=200,
-    num_prefill_requests=1,
-    num_decode_requests=4,
-    max_prefill_seqlen=200,
-    avg_decode_context_len=512,
-)
-
-
-def test_split_kernels_returns_positive_time(qwen3_4b_bundle):
-    est = _make_estimator(qwen3_4b_bundle, "split_kernels")
-    result = est.estimate(**_TYPICAL_MIXED)
-    assert result["strategy"] == "split_kernels"
-    assert result["per_layer_time"] > 0
-    assert result["total_time"] == pytest.approx(
-        result["per_layer_time"] * qwen3_4b_bundle.model.num_layers
-    )
-    assert {"t_prefill", "t_decode", "sync_overhead", "overlap"} <= set(
-        result["breakdown"].keys()
-    )
-
-
-def test_unified_ragged_returns_positive_time(qwen3_4b_bundle):
-    est = _make_estimator(qwen3_4b_bundle, "unified_ragged")
-    result = est.estimate(**_TYPICAL_MIXED)
-    assert result["strategy"] == "unified_ragged"
-    assert result["per_layer_time"] > 0
-    bd = result["breakdown"]
-    assert bd["merged_flops"] > 0
-    assert bd["merged_mem_bytes"] > 0
-    assert bd["t_compute"] >= 0 and bd["t_memory"] >= 0
-    assert bd["ragged_efficiency"] == pytest.approx(1.0)
-
-
-def test_unified_ragged_merged_op_consistency(qwen3_4b_bundle):
-    """merged op 的 flops / 5-way mem decomposition 必须 = 子段之和。"""
-    est = _make_estimator(qwen3_4b_bundle, "unified_ragged")
-    prefill_ops = est._build_prefill_ops(200, 1, 200)
-    decode_ops = est._build_decode_ops(4, 512)
-    all_ops = list(prefill_ops) + list(decode_ops)
-    merged = _merge_ops(all_ops, name="test_merge")
-
-    assert merged.flops == sum(op.flops for op in all_ops)
-    assert merged.load_weight == sum(op.load_weight for op in all_ops)
-    assert merged.load_act == sum(op.load_act for op in all_ops)
-    assert merged.store_act == sum(op.store_act for op in all_ops)
-    assert merged.load_kv_cache == sum(op.load_kv_cache for op in all_ops)
-    assert merged.store_kv_cache == sum(op.store_kv_cache for op in all_ops)
-    assert merged.mem_bytes == sum(op.mem_bytes for op in all_ops)
-    assert merged.op_category == "attention"
-
-
-def test_unified_equals_split_when_both_same_bound(qwen3_4b_bundle):
-    """两段同 bound 时, split = max(c_pf, m_pf) + max(c_dc, m_dc) ; unified = max(Σc, Σm).
-
-    Qwen3-4B + 200 prefill + 4 decode(ctx=512) 实测两段都 memory-bound, 数学上相等,
-    但 split 比 unified 多注入 1 个 kernel_overhead (split 把 attention 拆 2 个 op),
-    所以差应严格 == 一个 overhead (默认 2 µs).
-    """
-    est_split = _make_estimator(qwen3_4b_bundle, "split_kernels")
-    est_unified = _make_estimator(qwen3_4b_bundle, "unified_ragged")
-    t_split = est_split.estimate(**_TYPICAL_MIXED)["per_layer_time"]
-    t_unified = est_unified.estimate(**_TYPICAL_MIXED)["per_layer_time"]
-    assert t_split > 0 and t_unified > 0
-    # 差等于 split 多注入的一个 overhead (default 2 µs = 2e-6 s)
-    overhead = qwen3_4b_bundle.hw.kernel_overhead.get("default", 0)
-    assert t_split == pytest.approx(t_unified + overhead, rel=1e-9)
-
-
-def test_unified_le_split_always(qwen3_4b_bundle):
-    """阶段 0-9 placeholder 哲学下数学恒等式: unified <= split 永远成立。
-
-    证明: max(a+c, b+d) <= max(a,b) + max(c,d) 对任意正数恒成立 (经典不等式)。
-    取 a=t_c_pf, b=t_m_pf, c=t_c_dc, d=t_m_dc 即可。
-    """
-    workloads = [
-        _TYPICAL_MIXED,
-        # 长 prefill + 短 decode: prefill compute-bound 可能性高
-        dict(num_prefill_tokens=8192, num_prefill_requests=1,
-             num_decode_requests=4, max_prefill_seqlen=8192,
-             avg_decode_context_len=512),
-        # 短 prefill + 大量 long-ctx decode: decode memory-bound 显著
-        dict(num_prefill_tokens=128, num_prefill_requests=1,
-             num_decode_requests=32, max_prefill_seqlen=128,
-             avg_decode_context_len=8192),
+    ] + [
+        RequestWorkload(
+            request_id=f"d{i}", phase=StepPhase.DECODE,
+            num_tokens=1, context_len=ctx_decode,
+        )
+        for i in range(n_decode)
     ]
-    est_split = _make_estimator(qwen3_4b_bundle, "split_kernels")
-    est_unified = _make_estimator(qwen3_4b_bundle, "unified_ragged")
-    for wl in workloads:
-        t_split = est_split.estimate(**wl)["per_layer_time"]
-        t_unified = est_unified.estimate(**wl)["per_layer_time"]
-        assert t_unified <= t_split + 1e-15, f"violation @ {wl}: split={t_split}, unified={t_unified}"
-
-
-def test_unified_ragged_empty_workload(qwen3_4b_bundle):
-    est = _make_estimator(qwen3_4b_bundle, "unified_ragged")
-    result = est.estimate(
-        num_prefill_tokens=0, num_prefill_requests=0,
-        num_decode_requests=0, max_prefill_seqlen=0,
-        avg_decode_context_len=0,
+    wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.MIXED, requests=requests,
+        num_prefill_tokens=isl, num_decode_tokens=n_decode,
+        total_scheduled_tokens=isl + n_decode,
+        num_prefill_requests=1, num_decode_requests=n_decode,
     )
-    assert result["per_layer_time"] == 0.0
-    assert result["total_time"] == 0.0
-    assert result["breakdown"].get("empty") is True
+    return StepShape.from_workload(wl, DeployConfig())
 
 
-def test_ragged_efficiency_scales_inversely(qwen3_4b_bundle):
-    """eff=0.5 应给出约 2× eff=1.0 的 per_layer_time。"""
-    t1 = _make_estimator(qwen3_4b_bundle, "unified_ragged", ragged_efficiency=1.0)\
-        .estimate(**_TYPICAL_MIXED)["per_layer_time"]
-    t_half = _make_estimator(qwen3_4b_bundle, "unified_ragged", ragged_efficiency=0.5)\
-        .estimate(**_TYPICAL_MIXED)["per_layer_time"]
-    assert t_half == pytest.approx(t1 * 2.0, rel=1e-6)
+# ---- StepShape 支持 mixed ----
+
+def test_step_shape_accepts_mixed_phase():
+    step = _mixed_step()
+    assert step.phase == "mixed"
+    assert step.num_prefill_tokens == 200
+    assert step.num_decode_requests == 4
+    assert step.max_prefill_seqlen == 200
+    assert step.avg_decode_context_len == 512
 
 
-def test_unimplemented_modes_still_raise(qwen3_4b_bundle):
-    for mode in ("chunked_prefill_interleaved", "decode_priority_prefill_append"):
-        est = _make_estimator(qwen3_4b_bundle, mode)
-        with pytest.raises(NotImplementedError, match="§10.5"):
-            est.estimate(**_TYPICAL_MIXED)
+# ---- mixed_attention split kernels ----
+
+def test_mixed_attention_returns_two_ops_for_mixed_step():
+    engine = _build_engine()
+    step = _mixed_step()
+    ops = engine.factories.attention.mixed_attention(0, step)
+    assert len(ops) == 2
+    subtypes = sorted(op.op_subtype for op in ops)
+    assert subtypes == ["mixed_decode", "mixed_prefill"]
 
 
-def test_unknown_mode_raises_value_error(qwen3_4b_bundle):
-    est = _make_estimator(qwen3_4b_bundle, "nonexistent_mode")
-    with pytest.raises(ValueError, match="Unknown mixed_attention.mode"):
-        est.estimate(**_TYPICAL_MIXED)
+def test_mixed_attention_tags_both_with_mixed():
+    engine = _build_engine()
+    ops = engine.factories.attention.mixed_attention(0, _mixed_step())
+    for op in ops:
+        assert "mixed" in op.tags
 
 
-def test_unified_decode_only_path(qwen3_4b_bundle):
-    """纯 decode workload (无 prefill) 应有正常时间且不报错。"""
-    est = _make_estimator(qwen3_4b_bundle, "unified_ragged")
-    result = est.estimate(
-        num_prefill_tokens=0, num_prefill_requests=0,
-        num_decode_requests=8, max_prefill_seqlen=0,
-        avg_decode_context_len=256,
+def test_mixed_attention_prefill_segment_matches_standalone_prefill():
+    """mixed.prefill 段公式 = pure prefill StepShape.attention 公式 (用同 isl)."""
+    engine = _build_engine()
+    step_mixed = _mixed_step(isl=200, n_decode=4)
+    ops_mixed = engine.factories.attention.mixed_attention(0, step_mixed)
+    pf_op = next(op for op in ops_mixed if op.op_subtype == "mixed_prefill")
+
+    # pure prefill ref
+    pf_only_wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.PREFILL,
+        requests=[RequestWorkload(
+            request_id="p", phase=StepPhase.PREFILL,
+            num_tokens=200, context_len=0,
+        )],
+        num_prefill_tokens=200, total_scheduled_tokens=200,
+        num_prefill_requests=1,
     )
-    assert result["per_layer_time"] > 0
-    assert result["breakdown"]["merged_flops"] > 0
+    ref_step = StepShape.from_workload(pf_only_wl, engine.deploy)
+    ref_op = engine.factories.attention.attention(0, ref_step)
+    assert pf_op.formula().flops == ref_op.formula().flops
+    assert pf_op.formula().mem_bytes == ref_op.formula().mem_bytes
 
 
-def test_unified_prefill_only_path(qwen3_4b_bundle):
-    """纯 prefill workload (无 decode) 应有正常时间。"""
-    est = _make_estimator(qwen3_4b_bundle, "unified_ragged")
-    result = est.estimate(
-        num_prefill_tokens=512, num_prefill_requests=1,
-        num_decode_requests=0, max_prefill_seqlen=512,
-        avg_decode_context_len=0,
+def test_mixed_attention_decode_segment_matches_standalone_decode():
+    """mixed.decode 段公式 = pure decode StepShape.attention 公式 (同 n_decode, ctx)."""
+    engine = _build_engine()
+    step_mixed = _mixed_step(isl=200, n_decode=4, ctx_decode=512)
+    ops_mixed = engine.factories.attention.mixed_attention(0, step_mixed)
+    dc_op = next(op for op in ops_mixed if op.op_subtype == "mixed_decode")
+
+    # pure decode ref
+    dc_only_wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.DECODE,
+        requests=[RequestWorkload(
+            request_id=f"d{i}", phase=StepPhase.DECODE,
+            num_tokens=1, context_len=512,
+        ) for i in range(4)],
+        num_decode_tokens=4, total_scheduled_tokens=4,
+        num_decode_requests=4,
     )
-    assert result["per_layer_time"] > 0
-    assert result["breakdown"]["merged_flops"] > 0
+    ref_step = StepShape.from_workload(dc_only_wl, engine.deploy)
+    ref_op = engine.factories.attention.attention(0, ref_step)
+    assert dc_op.formula().flops == ref_op.formula().flops
+    assert dc_op.formula().load_kv_cache == ref_op.formula().load_kv_cache
+
+
+def test_mixed_attention_no_prefill_drops_prefill_op():
+    """mixed step 没有 prefill tokens (n=0) → 只返 decode op."""
+    engine = _build_engine()
+    wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.MIXED,
+        requests=[RequestWorkload(
+            request_id=f"d{i}", phase=StepPhase.DECODE,
+            num_tokens=1, context_len=512,
+        ) for i in range(4)],
+        num_prefill_tokens=0, num_decode_tokens=4,
+        total_scheduled_tokens=4,
+        num_prefill_requests=0, num_decode_requests=4,
+    )
+    step = StepShape.from_workload(wl, engine.deploy)
+    ops = engine.factories.attention.mixed_attention(0, step)
+    assert len(ops) == 1
+    assert ops[0].op_subtype == "mixed_decode"
+
+
+def test_mixed_attention_no_decode_drops_decode_op():
+    """mixed step 没有 decode (但 phase=mixed) → 只返 prefill op."""
+    engine = _build_engine()
+    wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.MIXED,
+        requests=[RequestWorkload(
+            request_id="p", phase=StepPhase.PREFILL,
+            num_tokens=200, context_len=0,
+        )],
+        num_prefill_tokens=200, num_decode_tokens=0,
+        total_scheduled_tokens=200,
+        num_prefill_requests=1, num_decode_requests=0,
+    )
+    step = StepShape.from_workload(wl, engine.deploy)
+    ops = engine.factories.attention.mixed_attention(0, step)
+    assert len(ops) == 1
+    assert ops[0].op_subtype == "mixed_prefill"
+
+
+def test_mixed_attention_raises_for_non_mixed_phase():
+    """attention(step) for prefill/decode 走单 op path; mixed_attention 拒非 mixed/chunked."""
+    engine = _build_engine()
+    pf_only_wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.PREFILL,
+        requests=[RequestWorkload(
+            request_id="p", phase=StepPhase.PREFILL,
+            num_tokens=128, context_len=0,
+        )],
+        num_prefill_tokens=128, total_scheduled_tokens=128,
+        num_prefill_requests=1,
+    )
+    step = StepShape.from_workload(pf_only_wl, engine.deploy)
+    with pytest.raises(ValueError, match="mixed_attention expects"):
+        engine.factories.attention.mixed_attention(0, step)
+
+
+def test_mixed_attention_accepts_chunked_prefill_phase():
+    """chunked_prefill 跟 mixed 同等对待."""
+    engine = _build_engine()
+    wl = GlobalStepWorkload(
+        step_id=0, phase=StepPhase.CHUNKED_PREFILL,
+        requests=[
+            RequestWorkload(
+                request_id="p", phase=StepPhase.PREFILL,
+                num_tokens=200, context_len=0,
+            ),
+        ],
+        num_prefill_tokens=200, total_scheduled_tokens=200,
+        num_prefill_requests=1,
+    )
+    step = StepShape.from_workload(wl, engine.deploy)
+    assert step.phase == "chunked_prefill"
+    # decode 段没有,只返 prefill
+    ops = engine.factories.attention.mixed_attention(0, step)
+    assert len(ops) == 1
+    assert ops[0].op_subtype == "mixed_prefill"

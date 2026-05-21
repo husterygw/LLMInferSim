@@ -112,7 +112,7 @@ def test_gemm_entries_carry_required_metadata(engine):
     trace = engine.estimate(_prefill(isl=128))
     gemm_entries = [e for e in trace.entries if e.op_kind == "gemm"]
     assert gemm_entries, "no GEMM entries"
-    # entry 本身就有 op_kind/op_subtype, VirtualOp 字段已通过 test_qwen_dense_template 锁住,
+    # entry 本身就有 op_kind/op_subtype, Operator 字段已通过 test_qwen_dense_template 锁住,
     # 这里间接 verify entry 与 op 一一对应
     for e in gemm_entries:
         assert e.op_kind == "gemm"
