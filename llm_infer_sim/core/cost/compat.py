@@ -11,8 +11,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from llm_infer_sim.core.cost.legacy import GlobalStepCost
 from llm_infer_sim.core.cost.trace import StepCostTrace
-from llm_infer_sim.core.cost_model.cost_result import GlobalStepCost
 
 
 def step_cost_trace_to_global(

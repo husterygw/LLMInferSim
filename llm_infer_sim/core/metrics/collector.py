@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from llm_infer_sim.core.cost_model.cost_result import GlobalStepCost
+from llm_infer_sim.core.cost.legacy import GlobalStepCost
 from llm_infer_sim.core.workload.request_state import RequestMetrics, SystemMetrics
 from llm_infer_sim.core.workload.workload import GlobalStepWorkload, StepPhase
 

@@ -10,7 +10,7 @@ TTFT / TPOT / throughput 完整 metrics。
 """
 from __future__ import annotations
 
-from llm_infer_sim.core.cost_model.cost_result import GlobalStepCost
+from llm_infer_sim.core.cost.legacy import GlobalStepCost
 
 
 def format_step_breakdown(cost: GlobalStepCost) -> str:

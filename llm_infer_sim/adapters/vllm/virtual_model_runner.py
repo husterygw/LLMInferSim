@@ -31,7 +31,7 @@ from llm_infer_sim.core.cost.engine import (
     build_deepseek_roofline_engine,
     build_qwen_roofline_engine,
 )
-from llm_infer_sim.core.cost_model.cost_result import GlobalStepCost
+from llm_infer_sim.core.cost.legacy import GlobalStepCost
 from llm_infer_sim.core.cost_model.model_core import ModelCoreCostModel
 from llm_infer_sim.core.metrics.breakdown import format_step_breakdown
 from llm_infer_sim.core.metrics.collector import MetricsCollector
@@ -57,16 +57,19 @@ class VirtualModelRunner:
         self.bundle = extract_profile_bundle(vllm_config)
 
         # ---- 2. cost model
-        # 默认仍走旧 ModelCoreCostModel (向后兼容).
-        # 设置 LLM_INFER_SIM_USE_V3_ENGINE=1 切到新 StepCostEngine (Step 4 渐进迁移).
-        self._use_v3_engine = os.environ.get("LLM_INFER_SIM_USE_V3_ENGINE", "0") == "1"
-        if self._use_v3_engine and self.bundle.deploy_v3 is not None:
+        # Step 4.4: 默认走新 StepCostEngine. LLM_INFER_SIM_USE_V3_ENGINE=0 显式 opt-out 走旧 ModelCoreCostModel.
+        self._use_v3_engine = (
+            os.environ.get("LLM_INFER_SIM_USE_V3_ENGINE", "1") == "1"
+            and self.bundle.deploy_v3 is not None
+        )
+        if self._use_v3_engine:
             self.v3_engine = self._build_v3_engine()
             self.model_cost = None
             _log(f"using V3 StepCostEngine (template={type(self.v3_engine.template).__name__})")
         else:
             self.v3_engine = None
             self.model_cost = ModelCoreCostModel(self.bundle)
+            _log("using legacy ModelCoreCostModel (LLM_INFER_SIM_USE_V3_ENGINE=0)")
 
         # ---- 3. time emulator (realtime by default) ----
         mode = os.environ.get("LLM_INFER_SIM_TIME_MODE", "realtime")

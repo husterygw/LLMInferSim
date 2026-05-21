@@ -73,6 +73,12 @@ class QwenModelGraphTemplate:
 
     # ---- dense layer ----
 
+    def _attention_ops(self, layer_idx, step, factories):
+        """mixed/chunked phase 拆 2 ops, prefill/decode 单 op."""
+        if step.phase in ("mixed", "chunked_prefill"):
+            return list(factories.attention.mixed_attention(layer_idx, step))
+        return [factories.attention.attention(layer_idx, step)]
+
     def _build_layer(
         self,
         layer_idx: int,
@@ -85,7 +91,7 @@ class QwenModelGraphTemplate:
             factories.norm.attn_norm(layer_idx, tokens, phase),
             factories.dense.qkv_proj(layer_idx, tokens, phase),
             factories.attention.rope(layer_idx, tokens, phase),
-            factories.attention.attention(layer_idx, step),
+            *self._attention_ops(layer_idx, step, factories),
             factories.dense.o_proj(layer_idx, tokens, phase),
             factories.norm.attn_add(layer_idx, tokens, phase),
             factories.norm.mlp_norm(layer_idx, tokens, phase),
@@ -122,7 +128,7 @@ class QwenModelGraphTemplate:
             factories.norm.attn_norm(layer_idx, tokens, phase),
             factories.dense.qkv_proj(layer_idx, tokens, phase),
             factories.attention.rope(layer_idx, tokens, phase),
-            factories.attention.attention(layer_idx, step),
+            *self._attention_ops(layer_idx, step, factories),
             factories.dense.o_proj(layer_idx, tokens, phase),
             factories.norm.attn_add(layer_idx, tokens, phase),
             # MoE FFN
