@@ -15,7 +15,7 @@ import math
 
 import pytest
 
-from llm_infer_sim.core.cost.formulas.communication import (
+from llm_infer_sim.core.cost.roofline.communication import (
     _hierarchical_allgather,
     _hierarchical_allreduce,
     _hierarchical_alltoall,

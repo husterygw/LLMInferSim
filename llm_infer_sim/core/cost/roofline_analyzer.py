@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.operators.base import RooflineSpec
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
 
 
@@ -45,7 +45,7 @@ class RooflineAnalyzer:
         self.efficiency_profile = efficiency_profile
         self.execution_mode = execution_mode
 
-    def _select_peak(self, formula: OperatorFormula) -> float:
+    def _select_peak(self, formula: RooflineSpec) -> float:
         if formula.op_precision == "fp8":
             return self.hw.effective_peak_fp8
         if formula.op_precision == "fp4":
@@ -78,7 +78,7 @@ class RooflineAnalyzer:
             return 0.0
         return overheads.get(op_category, overheads.get("default", 0.0))
 
-    def analyze(self, name: str, formula: OperatorFormula) -> RooflineResult:
+    def analyze(self, name: str, formula: RooflineSpec) -> RooflineResult:
         peak = self._select_peak(formula)
         bandwidth = self.hw.effective_mem_bandwidth
         mem_bytes = formula.mem_bytes

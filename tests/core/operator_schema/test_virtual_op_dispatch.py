@@ -18,10 +18,6 @@ from llm_infer_sim.core.operator_schema import (
     gemm_case_params_to_signature,
     virtual_op_to_signature,
 )
-from llm_infer_sim.core.operators.factories import (
-    AttentionOpFactory, DenseOpFactory,
-    EmbeddingOpFactory, FactoryBundle, NormalizationOpFactory,
-)
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 from llm_infer_sim.core.profiles.model_config import ModelConfig
@@ -39,15 +35,11 @@ def _qwen3_4b() -> ModelConfig:
 
 
 def _build_plan(isl=128, deploy=None):
+    from llm_infer_sim.core.operators.context import build_operator_context
     model = _qwen3_4b()
     deploy = deploy or DeployConfig()
     hw = get_hardware_profile("RTX_4090")
-    factories = FactoryBundle(
-        dense=DenseOpFactory(model, deploy),
-        norm=NormalizationOpFactory(model, deploy),
-        embedding=EmbeddingOpFactory(model, deploy),
-        attention=AttentionOpFactory(model, deploy, hw),
-    )
+    ctx = build_operator_context(model, deploy, hw)
     wl = GlobalStepWorkload(
         step_id=0, phase=StepPhase.PREFILL,
         requests=[RequestWorkload(
@@ -58,7 +50,7 @@ def _build_plan(isl=128, deploy=None):
         num_prefill_requests=1,
     )
     step = StepShape.from_workload(wl, deploy)
-    return QwenModelGraphTemplate(model).build_step(step, factories)
+    return QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(step)
 
 
 def test_dispatch_qwen_qkv_proj():

@@ -1,6 +1,6 @@
 """Expert Parallelism (EP) cost 公式一致性.
 
-链路: MoEOpFactory + CollectiveOpFactory (ep_alltoall_dispatch / combine).
+链路: QwenModelGraphTemplate._build_moe_ffn_block 直接构造 FusedMoE + Collective (ep_alltoall_dispatch / combine).
 
 固化以下:
   1. ep>1 时 expert_dim_per_device = expert_dim (不切 tp), 跟 ep=1 时反着
@@ -8,7 +8,7 @@
   3. weight = distinct(T,k,N) × 3 × h × expert_dim × w_byte / ep
   4. ep>1 时 ep_alltoall_dispatch + combine 同时出现, comm_bytes = tokens × h × a_byte
   5. ep>1 时 routed_expert_allreduce 消失
-  6. CollectiveOp.parallel.world_size = ep (跟 DP+EP 场景 ep = tp × dp 一致)
+  6. Collective.parallel.world_size = ep (跟 DP+EP 场景 ep = tp × dp 一致)
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import pytest
 
 from llm_infer_sim.core.cost.engine import build_qwen_roofline_engine
 from llm_infer_sim.core.graph.step_shape import StepShape
-from llm_infer_sim.core.operators.routing import estimate_distinct_experts
+from llm_infer_sim.core.operators import estimate_distinct_experts
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 from llm_infer_sim.core.profiles.model_config import ModelConfig
@@ -71,7 +71,7 @@ def _layer_ops(*, tokens: int, phase: str, tp: int, ep: int,
             num_decode_requests=tokens,
         )
     step = StepShape.from_workload(wl, deploy)
-    return engine.template._build_moe_layer(layer_idx, step, engine.factories)
+    return engine.template._build_moe_layer(layer_idx, step)
 
 
 def _find(ops, name):
@@ -100,7 +100,7 @@ def test_routed_experts_expert_dim_not_sliced_under_ep():
         tokens * m.num_activated_experts * 3 * 2 * m.hidden_dim
         * expert_dim_per_device // ep
     )
-    assert op.formula().flops == expected_flops
+    assert op.roofline_spec().flops == expected_flops
 
 
 def test_routed_experts_weight_uses_distinct_div_ep():
@@ -121,7 +121,7 @@ def test_routed_experts_weight_uses_distinct_div_ep():
         )
         tokens_per_device = tokens * m.num_activated_experts // ep
         expected_act = 2 * tokens_per_device * m.hidden_dim * A_BYTE
-        assert op.formula().mem_bytes == expected_weight + expected_act, (
+        assert op.roofline_spec().mem_bytes == expected_weight + expected_act, (
             f"tokens={tokens}: distinct={distinct:.2f}"
         )
 
@@ -133,7 +133,7 @@ def test_routed_experts_act_scales_with_tokens_per_device():
     ep = 2
     ops = _layer_ops(tokens=tokens, phase="decode", tp=2, ep=ep)
     op = _find(ops, "routed_experts")
-    f = op.formula()
+    f = op.roofline_spec()
 
     tokens_per_device = tokens * m.num_activated_experts // ep
     expected_act_each = tokens_per_device * m.hidden_dim * A_BYTE
@@ -160,7 +160,7 @@ def test_ep_alltoall_comm_bytes():
         ops = _layer_ops(tokens=tokens, phase=phase, tp=2, ep=ep)
         for op_name in ("ep_alltoall_dispatch", "ep_alltoall_combine"):
             op = _find(ops, op_name)
-            f = op.formula()
+            f = op.roofline_spec()
             expected = tokens * m.hidden_dim * A_BYTE
             assert f.comm_bytes == expected, (
                 f"tokens={tokens} op={op_name}"
@@ -169,7 +169,7 @@ def test_ep_alltoall_comm_bytes():
 
 
 def test_alltoall_world_size_equals_ep():
-    """CollectiveOp.parallel.world_size 应严格等于 ep_size (不是 tp)."""
+    """Collective.parallel.world_size 应严格等于 ep_size (不是 tp)."""
     for ep in (2, 4):
         ops = _layer_ops(tokens=4, phase="decode", tp=2, ep=ep)
         for name in ("ep_alltoall_dispatch", "ep_alltoall_combine"):
@@ -203,7 +203,7 @@ def test_ep1_uses_allreduce_ep2_uses_alltoall():
 
 def test_dp_doubles_ep_world_size():
     """DP+EP 场景: tp=2 dp=2 ep=4 vs tp=2 dp=1 ep=2.
-    CollectiveOp.parallel.world_size 必须等于 ep_size, 不是 tp."""
+    Collective.parallel.world_size 必须等于 ep_size, 不是 tp."""
     ops_small = _layer_ops(tokens=4, phase="decode", tp=2, ep=2)
     ops_big = _layer_ops(tokens=4, phase="decode", tp=2, ep=4)
 

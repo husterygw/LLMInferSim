@@ -55,7 +55,7 @@ def _attn_ops(model, deploy, *, tokens=1, phase="decode", ctx_len=8192, layer_id
             num_prefill_requests=1,
         )
     step = StepShape.from_workload(wl, deploy)
-    return engine.template._build_mla_attn_block(layer_idx, step, engine.factories)
+    return engine.template._build_mla_attn_block(layer_idx, step)
 
 
 def _has_subtype(ops, subtype) -> bool:
@@ -70,8 +70,9 @@ def _find_by_subtype(ops, subtype):
 
 
 def _find_by_name_endswith(ops, suffix):
+    short = suffix.lstrip("_")
     for op in ops:
-        if op.name.endswith(suffix):
+        if op.name.endswith(suffix) or op.name == short:
             return op
     raise AssertionError(f"no op ends with {suffix!r} in {[o.name for o in ops]}")
 
@@ -84,7 +85,7 @@ def test_v32_uses_sparse_mla_path_not_dense_mla():
     ops = _attn_ops(m, deploy, ctx_len=8192)
     attn = next(o for o in ops if o.op_kind == "attention" and "sparse" in (o.tags or ()))
     assert attn is not None
-    assert attn.name.endswith("_mla_sparse_attention")
+    assert attn.name == "mla_sparse_attention"
     # 没有 dense MLA op (tag mla 但不含 sparse)
     dense_mla = [o for o in ops if o.op_kind == "attention"
                  and "mla" in (o.tags or ())
@@ -128,7 +129,7 @@ def test_indexer_wq_b_handcheck():
     op = _find_by_subtype(ops, "indexer_wq_b")
     tokens = 1
     expected = 2 * tokens * m.q_lora_rank * (m.index_n_heads * m.index_head_dim)
-    assert op.formula().flops == expected
+    assert op.roofline_spec().flops == expected
 
 
 def test_indexer_wk_weights_proj_handcheck():
@@ -138,7 +139,7 @@ def test_indexer_wk_weights_proj_handcheck():
     op = _find_by_subtype(ops, "indexer_wk_weights_proj")
     tokens = 1
     fused_oc = m.index_head_dim + m.index_n_heads
-    f = op.formula()
+    f = op.roofline_spec()
     assert f.flops == 2 * tokens * m.hidden_dim * fused_oc
     assert f.op_precision == "bf16"
     assert f.load_weight == m.hidden_dim * fused_oc * 2   # bf16 weight
@@ -154,7 +155,7 @@ def test_sparse_attended_len_capped_at_index_topk():
     ops_long = _attn_ops(m, deploy, ctx_len=8192)
     attn_short = _find_by_name_endswith(ops_short, "_mla_sparse_attention")
     attn_long = _find_by_name_endswith(ops_long, "_mla_sparse_attention")
-    ratio = attn_long.formula().flops / attn_short.formula().flops
+    ratio = attn_long.roofline_spec().flops / attn_short.roofline_spec().flops
     assert 1.8 < ratio < 2.2, f"ratio for 8192/1024 should be ~2 (capped at topk), got {ratio:.2f}"
 
 
@@ -168,7 +169,7 @@ def test_v32_vs_v3_dense_ratio_at_long_ctx():
     ops_dense = _attn_ops(m_dense, deploy, ctx_len=16384)
     attn_sparse = _find_by_name_endswith(ops_sparse, "_mla_sparse_attention")
     attn_dense = _find_by_name_endswith(ops_dense, "_mla_attention")
-    assert attn_dense.formula().flops > attn_sparse.formula().flops * 5
+    assert attn_dense.roofline_spec().flops > attn_sparse.roofline_spec().flops * 5
 
 
 # ---- sparse_attn_indexer KV cache IO scales with ctx ----
@@ -180,5 +181,5 @@ def test_sparse_attn_indexer_kv_cache_io_scales_with_ctx():
     ops_8k = _attn_ops(m, deploy, ctx_len=8192)
     op_1k = _find_by_subtype(ops_1k, "sparse_index")
     op_8k = _find_by_subtype(ops_8k, "sparse_index")
-    ratio = op_8k.formula().load_kv_cache / op_1k.formula().load_kv_cache
+    ratio = op_8k.roofline_spec().load_kv_cache / op_1k.roofline_spec().load_kv_cache
     assert 7.5 < ratio < 8.5, f"ratio={ratio:.2f}"

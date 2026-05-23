@@ -89,18 +89,15 @@ def estimate_param_bytes(
 
     Args:
       w_byte: 量化层 dtype (attention QKVO / dense FFN / shared expert).
-      expert_w_byte: routed expert 专用 dtype. None 时按 model.expert_fp4 推断:
-                     expert_fp4=True → 0.5 (fp4), 否则 fallback 到 w_byte.
+      expert_w_byte: routed expert 专用 dtype. None 时 fallback 到 w_byte.
+                     未来支持 expert FP4 量化时由 caller 显式传 0.5.
       base_w_byte: 非量化层 dtype (embed / lm_head / final_norm / per-layer norm).
                    None 时 fallback 到 w_byte (向后兼容旧 caller).
                    fp8 / fp4 量化模型实际 lm_head / embed 仍是 bf16, 因此 base_w_byte
                    应是 model_config.dtype 对应字节数 (一般 2.0), 不跟 w_byte 走.
-
-    V4 production 真实: attention/wo/shared = fp8 (1.0), routed expert = fp4 (0.5),
-    lm_head/embed/norm = bf16 (2.0).
     """
     if expert_w_byte is None:
-        expert_w_byte = 0.5 if model.expert_fp4 else w_byte
+        expert_w_byte = w_byte
     if base_w_byte is None:
         base_w_byte = w_byte
     h = model.hidden_dim
@@ -147,13 +144,13 @@ def per_rank_param_bytes(
 
     dtype 切分:
       - 量化层 (attention / dense / shared expert): w_byte
-      - routed expert: expert_w_byte (默认按 model.expert_fp4)
+      - routed expert: expert_w_byte (默认 fallback 到 w_byte)
       - 非量化层 (embed / lm_head / final_norm / per-layer norm): base_w_byte (None → w_byte)
 
     EP=1 时退化到纯 TP 切分.
     """
     if expert_w_byte is None:
-        expert_w_byte = 0.5 if model.expert_fp4 else w_byte
+        expert_w_byte = w_byte
     if base_w_byte is None:
         base_w_byte = w_byte
     h = model.hidden_dim

@@ -449,7 +449,7 @@ KNOWN_PROFILES: dict[str, dict] = {
         has_fp4_tc=False,
         mem_bandwidth=1008e9,             # GDDR6X 21 Gbps × 384-bit ≈ 1008 GB/s
         mem_capacity_gb=24,
-        onchip_buffer=72 * 1024 * 1024,   # L2 cache 72 MB
+        onchip_buffer=32768e3,            # 128 SM × 256 KB register file (AD102)
         # PCIe 4.0 ×16: 32 GB/s 单向 / 64 GB/s 双向 nominal. 实测 AllReduce
         # effective β = nominal/2 × protocol_eff / n_per_root.
         # Phase 5: 拓扑感知, 跨 NUMA 部署自动有更高 effective β.

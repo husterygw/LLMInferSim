@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
-from llm_infer_sim.core.cost.trace import CostTraceEntry
+from llm_infer_sim.core.cost.trace import CostTraceEntry, format_display_name
 from llm_infer_sim.core.operator_db.store import OperatorStore
 from llm_infer_sim.core.operator_schema import operator_to_signature
 
@@ -52,6 +52,8 @@ class OperatorDBBackend:
             latency_s=latency_s,
             source="operator_db",
             match_type="exact",
+            layer_idx=getattr(op, "layer_idx", None),
+            display_name=format_display_name(op.name, getattr(op, "layer_idx", None)),
             roofline_s=roofline_s,
             roofline_gap=roofline_gap,
             metadata={

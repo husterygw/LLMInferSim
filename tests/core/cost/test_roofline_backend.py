@@ -1,7 +1,7 @@
 """V3 §7.3 RooflineBackend + Step 1.6 CostRouter 单测.
 
 锁住:
-  - Operator.formula -> OperatorFormula 转换正确
+  - Operator.formula -> RooflineSpec 转换正确
   - estimate() 返 CostTraceEntry, source=roofline, match_type=fallback
   - 大 GEMM (compute-bound) / 小 GEMM (memory-bound) bottleneck 区分
   - CostRouter aggregate StepOpPlan -> StepCostTrace
@@ -15,8 +15,8 @@ from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.router import CostRouter
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
 from llm_infer_sim.core.graph.step_plan import StepOpPlan
-from llm_infer_sim.core.operators.ops import CollectiveOp, GemmOp
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.operators import Collective, GEMM
+from llm_infer_sim.core.operators.base import RooflineSpec
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 
@@ -41,14 +41,20 @@ def backend_eager(hw, deploy_eager):
     return RooflineBackend(hw, deploy_eager)
 
 
-def _gemm_op(m: int, n: int, k: int, name: str = "qkv_proj") -> GemmOp:
-    """构 GEMM op: gemm_formula() 算出 flops=2*m*n*k + 2-byte loads (bf16)."""
-    return GemmOp(
+def _gemm_op(m: int, n: int, k: int, name: str = "qkv_proj") -> GEMM:
+    """构 GEMM op: GEMM.roofline_spec() 算出 flops=2*m*n*k + 2-byte loads (bf16)."""
+    from llm_infer_sim.core.operators.context import build_operator_context
+    from llm_infer_sim.core.profiles.model_config import ModelConfig
+    ctx = build_operator_context(
+        ModelConfig(),
+        DeployConfig(backend="vllm", backend_version="0.20.1"),
+        get_hardware_profile("RTX_4090"),
+    )
+    return GEMM(
         name=name, op_subtype=name,
-        phase="prefill", layer_idx=0, dtype="bf16",
-        m=m, n=n, k=k, tp=1,
-        framework="vllm", framework_version="0.20.1",
-        execution_mode="eager", kernel_source="vllm_default",
+        phase="prefill", layer_idx=0,
+        m=m, n=n, k=k,
+        ctx=ctx,
     )
 
 
@@ -57,6 +63,8 @@ def test_estimate_returns_cost_trace_entry(backend_eager):
     entry = backend_eager.estimate(op)
     assert isinstance(entry, CostTraceEntry)
     assert entry.op_name == "qkv_proj"
+    assert entry.display_name == "layer0.qkv_proj"
+    assert entry.layer_idx == 0
     assert entry.op_kind == "gemm"
     assert entry.source == "roofline"
     assert entry.match_type == "fallback"
@@ -128,14 +136,20 @@ def test_router_aggregates_step_plan(backend_eager):
 
 def test_router_skips_collective_in_stage_1(backend_eager):
     """阶段 5 才接 communication backend, 阶段 1 collective op 直接跳过不入 trace."""
+    from llm_infer_sim.core.operators.context import build_operator_context
+    from llm_infer_sim.core.profiles.model_config import ModelConfig
     gemm = _gemm_op(m=128, n=6144, k=2560)
-    coll = CollectiveOp(
-        name="attn_allreduce", op_kind="collective", op_subtype="allreduce",
-        phase="prefill", layer_idx=0, dtype="bf16",
-        shape_fields={"message_bytes": 128 * 2560 * 2},
-        parallel_fields={"world_size": 2, "tp": 2},
-        runtime_fields={"backend": "nccl"},
-        formula_value=OperatorFormula(
+    coll_ctx = build_operator_context(
+        ModelConfig(),
+        DeployConfig(tp_size=2, backend="vllm", backend_version="0.20.1"),
+        get_hardware_profile("RTX_4090"),
+    )
+    coll = Collective(
+        name="attn_allreduce", op_subtype="allreduce",
+        phase="prefill", layer_idx=0,
+        message_bytes=128 * 2560 * 2, world_size=2,
+        ctx=coll_ctx, comm_backend="nccl",
+        roofline_spec_value=RooflineSpec(
             comm_bytes=128 * 2560 * 2,
             comm_type="allreduce",
             op_category="communication",
@@ -159,6 +173,9 @@ def test_to_report_dict_round_trip(backend_eager):
     assert len(d["entries"]) == 1
     assert d["entries"][0]["source"] == "roofline"
     assert d["entries"][0]["match_type"] == "fallback"
+    assert d["entries"][0]["op_name"] == "qkv_proj"
+    assert d["entries"][0]["display_name"] == "layer0.qkv_proj"
+    assert d["entries"][0]["layer_idx"] == 0
 
 
 def test_formula_translation_preserves_mem_breakdown(backend_eager):

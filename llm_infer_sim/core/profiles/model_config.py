@@ -1,10 +1,15 @@
 """ModelConfig — 模型架构参数 dataclass (框架无关, V3 §4.1).
 
 profiles/ 放配置 dataclass; layer 顺序 / 公式由 core/models/ 模板生成.
+
+V4 字段 (window_size / o_groups / compress_ratio_* / hc_* / num_hash_layers /
+expert_fp4 / no_compress_last_n / first_compress_b_layer / compress_ratios /
+o_lora_rank / get_compress_ratio()) 已在 #157 删除. V3 / V3.2 共用字段
+(q_lora_rank / index_topk / index_n_heads / index_head_dim) 保留.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -35,56 +40,15 @@ class ModelConfig:
     kv_lora_rank: int = 0       # MLA: compressed KV dim (c_kv); 0 = standard MHA
     v_head_dim: int = 0         # MLA: per-head V dim (may differ from head_dim)
     qk_nope_head_dim: int = 0   # MLA: qk head dim without rope (e.g. 128 in DSV3)
+    rope_head_dim: int = 0      # qk_rope_head_dim (64 in V3/V3.2)
 
-    # V4 low-rank projections
-    q_lora_rank: int = 0        # Q low-rank bottleneck (1536 in V4); 0 = direct projection
-    o_lora_rank: int = 0        # O low-rank bottleneck (1024 in V4)
-    o_groups: int = 0           # Grouped O projection (16 in V4); 0 = single o_proj
+    # Q low-rank projection (V3 / V3.2 用; V4 用过的 o_lora_rank 已删)
+    q_lora_rank: int = 0        # Q low-rank bottleneck (1536 in V3); 0 = direct projection
 
-    # V4 sparse attention
-    window_size: int = 0        # Sliding window size (128 in V4); 0 = dense attention
-    compress_ratio_a: int = 0   # High compression ratio (128 in V4, for odd-index layers)
-    compress_ratio_b: int = 0   # Low compression ratio (4 in V4, for even-index layers)
-    first_compress_b_layer: int = 0  # First layer using ratio_b (2 in V4)
-    index_topk: int = 0         # Top-k selection for ratio_b layers (1024 in V4)
-    index_n_heads: int = 0      # Indexer attention heads (64 in V4)
-    index_head_dim: int = 0     # Indexer head dim (128 in V4)
-    no_compress_last_n: int = 0 # Last N layers with ratio=0 (1 in V4)
-    rope_head_dim: int = 0      # qk_rope_head_dim (64 in V4); rope-vs-nope split
-                                # for KV mixed-precision storage
-    # Per-layer compression ratios (preferred over inferred a/b pattern; V4-Flash
-    # has leading 0 layers that the a/b inference can't represent).
-    compress_ratios: list = field(default_factory=list)
-
-    # V4 Hyper-Connections
-    hc_mult: int = 0            # HC parallel copies (4 in V4); 0 = simple residual
-    hc_sinkhorn_iters: int = 0  # Sinkhorn iterations (20 in V4)
-
-    # V4 expert quantization
-    expert_fp4: bool = False    # Experts use FP4 weights (0.5 byte/param)
-
-    # V4 hash MoE routing: 前 num_hash_layers 层用 tid2eid lookup, 无 router GEMM (FLOPs≈0)
-    num_hash_layers: int = 0
-
-    def get_compress_ratio(self, layer_idx: int) -> int:
-        """Return compression ratio for a given layer index.
-
-        Prefers the explicit per-layer `compress_ratios` list (matches official
-        config.json verbatim). Falls back to the (a, b, first_b) pattern only
-        when the list is unavailable.
-        """
-        if self.window_size == 0:
-            return 0
-        if self.compress_ratios and layer_idx < len(self.compress_ratios):
-            return int(self.compress_ratios[layer_idx])
-        # Fallback: a/b alternation pattern (works for V4-Pro but NOT V4-Flash,
-        # which has leading-zero SW-only layers).
-        if layer_idx >= self.num_layers - self.no_compress_last_n:
-            return 0
-        if layer_idx < self.first_compress_b_layer:
-            return self.compress_ratio_a
-        offset = layer_idx - self.first_compress_b_layer
-        return self.compress_ratio_b if offset % 2 == 0 else self.compress_ratio_a
+    # V3.2 lightning indexer
+    index_topk: int = 0         # Top-k context positions (2048 in V3.2); 0 = no indexer
+    index_n_heads: int = 0      # Indexer attention heads (64 in V3.2)
+    index_head_dim: int = 0     # Indexer head dim (128 in V3.2)
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         if not self.is_moe:

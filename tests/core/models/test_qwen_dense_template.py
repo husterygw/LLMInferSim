@@ -12,15 +12,8 @@ import pytest
 
 from llm_infer_sim.core.graph.step_shape import StepShape
 from llm_infer_sim.core.models.qwen import QwenModelGraphTemplate
-from llm_infer_sim.core.operators.factories import (
-    AttentionOpFactory,
-    DenseOpFactory,
-    EmbeddingOpFactory,
-    FactoryBundle,
-    NormalizationOpFactory,
-)
-from llm_infer_sim.core.operators.ops import GemmOp
-from llm_infer_sim.core.operators.specs import Operator
+from llm_infer_sim.core.operators import GEMM
+from llm_infer_sim.core.operators.base import Operator
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 from llm_infer_sim.core.profiles.model_config import ModelConfig
@@ -39,14 +32,10 @@ def _qwen3_4b() -> ModelConfig:
     )
 
 
-def _make_factories(model: ModelConfig, deploy: DeployConfig) -> FactoryBundle:
+def _make_ctx(model: ModelConfig, deploy: DeployConfig):
+    from llm_infer_sim.core.operators.context import build_operator_context
     hw = get_hardware_profile("RTX_4090")
-    return FactoryBundle(
-        dense=DenseOpFactory(model, deploy),
-        norm=NormalizationOpFactory(model, deploy),
-        embedding=EmbeddingOpFactory(model, deploy),
-        attention=AttentionOpFactory(model, deploy, hw),
-    )
+    return build_operator_context(model, deploy, hw)
 
 
 def _prefill_step(isl: int = 128) -> StepShape:
@@ -91,9 +80,9 @@ def test_prefill_op_count():
     """1 embedding + num_layers × 11 per-layer + 1 lm_head."""
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
+    ctx = _make_ctx(model, deploy)
     step = _prefill_step()
-    plan = QwenModelGraphTemplate(model).build_step(step, factories)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(step)
     expected = 1 + model.num_layers * 11 + 1
     assert len(plan.ops) == expected
 
@@ -101,27 +90,31 @@ def test_prefill_op_count():
 def test_decode_op_count():
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
+    ctx = _make_ctx(model, deploy)
     step = _decode_step()
-    plan = QwenModelGraphTemplate(model).build_step(step, factories)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(step)
     expected = 1 + model.num_layers * 11 + 1
     assert len(plan.ops) == expected
 
 
 def test_per_layer_order_first_layer():
-    """每层 11 个 op 顺序应该是: attn_norm/qkv/rope/attn/o/attn_add/mlp_norm/gu/act/down/mlp_add."""
+    """每层 11 个 op 顺序应该是: attn_norm/qkv/rope/attn/o/attn_add/mlp_norm/gu/act/down/mlp_add.
+
+    Grouped trace: per-layer ops 从 groups 中 filter layer_idx ∈ g.layer_indices 的代表 op,
+    顺序就是 build_grouped_step 的 group 顺序.
+    """
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
-    plan = QwenModelGraphTemplate(model).build_step(_prefill_step(), factories)
-    # ops[0] = embedding, ops[1..12] = layer 0, ops[12..] = layer 1, ...
-    layer0 = plan.ops[1:12]
+    ctx = _make_ctx(model, deploy)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_prefill_step())
+    layer0 = [g.op for g in plan.groups if 0 in g.layer_indices]
     expected_subtypes = [
         "attn_norm", "qkv_proj", "rope", "prefill",
         "o_proj", "attn_add", "mlp_norm", "gate_up_proj",
         "mlp_act", "down_proj", "mlp_add",
     ]
     assert [op.op_subtype for op in layer0] == expected_subtypes
+    # 代表 op 的 layer_idx 是 0 (build_grouped_step 用 rep=layer_indices[0])
     for op in layer0:
         assert op.layer_idx == 0
 
@@ -129,8 +122,8 @@ def test_per_layer_order_first_layer():
 def test_embedding_and_lm_head_are_at_boundaries():
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
-    plan = QwenModelGraphTemplate(model).build_step(_prefill_step(), factories)
+    ctx = _make_ctx(model, deploy)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_prefill_step())
     assert plan.ops[0].op_kind == "embedding"
     assert plan.ops[0].op_subtype == "embedding"
     assert plan.ops[-1].op_kind == "gemm"
@@ -141,12 +134,12 @@ def test_qkv_proj_shape_matches_gqa():
     """Qwen3-4B: num_heads=32, num_kv_heads=8, head_dim=128 → QKV n = (32 + 16) × 128 = 6144."""
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
-    plan = QwenModelGraphTemplate(model).build_step(_prefill_step(isl=128), factories)
+    ctx = _make_ctx(model, deploy)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_prefill_step(isl=128))
     qkv_ops = [op for op in plan.ops if op.op_subtype == "qkv_proj"]
     assert qkv_ops, "no qkv_proj op generated"
     op = qkv_ops[0]
-    assert isinstance(op, GemmOp)
+    assert isinstance(op, GEMM)
     assert op.shape["m"] == 128
     assert op.shape["k"] == model.hidden_dim
     # Q dim = 32 × 128 = 4096, K = V = 8 × 128 = 1024; total n = 4096 + 2*1024 = 6144
@@ -159,8 +152,8 @@ def test_attention_op_carries_full_shape():
     """V3 §5.3: attention shape 必带 num_tokens/num_seqs/q_len/kv_len/heads/head_dim."""
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
-    plan = QwenModelGraphTemplate(model).build_step(_prefill_step(isl=2048), factories)
+    ctx = _make_ctx(model, deploy)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_prefill_step(isl=2048))
     attn_ops = [op for op in plan.ops if op.op_kind == "attention"]
     assert len(attn_ops) == model.num_layers
     op = attn_ops[0]
@@ -177,8 +170,8 @@ def test_attention_op_carries_full_shape():
 def test_decode_attention_subtype_and_kv_len():
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
-    plan = QwenModelGraphTemplate(model).build_step(_decode_step(n=8, ctx=1024), factories)
+    ctx = _make_ctx(model, deploy)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_decode_step(n=8, ctx=1024))
     attn = [op for op in plan.ops if op.op_kind == "attention"][0]
     assert attn.op_subtype == "decode"
     assert attn.shape["q_len"] == 1
@@ -190,13 +183,13 @@ def test_lm_head_tokens_equals_num_requests():
     """prefill: 每 req 1 个采样 token; decode: 同."""
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
+    ctx = _make_ctx(model, deploy)
     # prefill bs=1
-    plan_p = QwenModelGraphTemplate(model).build_step(_prefill_step(isl=2048), factories)
+    plan_p = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_prefill_step(isl=2048))
     head_p = [op for op in plan_p.ops if op.op_subtype == "lm_head"][0]
     assert head_p.shape["m"] == 1
     # decode bs=8
-    plan_d = QwenModelGraphTemplate(model).build_step(_decode_step(n=8), factories)
+    plan_d = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_decode_step(n=8))
     head_d = [op for op in plan_d.ops if op.op_subtype == "lm_head"][0]
     assert head_d.shape["m"] == 8
 
@@ -206,13 +199,13 @@ def test_tp_affects_qkv_shape():
     model = _qwen3_4b()
     step = _prefill_step(isl=128)
 
-    plan_tp1 = QwenModelGraphTemplate(model).build_step(
-        step, _make_factories(model, DeployConfig(tp_size=1)),
-    )
+    plan_tp1 = QwenModelGraphTemplate(
+        model, ctx=_make_ctx(model, DeployConfig(tp_size=1)),
+    ).build_grouped_step(step)
     # deploy 改 tp=2 后 step.execution_mode 不变, step_shape 可复用
-    plan_tp2 = QwenModelGraphTemplate(model).build_step(
-        step, _make_factories(model, DeployConfig(tp_size=2)),
-    )
+    plan_tp2 = QwenModelGraphTemplate(
+        model, ctx=_make_ctx(model, DeployConfig(tp_size=2)),
+    ).build_grouped_step(step)
 
     qkv1 = [op for op in plan_tp1.ops if op.op_subtype == "qkv_proj"][0]
     qkv2 = [op for op in plan_tp2.ops if op.op_subtype == "qkv_proj"][0]
@@ -226,21 +219,21 @@ def test_all_ops_have_required_metadata():
     """所有 runtime op 必含 op_kind/op_subtype/shape/parallel/runtime/formula."""
     model = _qwen3_4b()
     deploy = DeployConfig()
-    factories = _make_factories(model, deploy)
-    plan = QwenModelGraphTemplate(model).build_step(_prefill_step(), factories)
+    ctx = _make_ctx(model, deploy)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(_prefill_step())
     for op in plan.ops:
         assert isinstance(op, Operator)
         assert op.op_kind and op.op_subtype
         assert op.shape, f"{op.name} no shape"
         assert op.parallel, f"{op.name} no parallel"
         assert op.runtime, f"{op.name} no runtime"
-        assert op.formula, f"{op.name} no formula"
+        assert op.roofline_spec, f"{op.name} no roofline_spec"
 
 
 def test_plan_metadata_carries_model_info():
     model = _qwen3_4b()
     deploy = DeployConfig(execution_mode="cudagraph")
-    factories = _make_factories(model, deploy)
+    ctx = _make_ctx(model, deploy)
     step = StepShape.from_workload(
         GlobalStepWorkload(
             step_id=42, phase=StepPhase.PREFILL,
@@ -253,7 +246,7 @@ def test_plan_metadata_carries_model_info():
         ),
         deploy,
     )
-    plan = QwenModelGraphTemplate(model).build_step(step, factories)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(step)
     assert plan.step_id == 42
     assert plan.phase == "prefill"
     assert plan.metadata["model"] == "Qwen3-4B"

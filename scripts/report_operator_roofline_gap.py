@@ -18,7 +18,7 @@ from typing import Any
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.operator_db.importers.collector_v2 import import_record
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
-from llm_infer_sim.core.operators.ops import GemmOp
+from llm_infer_sim.core.operators import GEMM
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import HardwareConfig, get_hardware_profile
 
@@ -64,13 +64,13 @@ def load_records(path: Path | str, hardware: str) -> list[OperatorRecord]:
     return records
 
 
-def record_to_operator(record: OperatorRecord) -> GemmOp:
+def record_to_operator(record: OperatorRecord, *, hw) -> GEMM:
     if record.signature.op_kind != "gemm":
         raise ValueError(
             f"only GEMM formula is supported in stage-3 report, got "
             f"{record.signature.op_kind!r}"
         )
-    return GemmOp.from_record(record)
+    return GEMM.from_record(record, hw=hw)
 
 
 def estimate_gap(
@@ -80,7 +80,7 @@ def estimate_gap(
     shape = dict(record.signature.shape)
     parallel = dict(record.signature.parallel)
     row = {
-        "status": "unsupported_formula",
+        "status": "unsupported_roofline",
         "op_kind": record.signature.op_kind,
         "op_subtype": record.signature.op_subtype,
         "execution_mode": record.execution_mode,
@@ -108,7 +108,7 @@ def estimate_gap(
     if roofline_backend is None:
         raise ValueError("GEMM record requires a RooflineBackend")
 
-    op = record_to_operator(record)
+    op = record_to_operator(record, hw=roofline_backend.hw)
     entry = roofline_backend.estimate(op)
     roofline_us = entry.latency_s * 1e6
     row.update({
@@ -161,7 +161,7 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
         by_kind = defaultdict(int)
         for row in unsupported:
             by_kind[row["op_kind"]] += 1
-        print("unsupported_formula:", ", ".join(
+        print("unsupported_roofline:", ", ".join(
             f"{kind}={count}" for kind, count in sorted(by_kind.items())
         ))
     if not ok_rows:

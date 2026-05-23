@@ -5,18 +5,20 @@
     roofline_only      -> 不查 DB, 全走 roofline (阶段 1 行为)
     require_operator_db-> 必须 hit, miss → 抛 LookupError
 
-阶段 5 引入 CommunicationFormulaBackend, 阶段 6 引入 ModuleProfileBackend,
+阶段 5 引入 CommunicationRooflineBackend, 阶段 6 引入 ModuleProfileBackend,
 按 V3 §7.1 完整优先级排列.
 
 collective op 阶段 1-3 内默认跳过, 直到阶段 5 接通信 backend.
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 from llm_infer_sim.core.cost.backends.operator_db import OperatorDBBackend
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
+from llm_infer_sim.core.graph.grouped_plan import GroupedStepPlan
 from llm_infer_sim.core.graph.step_plan import StepOpPlan
 
 
@@ -52,7 +54,7 @@ class CostRouter:
         entries: list[CostTraceEntry] = []
         for op in plan.ops:
             if op.op_kind == "collective":
-                continue   # 阶段 5 接 CommunicationFormulaBackend
+                continue   # 阶段 5 接 CommunicationRooflineBackend
             entry = self._estimate_op(op)
             entries.append(entry)
 
@@ -61,6 +63,60 @@ class CostRouter:
         memory = sum(float(e.metadata.get("t_memory", 0.0)) for e in entries)
         bottleneck = "compute" if compute >= memory else "memory"
 
+        return StepCostTrace(
+            step_id=plan.step_id,
+            phase=plan.phase,
+            total_latency_s=total,
+            compute_time_s=compute,
+            memory_time_s=memory,
+            comm_time_s=0.0,
+            runtime_time_s=0.0,
+            entries=tuple(entries),
+            bottleneck=bottleneck,
+        )
+
+    def estimate_grouped(self, plan: GroupedStepPlan) -> StepCostTrace:
+        """Grouped trace mode: 同 pattern layer op 只算一次, latency × count.
+
+        数学等价 full path (sum of per-layer roofline = group_latency × count),
+        但 op 调用次数从 ~398/step 降到 ~13/step.
+        """
+        entries: list[CostTraceEntry] = []
+        total = 0.0
+        compute = 0.0
+        memory = 0.0
+        for group in plan.groups:
+            op = group.op
+            if op.op_kind == "collective":
+                continue
+            base_entry = self._estimate_op(op)
+            count = group.count
+            scaled_latency = base_entry.latency_s * count
+            scaled_compute = float(base_entry.metadata.get("t_compute", 0.0)) * count
+            scaled_memory = float(base_entry.metadata.get("t_memory", 0.0)) * count
+            new_md = dict(base_entry.metadata)
+            new_md["count"] = count
+            new_md["layer_indices"] = list(group.layer_indices)
+            display = (
+                f"{base_entry.op_name}[count={count}]"
+                if count > 1 else base_entry.op_name
+            )
+            roofline_scaled = (
+                base_entry.roofline_s * count
+                if base_entry.roofline_s is not None else None
+            )
+            entries.append(dataclasses.replace(
+                base_entry,
+                latency_s=scaled_latency,
+                layer_idx=None,
+                display_name=display,
+                roofline_s=roofline_scaled,
+                metadata=new_md,
+            ))
+            total += scaled_latency
+            compute += scaled_compute
+            memory += scaled_memory
+        bottleneck = "compute" if compute >= memory else "memory"
         return StepCostTrace(
             step_id=plan.step_id,
             phase=plan.phase,

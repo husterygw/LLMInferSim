@@ -1,7 +1,7 @@
 """GEMM canonicalizer 单测 — Step 2.2.
 
 锁住:
-  - collector Case.params + runtime GemmOp 生成相同 signature
+  - collector Case.params + runtime GEMM 生成相同 signature
   - eager vs cudagraph signature 不同
   - framework_version 进 key (不同版本不互相命中)
 """
@@ -15,8 +15,12 @@ from llm_infer_sim.core.operator_schema.gemm import (
     gemm_case_params_to_signature,
     gemm_virtual_op_to_signature,
 )
-from llm_infer_sim.core.operators.ops import FormulaOp, GemmOp
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.operators.context import build_operator_context
+from llm_infer_sim.core.operators import RooflineOperator, GEMM
+from llm_infer_sim.core.operators.base import RooflineSpec
+from llm_infer_sim.core.profiles.deploy import DeployConfig
+from llm_infer_sim.core.profiles.hardware import get_hardware_profile
+from llm_infer_sim.core.profiles.model_config import ModelConfig
 
 
 _COLLECTOR_CTX = dict(
@@ -36,17 +40,27 @@ def _gemm_case(m=128, n=6144, k=2560, dtype="bf16", tp=1, mode="eager",
     }
 
 
+def _ctx(tp=1, mode="eager", framework_version="0.20.1"):
+    return build_operator_context(
+        ModelConfig(),
+        DeployConfig(
+            tp_size=tp, execution_mode=mode,
+            backend="vllm", backend_version=framework_version,
+        ),
+        get_hardware_profile("RTX_4090"),
+    )
+
+
 def _gemm_op(m=128, n=6144, k=2560, dtype="bf16", tp=1, mode="eager",
              subtype="qkv_proj", framework_version="0.20.1",
-             kernel_source="vllm_default") -> GemmOp:
-    return GemmOp(
-        name=f"layer0_{subtype}",
+             kernel_source="vllm_default") -> GEMM:
+    return GEMM(
+        name=subtype,
         op_subtype=subtype,
-        phase="prefill", layer_idx=0, dtype=dtype,
-        m=m, n=n, k=k, tp=tp,
-        framework="vllm",
-        framework_version=framework_version,
-        execution_mode=mode,
+        phase="prefill", layer_idx=0,
+        m=m, n=n, k=k,
+        ctx=_ctx(tp=tp, mode=mode, framework_version=framework_version),
+        dtype_override=dtype,
         kernel_source=kernel_source,
     )
 
@@ -125,13 +139,13 @@ def test_tp_in_parallel_key():
 
 
 def test_virtual_op_wrong_kind_raises():
-    """传一个 op_kind=attention 的 FormulaOp, 走 GEMM canonicalizer 应该拒."""
-    bogus = FormulaOp(
+    """传一个 op_kind=attention 的 RooflineOperator, 走 GEMM canonicalizer 应该拒."""
+    bogus = RooflineOperator(
         name="x", op_kind="attention", op_subtype="prefill",
         phase="prefill", layer_idx=0, dtype="bf16",
         shape_fields={"m": 1, "n": 1, "k": 1},
         parallel_fields={"tp": 1}, runtime_fields={},
-        formula_value=OperatorFormula(op_category="attention"),
+        roofline_spec_value=RooflineSpec(op_category="attention"),
     )
     with pytest.raises(ValueError, match="op_kind=gemm"):
         gemm_virtual_op_to_signature(bogus)

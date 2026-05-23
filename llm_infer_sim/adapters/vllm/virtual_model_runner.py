@@ -31,7 +31,7 @@ from llm_infer_sim.core.cost.trace import StepCostTrace
 from llm_infer_sim.core.metrics.breakdown import format_step_breakdown
 from llm_infer_sim.core.metrics.collector import MetricsCollector
 from llm_infer_sim.core.metrics.reporter import ReportGenerator
-from llm_infer_sim.core.cost.formulas.kv_transfer import kv_transfer_time
+from llm_infer_sim.core.cost.roofline.kv_transfer import kv_transfer_time
 from llm_infer_sim.core.simulation.kv_block_allocator import KVBlockAllocator
 from llm_infer_sim.core.simulation.output_generator import FakeTokenGenerator
 from llm_infer_sim.core.simulation.time_emulator import VirtualTimeEmulator
@@ -337,17 +337,18 @@ class VirtualModelRunner:
             block_size = getattr(cc, "block_size", 16) or 16
             if num_blocks <= 0:
                 return None
+            kv_byte = self.bundle.efficiency.kv_byte
             self._block_allocator = KVBlockAllocator(
                 model=self.bundle.model,
                 block_size=block_size,
                 num_blocks_total=num_blocks,
-                kv_byte=self.bundle.deploy.kv_byte,
+                kv_byte=kv_byte,
             )
             _log(
                 f"KVBlockAllocator init: block_size={block_size} "
                 f"num_blocks_total={num_blocks} "
                 f"block_bytes={self._block_allocator.block_bytes} "
-                f"(kv_byte={self.bundle.deploy.kv_byte})"
+                f"(kv_byte={kv_byte})"
             )
         return self._block_allocator.step(scheduler_output, num_cached_tokens)
 
@@ -357,12 +358,12 @@ class VirtualModelRunner:
         return self.cost_engine.estimate(workload)
 
     def _build_cost_engine(self):
-        """选 Qwen / DeepSeek template 装配 StepCostEngine."""
+        """选 Qwen / DeepSeek template 装配 StepCostEngine (#156: 单 grouped 路径)."""
         m = self.bundle.model
         deploy = self.bundle.deploy
         hw = self.bundle.hw
-        # DeepSeek family: 有 MLA (kv_lora_rank > 0) 或 V4 (window_size > 0)
-        if m.kv_lora_rank > 0 or m.window_size > 0:
+        # DeepSeek family: 有 MLA (kv_lora_rank > 0). V4 已在 #157 删除.
+        if m.kv_lora_rank > 0:
             return build_deepseek_roofline_engine(m, deploy, hw)
         return build_qwen_roofline_engine(m, deploy, hw)
 

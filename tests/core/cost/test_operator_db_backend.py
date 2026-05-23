@@ -8,23 +8,31 @@ from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
 from llm_infer_sim.core.operator_db.stores.memory import MemoryOperatorStore
 from llm_infer_sim.core.operator_schema import virtual_op_to_signature
-from llm_infer_sim.core.operators.ops import GemmOp, NormOp
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.operators import GEMM, Norm
+from llm_infer_sim.core.operators.base import RooflineSpec
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
 
 
-def _gemm_op(m=128, mode="eager", ks="vllm_default", fwv="0.20.1") -> GemmOp:
-    return GemmOp(
-        name="layer0_qkv_proj", op_subtype="qkv_proj",
-        phase="prefill", layer_idx=0, dtype="bf16",
-        m=m, n=6144, k=2560, tp=1,
-        framework="vllm", framework_version=fwv,
-        execution_mode=mode, kernel_source=ks,
+def _gemm_op(m=128, mode="eager", ks="vllm_default", fwv="0.20.1") -> GEMM:
+    from llm_infer_sim.core.operators.context import build_operator_context
+    from llm_infer_sim.core.profiles.deploy import DeployConfig
+    from llm_infer_sim.core.profiles.model_config import ModelConfig
+    ctx = build_operator_context(
+        ModelConfig(),
+        DeployConfig(execution_mode=mode, backend="vllm", backend_version=fwv),
+        get_hardware_profile("RTX_4090"),
+    )
+    return GEMM(
+        name="qkv_proj", op_subtype="qkv_proj",
+        phase="prefill", layer_idx=0,
+        m=m, n=6144, k=2560,
+        ctx=ctx,
+        kernel_source=ks,
     )
 
 
-def _record_for(op: GemmOp, latency_us: float = 100.0) -> OperatorRecord:
+def _record_for(op: GEMM, latency_us: float = 100.0) -> OperatorRecord:
     sig = virtual_op_to_signature(op)
     return OperatorRecord(
         signature=sig, hardware="RTX_4090",
@@ -69,13 +77,18 @@ def test_eager_record_does_not_hit_cudagraph_op():
 
 
 def test_unsupported_op_kind_returns_none():
+    from llm_infer_sim.core.operators.context import build_operator_context
+    from llm_infer_sim.core.profiles.deploy import DeployConfig
+    from llm_infer_sim.core.profiles.model_config import ModelConfig
     store = MemoryOperatorStore()
     backend = OperatorDBBackend(store)
-    norm_op = NormOp(
-        name="x", op_kind="norm", op_subtype="rmsnorm",
-        phase="prefill", layer_idx=0, dtype="bf16",
-        shape_fields={}, parallel_fields={}, runtime_fields={},
-        formula_value=OperatorFormula(op_category="norm"),
+    ctx = build_operator_context(
+        ModelConfig(), DeployConfig(), get_hardware_profile("RTX_4090"),
+    )
+    norm_op = Norm(
+        name="x", op_subtype="rmsnorm",
+        phase="prefill", layer_idx=0,
+        tokens=1, hidden=128, ctx=ctx,
     )
     assert backend.estimate(norm_op) is None
 

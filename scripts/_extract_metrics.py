@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Extract TTFT/TPOT/throughput metrics from a case_dir produced by run_bench_group.sh.
+"""Extract TTFT/TPOT/throughput metrics from a case_dir produced by bench_compare.sh.
 
-Reads `<case_dir>/<model_basename>/{real,sim}_<scenario>.txt` (vllm bench serve output),
+Reads `<case_dir>/{real,sim}_<scenario>.txt` (vllm bench serve output),
 emits a single JSON on stdout with structure:
 
     {
@@ -55,7 +55,7 @@ def gap_pct(real: float | None, sim: float | None) -> float | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case-id", required=True)
-    ap.add_argument("--group", required=True)
+    ap.add_argument("--group", required=True, help="suite name; kept as group for JSON compatibility")
     ap.add_argument("--case-dir", required=True, help="case output dir; will glob real_*/sim_* recursively")
     args = ap.parse_args()
 
@@ -64,7 +64,8 @@ def main() -> int:
         print(f"case_dir not found: {case_dir}", file=sys.stderr)
         return 1
 
-    # bench_compare.sh 落在 <case_dir>/<model_basename>/{real,sim}_<scenario>.txt
+    # New executor writes <case_dir>/{real,sim}_case.txt. The recursive glob also
+    # keeps compatibility with older <case_dir>/<model>/{real,sim}_*.txt layouts.
     real_files = sorted(case_dir.glob("**/real_*.txt"))
     sim_files = sorted(case_dir.glob("**/sim_*.txt"))
 
@@ -72,7 +73,7 @@ def main() -> int:
         print(f"no real_*.txt or sim_*.txt under {case_dir}", file=sys.stderr)
         return 2
 
-    # 一个 case 应该只有 1 个 scenario (run_bench_group 用 SCENARIO_OVERRIDE)
+    # 一个 case 应该只有 1 个 scenario.
     def scen_of(p: Path) -> str:
         # filename pattern: <mode>_<scenario>.txt
         stem = p.stem  # real_case 或 sim_case
@@ -106,7 +107,7 @@ def main() -> int:
             },
         })
 
-    # back-compat top-level real/sim (1st scenario, 让 run_bench_group 的 one-liner summary 能用)
+    # back-compat top-level real/sim (1st scenario).
     if result["scenarios"]:
         first = result["scenarios"][0]
         result["real"] = first["real"]

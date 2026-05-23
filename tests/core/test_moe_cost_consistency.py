@@ -1,6 +1,7 @@
 """MoE cost 公式数字一致性 (V3 §5.2 + IMPL_PLAN §4 routed_experts 语义).
 
-链路: QwenModelGraphTemplate._build_moe_layer + MoEOpFactory + CollectiveOpFactory.
+链路: QwenModelGraphTemplate._build_moe_layer 直接构造 GEMM (moe_gate) + FusedMoE
+(routed_experts) + Collective (ep/tp 通信 op).
 
 固化以下关键正确性:
   1. routed_experts.flops = tokens × top_k × 3 × 2 × h × expert_dim_per_device
@@ -15,7 +16,7 @@ import pytest
 
 from llm_infer_sim.core.cost.engine import build_qwen_roofline_engine
 from llm_infer_sim.core.graph.step_shape import StepShape
-from llm_infer_sim.core.operators.routing import (
+from llm_infer_sim.core.operators import (
     MoERoutingProfile,
     estimate_distinct_experts,
 )
@@ -29,7 +30,7 @@ from llm_infer_sim.core.workload.workload import (
 )
 
 
-# BF16 unquantized (跟 MoEOpFactory 默认对齐)
+# BF16 unquantized (跟 OperatorContext 默认对齐)
 W_BYTE = 2.0
 A_BYTE = 2.0
 
@@ -78,7 +79,7 @@ def _layer_ops(*, tokens: int, phase: str, tp: int = 2, ep: int = 1,
             num_decode_requests=tokens,
         )
     step = StepShape.from_workload(wl, deploy)
-    return engine.template._build_moe_layer(layer_idx, step, engine.factories)
+    return engine.template._build_moe_layer(layer_idx, step)
 
 
 def _find(ops, name):
@@ -105,10 +106,10 @@ def test_routed_experts_flops_uses_top_k_not_num_experts():
     expected_flops = (
         tokens * m.num_activated_experts * 3 * 2 * m.hidden_dim * expert_dim_per_device
     )
-    assert op.formula().flops == expected_flops
+    assert op.roofline_spec().flops == expected_flops
 
     wrong = tokens * m.num_experts * 3 * 2 * m.hidden_dim * expert_dim_per_device
-    assert op.formula().flops != wrong
+    assert op.roofline_spec().flops != wrong
 
 
 def test_routed_experts_weight_read_decode_single_token_equals_topk():
@@ -123,7 +124,7 @@ def test_routed_experts_weight_read_decode_single_token_equals_topk():
         m.num_activated_experts * 3 * m.hidden_dim * expert_dim_per_device * W_BYTE
     )
     expected_act = 2 * tokens * m.hidden_dim * A_BYTE
-    assert op.formula().mem_bytes == expected_weight + expected_act
+    assert op.roofline_spec().mem_bytes == expected_weight + expected_act
 
 
 def test_routed_experts_weight_read_scales_with_distinct():
@@ -141,7 +142,7 @@ def test_routed_experts_weight_read_scales_with_distinct():
             distinct * 3 * m.hidden_dim * expert_dim_per_device * W_BYTE
         )
         expected_act = 2 * tokens * m.hidden_dim * A_BYTE
-        assert op.formula().mem_bytes == expected_weight + expected_act, (
+        assert op.roofline_spec().mem_bytes == expected_weight + expected_act, (
             f"tokens={tokens}: distinct={distinct:.2f}"
         )
 
@@ -156,12 +157,12 @@ def test_routed_experts_no_intermediate_hbm_write():
     expert_dim_per_device = m.expert_dim // 2
     weight = m.num_activated_experts * 3 * m.hidden_dim * expert_dim_per_device * W_BYTE
     qo_act = 2 * tokens * m.hidden_dim * A_BYTE
-    assert op.formula().mem_bytes == int(weight + qo_act)
+    assert op.roofline_spec().mem_bytes == int(weight + qo_act)
 
     # 防御: 若误加 naive intermediate 项 mem_bytes 会变大
     m_e = max(1, tokens * m.num_activated_experts // m.num_experts)
     naive_intermediate = 2 * m_e * 2 * expert_dim_per_device * A_BYTE
-    assert op.formula().mem_bytes < weight + qo_act + naive_intermediate
+    assert op.roofline_spec().mem_bytes < weight + qo_act + naive_intermediate
 
 
 def test_moe_gate_flops():
@@ -170,7 +171,7 @@ def test_moe_gate_flops():
     tokens = 4
     ops = _layer_ops(tokens=tokens, phase="decode")
     op = _find(ops, "moe_gate")
-    assert op.formula().flops == 2 * tokens * m.hidden_dim * m.num_experts
+    assert op.roofline_spec().flops == 2 * tokens * m.hidden_dim * m.num_experts
 
 
 def test_routed_expert_allreduce_present_under_ep1_tp2():
@@ -179,7 +180,7 @@ def test_routed_expert_allreduce_present_under_ep1_tp2():
     tokens = 4
     ops = _layer_ops(tokens=tokens, phase="decode", tp=2, ep=1)
     op = _find(ops, "routed_expert_allreduce")
-    f = op.formula()
+    f = op.roofline_spec()
     assert f.op_category == "communication"
     assert f.comm_type == "allreduce"
     assert f.comm_bytes == tokens * m.hidden_dim * A_BYTE
@@ -214,4 +215,4 @@ def test_skew_one_pins_routed_experts_back_to_topk():
         m.num_activated_experts * 3 * m.hidden_dim * expert_dim_per_device * W_BYTE
     )
     expected_act = 2 * tokens * m.hidden_dim * A_BYTE
-    assert op.formula().mem_bytes == expected_weight + expected_act
+    assert op.roofline_spec().mem_bytes == expected_weight + expected_act

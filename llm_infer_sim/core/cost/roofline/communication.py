@@ -1,4 +1,4 @@
-"""Communication primitives: AllReduce, AllGather, ReduceScatter, AllToAll,
+"""Communication roofline helpers: AllReduce, AllGather, ReduceScatter, AllToAll,
 Broadcast, P2P (intra-node + cross-node).
 
 Phase 5 重构(详 docs/COMMUNICATION_MODELING.md):

@@ -1,11 +1,12 @@
 """mixed step (prefill+decode 同 step) attention 拆解.
 
-链路: AttentionOpFactory.mixed_attention() 实现 split_kernels (V3 §4.7.1b),
-返 2 个 AttentionOp (prefill 段 + decode 段).
+链路: QwenModelGraphTemplate._attention_ops 在 mixed/chunked_prefill phase 拆 2 个
+Attention op (prefill segment + decode segment), 各自走 flash_attention_*_formula
+helper 算公式.
 
 阶段 3d 范围 (split_kernels only):
-  - prefill 段公式 = AttentionOpFactory.attention(prefill substep)
-  - decode 段公式 = AttentionOpFactory.attention(decode substep)
+  - prefill 段公式 = flash_attention_prefill_formula
+  - decode 段公式 = flash_attention_decode_formula
   - 总成本 = sum (split_kernels) — CostRouter 不另算 sync overhead
 
 未实现:
@@ -78,7 +79,7 @@ def test_step_shape_accepts_mixed_phase():
 def test_mixed_attention_returns_two_ops_for_mixed_step():
     engine = _build_engine()
     step = _mixed_step()
-    ops = engine.factories.attention.mixed_attention(0, step)
+    ops = engine.template._attention_ops(0, step, engine.template.ctx)
     assert len(ops) == 2
     subtypes = sorted(op.op_subtype for op in ops)
     assert subtypes == ["mixed_decode", "mixed_prefill"]
@@ -86,7 +87,7 @@ def test_mixed_attention_returns_two_ops_for_mixed_step():
 
 def test_mixed_attention_tags_both_with_mixed():
     engine = _build_engine()
-    ops = engine.factories.attention.mixed_attention(0, _mixed_step())
+    ops = engine.template._attention_ops(0, _mixed_step(), engine.template.ctx)
     for op in ops:
         assert "mixed" in op.tags
 
@@ -95,7 +96,7 @@ def test_mixed_attention_prefill_segment_matches_standalone_prefill():
     """mixed.prefill 段公式 = pure prefill StepShape.attention 公式 (用同 isl)."""
     engine = _build_engine()
     step_mixed = _mixed_step(isl=200, n_decode=4)
-    ops_mixed = engine.factories.attention.mixed_attention(0, step_mixed)
+    ops_mixed = engine.template._attention_ops(0, step_mixed, engine.template.ctx)
     pf_op = next(op for op in ops_mixed if op.op_subtype == "mixed_prefill")
 
     # pure prefill ref
@@ -109,16 +110,16 @@ def test_mixed_attention_prefill_segment_matches_standalone_prefill():
         num_prefill_requests=1,
     )
     ref_step = StepShape.from_workload(pf_only_wl, engine.deploy)
-    ref_op = engine.factories.attention.attention(0, ref_step)
-    assert pf_op.formula().flops == ref_op.formula().flops
-    assert pf_op.formula().mem_bytes == ref_op.formula().mem_bytes
+    ref_op = engine.template._attention_ops(0, ref_step, engine.template.ctx)[0]
+    assert pf_op.roofline_spec().flops == ref_op.roofline_spec().flops
+    assert pf_op.roofline_spec().mem_bytes == ref_op.roofline_spec().mem_bytes
 
 
 def test_mixed_attention_decode_segment_matches_standalone_decode():
     """mixed.decode 段公式 = pure decode StepShape.attention 公式 (同 n_decode, ctx)."""
     engine = _build_engine()
     step_mixed = _mixed_step(isl=200, n_decode=4, ctx_decode=512)
-    ops_mixed = engine.factories.attention.mixed_attention(0, step_mixed)
+    ops_mixed = engine.template._attention_ops(0, step_mixed, engine.template.ctx)
     dc_op = next(op for op in ops_mixed if op.op_subtype == "mixed_decode")
 
     # pure decode ref
@@ -132,9 +133,9 @@ def test_mixed_attention_decode_segment_matches_standalone_decode():
         num_decode_requests=4,
     )
     ref_step = StepShape.from_workload(dc_only_wl, engine.deploy)
-    ref_op = engine.factories.attention.attention(0, ref_step)
-    assert dc_op.formula().flops == ref_op.formula().flops
-    assert dc_op.formula().load_kv_cache == ref_op.formula().load_kv_cache
+    ref_op = engine.template._attention_ops(0, ref_step, engine.template.ctx)[0]
+    assert dc_op.roofline_spec().flops == ref_op.roofline_spec().flops
+    assert dc_op.roofline_spec().load_kv_cache == ref_op.roofline_spec().load_kv_cache
 
 
 def test_mixed_attention_no_prefill_drops_prefill_op():
@@ -151,7 +152,7 @@ def test_mixed_attention_no_prefill_drops_prefill_op():
         num_prefill_requests=0, num_decode_requests=4,
     )
     step = StepShape.from_workload(wl, engine.deploy)
-    ops = engine.factories.attention.mixed_attention(0, step)
+    ops = engine.template._attention_ops(0, step, engine.template.ctx)
     assert len(ops) == 1
     assert ops[0].op_subtype == "mixed_decode"
 
@@ -170,13 +171,13 @@ def test_mixed_attention_no_decode_drops_decode_op():
         num_prefill_requests=1, num_decode_requests=0,
     )
     step = StepShape.from_workload(wl, engine.deploy)
-    ops = engine.factories.attention.mixed_attention(0, step)
+    ops = engine.template._attention_ops(0, step, engine.template.ctx)
     assert len(ops) == 1
     assert ops[0].op_subtype == "mixed_prefill"
 
 
-def test_mixed_attention_raises_for_non_mixed_phase():
-    """attention(step) for prefill/decode 走单 op path; mixed_attention 拒非 mixed/chunked."""
+def test_attention_ops_returns_single_for_pure_phase():
+    """template._attention_ops 在 prefill/decode 纯 phase 返 list 1 op (不再拒)."""
     engine = _build_engine()
     pf_only_wl = GlobalStepWorkload(
         step_id=0, phase=StepPhase.PREFILL,
@@ -188,8 +189,9 @@ def test_mixed_attention_raises_for_non_mixed_phase():
         num_prefill_requests=1,
     )
     step = StepShape.from_workload(pf_only_wl, engine.deploy)
-    with pytest.raises(ValueError, match="mixed_attention expects"):
-        engine.factories.attention.mixed_attention(0, step)
+    ops = engine.template._attention_ops(0, step, engine.template.ctx)
+    assert len(ops) == 1
+    assert ops[0].op_subtype == "prefill"
 
 
 def test_mixed_attention_accepts_chunked_prefill_phase():
@@ -209,6 +211,6 @@ def test_mixed_attention_accepts_chunked_prefill_phase():
     step = StepShape.from_workload(wl, engine.deploy)
     assert step.phase == "chunked_prefill"
     # decode 段没有,只返 prefill
-    ops = engine.factories.attention.mixed_attention(0, step)
+    ops = engine.template._attention_ops(0, step, engine.template.ctx)
     assert len(ops) == 1
     assert ops[0].op_subtype == "mixed_prefill"

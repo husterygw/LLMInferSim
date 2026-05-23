@@ -27,7 +27,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
-from llm_infer_sim.core.cost.formulas.communication import (
+from llm_infer_sim.core.cost.roofline.communication import (
     allreduce_time,
     allgather_time,
     reducescatter_time,

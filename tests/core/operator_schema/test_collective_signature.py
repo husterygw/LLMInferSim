@@ -12,8 +12,8 @@ from llm_infer_sim.core.operator_schema.collective import (
     collective_case_params_to_signature,
     collective_virtual_op_to_signature,
 )
-from llm_infer_sim.core.operators.ops import CollectiveOp
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.operators import Collective
+from llm_infer_sim.core.operators.base import RooflineSpec
 
 
 _CTX = dict(
@@ -35,19 +35,31 @@ def _coll_case(subtype="allreduce", num_gpus=2, bytes_=1024 * 1024,
     }
 
 
+def _coll_ctx(world_size=2, mode="eager"):
+    from llm_infer_sim.core.operators.context import build_operator_context
+    from llm_infer_sim.core.profiles.deploy import DeployConfig
+    from llm_infer_sim.core.profiles.hardware import get_hardware_profile
+    from llm_infer_sim.core.profiles.model_config import ModelConfig
+    return build_operator_context(
+        ModelConfig(),
+        DeployConfig(
+            tp_size=world_size, execution_mode=mode,
+            backend="vllm", backend_version="0.20.1",
+        ),
+        get_hardware_profile("RTX_4090"),
+    )
+
+
 def _coll_op(subtype="allreduce", world_size=2, bytes_=1024 * 1024,
               topology="single_node", mode="eager"):
-    return CollectiveOp(
-        name="attn_allreduce", op_kind="collective", op_subtype=subtype,
-        phase="prefill", layer_idx=0, dtype="bf16",
-        shape_fields={"message_bytes": bytes_},
-        parallel_fields={"world_size": world_size},
-        runtime_fields={
-            "framework": "vllm", "framework_version": "0.20.1",
-            "backend": "nccl", "topology": topology,
-            "execution_mode": mode, "kernel_source": "vllm_nccl_allreduce",
-        },
-        formula_value=OperatorFormula(
+    return Collective(
+        name="attn_allreduce", op_subtype=subtype,
+        phase="prefill", layer_idx=0,
+        message_bytes=bytes_, world_size=world_size,
+        ctx=_coll_ctx(world_size=world_size, mode=mode),
+        comm_backend="nccl", topology=topology,
+        kernel_source="vllm_nccl_allreduce",
+        roofline_spec_value=RooflineSpec(
             comm_bytes=bytes_, comm_type=subtype, op_category="communication",
         ),
     )

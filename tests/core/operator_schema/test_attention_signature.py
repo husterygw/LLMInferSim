@@ -7,8 +7,8 @@ from llm_infer_sim.core.operator_schema.attention import (
     attention_case_params_to_signature,
     attention_virtual_op_to_signature,
 )
-from llm_infer_sim.core.operators.ops import AttentionOp, FormulaOp
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.operators import Attention, RooflineOperator
+from llm_infer_sim.core.operators.base import RooflineSpec
 
 
 _RUNTIME_CTX = dict(
@@ -39,41 +39,46 @@ def _decode_case(n=8, ctx=2048, tp=1, mode="eager"):
     }
 
 
+def _attn_ctx(tp=1, mode="eager"):
+    from llm_infer_sim.core.operators.context import build_operator_context
+    from llm_infer_sim.core.profiles.deploy import DeployConfig
+    from llm_infer_sim.core.profiles.hardware import get_hardware_profile
+    from llm_infer_sim.core.profiles.model_config import ModelConfig
+    return build_operator_context(
+        ModelConfig(),
+        DeployConfig(
+            tp_size=tp, execution_mode=mode, block_size=16,
+            backend="vllm", backend_version="0.20.1",
+        ),
+        get_hardware_profile("RTX_4090"),
+    )
+
+
 def _prefill_op(isl=2048, bs=1, tp=1, mode="eager"):
-    return AttentionOp(
-        name="layer0_attention", op_kind="attention", op_subtype="prefill",
-        phase="prefill", layer_idx=0, dtype="bf16",
-        shape_fields={
-            "num_tokens": bs * isl, "num_seqs": bs,
-            "q_len": isl, "kv_len": isl,
-            "num_q_heads": 32, "num_kv_heads": 8, "head_dim": 128,
-        },
-        parallel_fields={"tp": tp},
-        runtime_fields={
-            "framework": "vllm", "framework_version": "0.20.1",
-            "execution_mode": mode, "kernel_source": "vllm_flash_attn",
-            "attention_backend": "flash_attn", "kv_dtype": "bf16", "block_size": 16,
-        },
-        formula_value=OperatorFormula(flops=1, op_category="attention"),
+    return Attention(
+        name="attention", op_subtype="prefill",
+        phase="prefill", layer_idx=0,
+        num_tokens=bs * isl, num_seqs=bs,
+        q_len=isl, kv_len=isl,
+        num_q_heads=32, num_kv_heads=8, head_dim=128,
+        attention_backend="flash_attn", kv_dtype="bf16", block_size=16,
+        kernel_source="vllm_flash_attn",
+        ctx=_attn_ctx(tp=tp, mode=mode),
+        roofline_spec_value=RooflineSpec(flops=1, op_category="attention"),
     )
 
 
 def _decode_op(n=8, ctx=2048, tp=1, mode="eager"):
-    return AttentionOp(
-        name="layer0_attention", op_kind="attention", op_subtype="decode",
-        phase="decode", layer_idx=0, dtype="bf16",
-        shape_fields={
-            "num_tokens": n, "num_seqs": n,
-            "q_len": 1, "kv_len": ctx,
-            "num_q_heads": 32, "num_kv_heads": 8, "head_dim": 128,
-        },
-        parallel_fields={"tp": tp},
-        runtime_fields={
-            "framework": "vllm", "framework_version": "0.20.1",
-            "execution_mode": mode, "kernel_source": "vllm_flash_attn",
-            "attention_backend": "flash_attn", "kv_dtype": "bf16", "block_size": 16,
-        },
-        formula_value=OperatorFormula(flops=1, op_category="attention"),
+    return Attention(
+        name="attention", op_subtype="decode",
+        phase="decode", layer_idx=0,
+        num_tokens=n, num_seqs=n,
+        q_len=1, kv_len=ctx,
+        num_q_heads=32, num_kv_heads=8, head_dim=128,
+        attention_backend="flash_attn", kv_dtype="bf16", block_size=16,
+        kernel_source="vllm_flash_attn",
+        ctx=_attn_ctx(tp=tp, mode=mode),
+        roofline_spec_value=RooflineSpec(flops=1, op_category="attention"),
     )
 
 
@@ -157,12 +162,12 @@ def test_mixed_phase_not_implemented():
 
 
 def test_virtual_op_wrong_kind_raises():
-    bogus = FormulaOp(
+    bogus = RooflineOperator(
         name="x", op_kind="gemm", op_subtype="qkv_proj",
         phase="prefill", layer_idx=0, dtype="bf16",
         shape_fields={"m": 1, "n": 1, "k": 1},
         parallel_fields={"tp": 1}, runtime_fields={},
-        formula_value=OperatorFormula(op_category="matmul"),
+        roofline_spec_value=RooflineSpec(op_category="matmul"),
     )
     with pytest.raises(ValueError, match="op_kind=attention"):
         attention_virtual_op_to_signature(bogus)

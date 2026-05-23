@@ -119,6 +119,12 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # MeasuredOperatorDB 落地后由 cost backend 替换。
     efficiency.apply_to(hw)
 
+    # 临时 sweep knob: LLM_INFER_SIM_MEM_EFFICIENCY 覆盖 hw.mem_efficiency.
+    # (对标 AIConfigurator mem_bw_empirical_scaling_factor, 0.8 是 H100/A100 经验值.)
+    _mem_eff = os.environ.get("LLM_INFER_SIM_MEM_EFFICIENCY")
+    if _mem_eff is not None:
+        hw.mem_efficiency = float(_mem_eff)
+
     # ---- 5. PD 分离 (详设 §7.6) ----
     pd_cfg = _extract_pd_config(vllm_config)
 
@@ -299,29 +305,19 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
     # q_lora_rank: DeepSeek-V3 Q 投影也走 LoRA 分解 (1536 in V3); 0 = 直接 hidden→Q proj
     q_lora_rank = getattr(hf, "q_lora_rank", 0) or 0
 
-    # V4 字段 (阶段 9+): sparse attention + HC + grouped O proj.
-    # V4 path 触发条件: window_size > 0 AND o_groups > 0.
-    # V4-Flash hf_config 真实字段名:
-    #   sliding_window=128 (注意映射到 ModelConfig.window_size)
-    #   o_groups=8, o_lora_rank=1024
-    #   compress_ratios=[0,0,4,128,...] (list, 优先级高于 a/b 派生)
-    #   index_topk=512, index_n_heads=64, index_head_dim=128
-    #   hc_mult=4, hc_sinkhorn_iters=20
-    #   expert_dtype="fp4" → expert_fp4=True
-    window_size = getattr(hf, "sliding_window", 0) or 0
-    o_lora_rank = getattr(hf, "o_lora_rank", 0) or 0
-    o_groups = getattr(hf, "o_groups", 0) or 0
-    compress_ratios_list = list(getattr(hf, "compress_ratios", None) or [])
+    # V3.2 lightning indexer 字段
     index_topk = getattr(hf, "index_topk", 0) or 0
     index_n_heads = getattr(hf, "index_n_heads", 0) or 0
     index_head_dim = getattr(hf, "index_head_dim", 0) or 0
-    hc_mult = getattr(hf, "hc_mult", 0) or 0
-    hc_sinkhorn_iters = getattr(hf, "hc_sinkhorn_iters", 0) or 0
-    # expert_fp4: 从 expert_dtype="fp4" 推导 (V4 用); 默认 False
-    expert_dtype = getattr(hf, "expert_dtype", "") or ""
-    expert_fp4 = (expert_dtype.lower() == "fp4")
-    # num_hash_layers: V4 前 N 层用 hash routing (tid2eid lookup, FLOPs≈0)
-    num_hash_layers = getattr(hf, "num_hash_layers", 0) or 0
+
+    # V4 model (sliding_window>0 + o_groups>0) 已在 #157 删除支持. 检测到 V4 hf_config
+    # 字段时显式抛错, 避免静默 fallback 到 V3 path.
+    if getattr(hf, "sliding_window", 0) and getattr(hf, "o_groups", 0):
+        raise NotImplementedError(
+            f"DeepSeek V4 (sliding_window + o_groups) support removed in #157. "
+            f"hf_config has sliding_window={hf.sliding_window!r}, o_groups={hf.o_groups!r}. "
+            f"V4 will be reimplemented on new operator class architecture."
+        )
 
     return ModelConfig(
         name=model_id.split("/")[-1] if isinstance(model_id, str) else "model",
@@ -345,18 +341,9 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
         qk_nope_head_dim=qk_nope_head_dim,
         rope_head_dim=qk_rope_head_dim,
         q_lora_rank=q_lora_rank,
-        # V4 字段
-        window_size=window_size,
-        o_lora_rank=o_lora_rank,
-        o_groups=o_groups,
-        compress_ratios=compress_ratios_list,
         index_topk=index_topk,
         index_n_heads=index_n_heads,
         index_head_dim=index_head_dim,
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
-        expert_fp4=expert_fp4,
-        num_hash_layers=num_hash_layers,
     )
 
 

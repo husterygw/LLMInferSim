@@ -1,4 +1,4 @@
-"""QwenModelGraphTemplate — IMPL_PLAN §1.4 Step 1.9 + §4 (Stage 3a MoE).
+"""QwenModelGraphTemplate — #158 ctx-based.
 
 阶段 1: Qwen3 dense, 每层:
     attn_norm → qkv_proj → rope → attention → o_proj → attn_add
@@ -13,161 +13,424 @@
         → [num_shared_experts>0: shared_expert_up_gate / _act / _down / _allreduce]
         → mlp_add
 
-attention block 跟 dense 层相同. attn_allreduce (TP>1 后) 暂未注入, Step 3e 时统一处理.
-
 全图: embedding → [layer ops × num_layers] → lm_head
 
-暂不支持:
-    HC (V4)                — 3c
-    MLA / sparse           — 3b / 3c
-    mixed step              — StepShape 不让进
+mixed/chunked_prefill phase 在 _attention_ops 内部拆 2 个 Attention op
+(prefill segment + decode segment), 仍是 layer-uniform 不影响 grouping.
+
+所有 op (Embedding / Norm / ElementWise / GEMM / Attention / FusedMoE / Collective)
+由 template 直接构造, ctx 从 self.ctx 派生.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
+from llm_infer_sim.core.graph.grouped_plan import GroupedOperator, GroupedStepPlan
 from llm_infer_sim.core.graph.step_shape import StepShape
-from llm_infer_sim.core.operators.factories import FactoryBundle
-from llm_infer_sim.core.operators.specs import Operator
+from llm_infer_sim.core.models.layer_partition import partition_ffn_layers
+from llm_infer_sim.core.operators.context import OperatorContext
+from llm_infer_sim.core.operators import (
+    Attention,
+    ElementWise,
+    Embedding,
+    FusedMoE,
+    GEMM,
+    MoERoutingProfile,
+    Norm,
+    make_collective,
+)
+from llm_infer_sim.core.operators.base import Operator
 from llm_infer_sim.core.profiles.model_config import ModelConfig
+
+
+# ---- Qwen dense shape helpers (private) ----
+
+def _qkv_dim(ctx: OperatorContext) -> int:
+    """Fused QKV projection output dim per-TP: (n_q + 2*n_kv) × head_dim."""
+    m = ctx.model
+    tp = ctx.tp_size
+    n_q = m.num_heads // tp
+    n_kv = m.num_kv_heads // tp
+    return (n_q + 2 * n_kv) * m.head_dim
+
+
+def _q_dim(ctx: OperatorContext) -> int:
+    """Q projection dim per-TP: n_q × head_dim (= input dim of o_proj)."""
+    m = ctx.model
+    tp = ctx.tp_size
+    n_q = m.num_heads // tp
+    return n_q * m.head_dim
+
+
+def _ffn_dim_per_tp(ctx: OperatorContext) -> int:
+    """Dense FFN intermediate dim per-TP."""
+    return ctx.model.ffn_dim // ctx.tp_size
+
+
+def _lm_head_dim(ctx: OperatorContext) -> int:
+    """LM head output dim per-TP (vocab sharded by TP)."""
+    return ctx.model.vocab_size // ctx.tp_size
+
+
+def _shared_dim_per_tp(ctx: OperatorContext) -> int:
+    """Shared experts intermediate dim per-TP."""
+    m = ctx.model
+    return m.expert_dim * m.num_shared_experts // ctx.tp_size
+
+
+def _comm_bytes_hidden(tokens: int, ctx: OperatorContext) -> int:
+    """Activation bytes for hidden-state communication."""
+    return int(tokens * ctx.model.hidden_dim * ctx.a_byte)
 
 
 @dataclass(frozen=True)
 class QwenModelGraphTemplate:
     model: ModelConfig
+    ctx: OperatorContext | None = None
+    routing: MoERoutingProfile | None = None
 
-    def build_step(
-        self,
-        step: StepShape,
-        factories: FactoryBundle,
-    ) -> StepOpPlan:
-        ops: list[Operator] = []
+    def build_grouped_step(self, step: StepShape) -> GroupedStepPlan:
+        """Grouped step plan. 用 self.ctx (engine builder 传入)."""
+        if self.ctx is None:
+            raise ValueError(
+                "QwenModelGraphTemplate.ctx is required (engine builder should pass it)"
+            )
+        ctx = self.ctx
         tokens = step.total_tokens
         phase = step.phase
+        layer_count = self.model.num_layers
+        all_layer_indices = tuple(range(layer_count))
 
-        ops.append(factories.embedding.embedding(tokens, phase))
+        groups: list[GroupedOperator] = [
+            GroupedOperator(
+                op=Embedding(
+                    name="embedding",
+                    phase=phase, layer_idx=None,
+                    tokens=tokens,
+                    vocab_size=self.model.vocab_size,
+                    hidden=self.model.hidden_dim,
+                    ctx=ctx,
+                ),
+                count=1, layer_indices=(),
+            ),
+        ]
 
-        for layer_idx in range(self.model.num_layers):
-            if self.model.is_moe_layer(layer_idx):
-                ops.extend(self._build_moe_layer(layer_idx, step, factories))
+        # attention block: layer-uniform
+        for op in self._build_attn_block(0, step, ctx):
+            groups.append(GroupedOperator(
+                op=op, count=layer_count, layer_indices=all_layer_indices,
+            ))
+
+        # FFN block: (dense / moe) partition
+        for ffn_kind, layer_indices in partition_ffn_layers(self.model):
+            rep = layer_indices[0]
+            if ffn_kind == "dense":
+                ffn_ops = self._build_dense_ffn_block(rep, step, ctx)
             else:
-                ops.extend(self._build_layer(layer_idx, step, factories))
+                ffn_ops = self._build_moe_ffn_block(rep, step, ctx)
+            for op in ffn_ops:
+                groups.append(GroupedOperator(
+                    op=op,
+                    count=len(layer_indices),
+                    layer_indices=layer_indices,
+                ))
 
         if phase == "prefill":
             head_tokens = max(step.num_prefill_requests, 1)
         else:
             head_tokens = step.num_decode_requests
-        ops.append(factories.dense.lm_head(head_tokens, phase))
+        groups.append(GroupedOperator(
+            op=GEMM(
+                name="lm_head", op_subtype="lm_head",
+                phase=phase, layer_idx=None,
+                m=head_tokens,
+                n=_lm_head_dim(ctx),
+                k=self.model.hidden_dim,
+                kernel_source="vllm_row_parallel_linear",
+                ctx=ctx,
+            ),
+            count=1, layer_indices=(),
+        ))
 
-        return StepOpPlan(
+        return GroupedStepPlan(
             step_id=step.step_id,
             phase=phase,
-            ops=tuple(ops),
+            groups=tuple(groups),
             metadata={
                 "model": self.model.name,
-                "num_layers": self.model.num_layers,
+                "num_layers": layer_count,
                 "execution_mode": step.execution_mode,
             },
         )
 
-    # ---- dense layer ----
+    # ---- dense attention block (direct construction) ----
 
-    def _attention_ops(self, layer_idx, step, factories):
-        """mixed/chunked phase 拆 2 ops, prefill/decode 单 op."""
+    def _attention_ops(self, layer_idx, step, ctx):
+        """prefill/decode 单 op; mixed/chunked 拆 2 ops (prefill segment + decode segment)."""
         if step.phase in ("mixed", "chunked_prefill"):
-            return list(factories.attention.mixed_attention(layer_idx, step))
-        return [factories.attention.attention(layer_idx, step)]
+            ops: list[Attention] = []
+            if step.num_prefill_tokens > 0:
+                ops.append(self._build_prefill_attention(
+                    layer_idx, step.max_prefill_seqlen,
+                    max(step.num_prefill_requests, 1),
+                    "mixed", ctx,
+                    name="attention_prefill", op_subtype="mixed_prefill",
+                    extra_tags=("mixed",),
+                ))
+            if step.num_decode_requests > 0:
+                ops.append(self._build_decode_attention(
+                    layer_idx, step.avg_decode_context_len,
+                    step.num_decode_requests,
+                    "mixed", ctx,
+                    name="attention_decode", op_subtype="mixed_decode",
+                    extra_tags=("mixed",),
+                ))
+            return ops
+        if step.phase == "prefill":
+            return [self._build_prefill_attention(
+                layer_idx, step.max_prefill_seqlen,
+                max(step.num_prefill_requests, 1),
+                step.phase, ctx,
+            )]
+        return [self._build_decode_attention(
+            layer_idx, step.avg_decode_context_len,
+            step.num_decode_requests,
+            step.phase, ctx,
+        )]
 
-    def _build_layer(
+    def _build_prefill_attention(
+        self,
+        layer_idx: int, seqlen: int, bs: int, phase: str,
+        ctx: OperatorContext, *,
+        name: str = "attention", op_subtype: str = "prefill",
+        extra_tags: tuple = (),
+    ) -> Attention:
+        tp = ctx.tp_size
+        return Attention.flash_prefill(
+            layer_idx=layer_idx, seqlen=seqlen, bs=bs,
+            n_q=self.model.num_heads // tp,
+            n_kv=self.model.num_kv_heads // tp,
+            head_dim=self.model.head_dim,
+            ctx=ctx, phase=phase,
+            name=name, op_subtype=op_subtype, tags=extra_tags,
+        )
+
+    def _build_decode_attention(
+        self,
+        layer_idx: int, ctx_len: int, bs: int, phase: str,
+        ctx: OperatorContext, *,
+        name: str = "attention", op_subtype: str = "decode",
+        extra_tags: tuple = (),
+    ) -> Attention:
+        tp = ctx.tp_size
+        return Attention.flash_decode(
+            layer_idx=layer_idx, ctx_len=ctx_len, bs=bs,
+            n_q=self.model.num_heads // tp,
+            n_kv=self.model.num_kv_heads // tp,
+            head_dim=self.model.head_dim,
+            ctx=ctx, phase=phase,
+            name=name, op_subtype=op_subtype, tags=extra_tags,
+        )
+
+    def _build_attn_block(
         self,
         layer_idx: int,
         step: StepShape,
-        factories: FactoryBundle,
+        ctx: OperatorContext,
     ) -> list[Operator]:
+        """attn_norm → qkv → rope → attention → o → attn_add. Qwen3 dense+MoE 共用."""
+        tokens = step.total_tokens
+        phase = step.phase
+        tp = ctx.tp_size
+        n_q = self.model.num_heads // tp
+        n_kv = self.model.num_kv_heads // tp
+        return [
+            Norm(
+                name="attn_norm", op_subtype="attn_norm",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, hidden=self.model.hidden_dim, ctx=ctx,
+            ),
+            GEMM(
+                name="qkv_proj", op_subtype="qkv_proj",
+                phase=phase, layer_idx=layer_idx,
+                m=tokens, n=_qkv_dim(ctx), k=self.model.hidden_dim,
+                kernel_source="vllm_row_parallel_linear",
+                ctx=ctx,
+            ),
+            ElementWise(
+                name="rope", op_subtype="rope",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens,
+                num_heads=n_q + n_kv, head_dim=self.model.head_dim,
+                ctx=ctx,
+            ),
+            *self._attention_ops(layer_idx, step, ctx),
+            GEMM(
+                name="o_proj", op_subtype="o_proj",
+                phase=phase, layer_idx=layer_idx,
+                m=tokens, n=self.model.hidden_dim, k=_q_dim(ctx),
+                kernel_source="vllm_row_parallel_linear",
+                ctx=ctx,
+            ),
+            ElementWise(
+                name="attn_add", op_subtype="attn_add",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, hidden=self.model.hidden_dim, ctx=ctx,
+            ),
+        ]
+
+    def _build_dense_ffn_block(
+        self,
+        layer_idx: int,
+        step: StepShape,
+        ctx: OperatorContext,
+    ) -> list[Operator]:
+        """mlp_norm → gate_up → act → down → mlp_add."""
         tokens = step.total_tokens
         phase = step.phase
         return [
-            factories.norm.attn_norm(layer_idx, tokens, phase),
-            factories.dense.qkv_proj(layer_idx, tokens, phase),
-            factories.attention.rope(layer_idx, tokens, phase),
-            *self._attention_ops(layer_idx, step, factories),
-            factories.dense.o_proj(layer_idx, tokens, phase),
-            factories.norm.attn_add(layer_idx, tokens, phase),
-            factories.norm.mlp_norm(layer_idx, tokens, phase),
-            factories.dense.gate_up_proj(layer_idx, tokens, phase),
-            factories.norm.mlp_act(layer_idx, tokens, phase),
-            factories.dense.down_proj(layer_idx, tokens, phase),
-            factories.norm.mlp_add(layer_idx, tokens, phase),
+            Norm(
+                name="mlp_norm", op_subtype="mlp_norm",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, hidden=self.model.hidden_dim, ctx=ctx,
+            ),
+            GEMM(
+                name="gate_up_proj", op_subtype="gate_up_proj",
+                phase=phase, layer_idx=layer_idx,
+                m=tokens, n=2 * _ffn_dim_per_tp(ctx), k=self.model.hidden_dim,
+                kernel_source="vllm_row_parallel_linear",
+                ctx=ctx,
+            ),
+            ElementWise(
+                name="mlp_act", op_subtype="mlp_act",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, intermediate=_ffn_dim_per_tp(ctx), ctx=ctx,
+            ),
+            GEMM(
+                name="down_proj", op_subtype="down_proj",
+                phase=phase, layer_idx=layer_idx,
+                m=tokens, n=self.model.hidden_dim, k=_ffn_dim_per_tp(ctx),
+                kernel_source="vllm_row_parallel_linear",
+                ctx=ctx,
+            ),
+            ElementWise(
+                name="mlp_add", op_subtype="mlp_add",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, hidden=self.model.hidden_dim, ctx=ctx,
+            ),
         ]
 
-    # ---- MoE layer (3a) ----
+    # ---- per-layer composition helpers (for tests / introspection) ----
 
-    def _build_moe_layer(
+    def _build_layer(self, layer_idx: int, step: StepShape) -> list[Operator]:
+        """Dense layer = attention block + dense FFN block."""
+        ctx = self.ctx
+        return [
+            *self._build_attn_block(layer_idx, step, ctx),
+            *self._build_dense_ffn_block(layer_idx, step, ctx),
+        ]
+
+    def _build_moe_layer(self, layer_idx: int, step: StepShape) -> list[Operator]:
+        """MoE layer = attention block + MoE FFN block."""
+        ctx = self.ctx
+        return [
+            *self._build_attn_block(layer_idx, step, ctx),
+            *self._build_moe_ffn_block(layer_idx, step, ctx),
+        ]
+
+    # ---- MoE FFN block ----
+
+    def _build_moe_ffn_block(
         self,
         layer_idx: int,
         step: StepShape,
-        factories: FactoryBundle,
+        ctx: OperatorContext,
     ) -> list[Operator]:
-        if factories.moe is None or factories.collective is None:
-            raise ValueError(
-                "MoE layer requires FactoryBundle.moe + .collective; "
-                "build engine via build_qwen_moe_roofline_engine() or pass them explicitly."
-            )
+        """mlp_norm → moe_gate → [alltoall_dispatch] → routed_experts → [comm] → shared → mlp_add."""
         tokens = step.total_tokens
         phase = step.phase
-        deploy = factories.moe.deploy
-        tp = deploy.tp_size
-        ep = deploy.ep_size
-        h = self.model.hidden_dim
-        a_byte = factories.moe.a_byte
-        comm_bytes_h = int(tokens * h * a_byte)
+        routing = self.routing or MoERoutingProfile.balanced()
+        m = self.model
+        tp = ctx.tp_size
+        ep = ctx.ep_size
+        comm_bytes_h = _comm_bytes_hidden(tokens, ctx)
 
         ops: list[Operator] = [
-            # attention block (与 dense 层相同)
-            factories.norm.attn_norm(layer_idx, tokens, phase),
-            factories.dense.qkv_proj(layer_idx, tokens, phase),
-            factories.attention.rope(layer_idx, tokens, phase),
-            *self._attention_ops(layer_idx, step, factories),
-            factories.dense.o_proj(layer_idx, tokens, phase),
-            factories.norm.attn_add(layer_idx, tokens, phase),
-            # MoE FFN
-            factories.norm.mlp_norm(layer_idx, tokens, phase),
-            factories.moe.moe_gate(layer_idx, tokens, phase),
+            Norm(
+                name="mlp_norm", op_subtype="mlp_norm",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, hidden=m.hidden_dim, ctx=ctx,
+            ),
+            # router GEMM (fp32 precision for routing stability)
+            GEMM(
+                name="moe_gate", op_subtype="router",
+                phase=phase, layer_idx=layer_idx,
+                m=tokens, n=m.num_experts, k=m.hidden_dim,
+                kernel_source="vllm_moe_gate",
+                op_precision_override="fp32",
+                ctx=ctx,
+            ),
         ]
 
         if ep > 1:
-            ops.append(factories.collective.alltoall(
+            ops.append(make_collective(kind="alltoall",
                 name="ep_alltoall_dispatch",
                 message_bytes=comm_bytes_h,
-                phase=phase, layer_idx=layer_idx, world_size=ep,
+                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
             ))
 
-        ops.append(factories.moe.routed_experts(layer_idx, tokens, phase))
+        # routed experts (fused_moe kernel)
+        ops.append(FusedMoE.routed_experts(
+            layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
+        ))
 
         if ep == 1 and tp > 1:
-            ops.append(factories.collective.allreduce(
+            ops.append(make_collective(kind="allreduce",
                 name="routed_expert_allreduce",
                 message_bytes=comm_bytes_h,
-                phase=phase, layer_idx=layer_idx, world_size=tp,
+                phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
             ))
         elif ep > 1:
-            ops.append(factories.collective.alltoall(
+            ops.append(make_collective(kind="alltoall",
                 name="ep_alltoall_combine",
                 message_bytes=comm_bytes_h,
-                phase=phase, layer_idx=layer_idx, world_size=ep,
+                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
             ))
 
-        if self.model.num_shared_experts > 0:
-            ops.append(factories.moe.shared_expert_up_gate(layer_idx, tokens, phase))
-            ops.append(factories.moe.shared_expert_act(layer_idx, tokens, phase))
-            ops.append(factories.moe.shared_expert_down(layer_idx, tokens, phase))
+        # shared experts (V3 / Qwen3-Coder; A3B 没有)
+        if m.num_shared_experts > 0:
+            shared_per_tp = _shared_dim_per_tp(ctx)
+            ops.append(GEMM(
+                name="shared_expert_up_gate", op_subtype="shared_expert_up_gate",
+                phase=phase, layer_idx=layer_idx,
+                m=tokens, n=2 * shared_per_tp, k=m.hidden_dim,
+                kernel_source="vllm_row_parallel_linear",
+                op_precision_override="bf16",
+                ctx=ctx,
+            ))
+            ops.append(ElementWise(
+                name="shared_expert_act", op_subtype="silu_mul",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, intermediate=shared_per_tp, ctx=ctx,
+            ))
+            ops.append(GEMM(
+                name="shared_expert_down", op_subtype="shared_expert_down",
+                phase=phase, layer_idx=layer_idx,
+                m=tokens, n=m.hidden_dim, k=shared_per_tp,
+                kernel_source="vllm_row_parallel_linear",
+                op_precision_override="bf16",
+                ctx=ctx,
+            ))
             if tp > 1:
-                ops.append(factories.collective.allreduce(
+                ops.append(make_collective(kind="allreduce",
                     name="shared_expert_allreduce",
                     message_bytes=comm_bytes_h,
-                    phase=phase, layer_idx=layer_idx, world_size=tp,
+                    phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
                 ))
 
-        ops.append(factories.norm.mlp_add(layer_idx, tokens, phase))
+        ops.append(ElementWise(
+            name="mlp_add", op_subtype="mlp_add",
+            phase=phase, layer_idx=layer_idx,
+            tokens=tokens, hidden=m.hidden_dim, ctx=ctx,
+        ))
         return ops

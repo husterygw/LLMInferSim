@@ -57,7 +57,8 @@ def moe_case_params_to_signature(
 def moe_virtual_op_to_signature(op: Any) -> OperatorSignature:
     """runtime operator descriptor → OperatorSignature.
 
-    Stage 4 之后 MoEOpFactory 会生成 op_kind=moe 的 Operator; 此处契约提前锁住.
+    qwen.py / deepseek.py 直接构造 FusedMoE (op_kind=moe), 此 canonicalizer
+    把 FusedMoE 转成 OperatorDB signature.
     """
     if op.op_kind != "moe":
         raise ValueError(f"expected op_kind=moe, got {op.op_kind!r}")

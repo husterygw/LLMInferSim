@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from llm_infer_sim.core.cost.formulas.kv_transfer import kv_transfer_time
+from llm_infer_sim.core.cost.roofline.kv_transfer import kv_transfer_time
 
 
 def test_zero_bytes_returns_just_latency():

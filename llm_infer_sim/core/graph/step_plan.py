@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from llm_infer_sim.core.operators.specs import Operator
+from llm_infer_sim.core.operators.base import Operator
 
 
 @dataclass(frozen=True)

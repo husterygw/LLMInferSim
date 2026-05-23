@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from llm_infer_sim.core.operators.routing import MoERoutingProfile
+from llm_infer_sim.core.operators import MoERoutingProfile
 
 
 @dataclass

@@ -82,37 +82,33 @@ def test_per_rank_scales_with_tp():
     assert tp4 == total // 4
 
 
-def _v4_flash_like_moe() -> ModelConfig:
-    """近 V4-Flash MoE 配置 (fp4 expert), 用于 sizing dtype/EP-aware 测试."""
+def _large_moe_fixture() -> ModelConfig:
+    """通用 MoE 配置, 用于 sizing dtype/EP-aware 测试 (改自原 V4-Flash-like)."""
     return ModelConfig(
-        name="V4-Flash-like",
+        name="Large-MoE-fixture",
         hidden_dim=4096, num_heads=32, num_kv_heads=1, head_dim=128,
         ffn_dim=0, num_layers=43, vocab_size=129280,
         is_moe=True,
         num_experts=128, num_activated_experts=4, expert_dim=2048,
         num_shared_experts=1, moe_layer_freq=1, first_moe_layer=0,
-        expert_fp4=True,                  # ← 关键: 触发 routed expert fp4 路径
     )
 
 
-def test_expert_fp4_halves_routed_bytes_vs_fp8():
-    """expert_fp4=True 时, routed expert 部分应按 0.5B/param 算, 非 expert 按 w_byte.
+def test_explicit_expert_w_byte_halves_routed_bytes():
+    """显式 expert_w_byte=0.5 时, routed expert 部分应按 0.5B/param 算, 非 expert 按 w_byte.
 
-    防回归: 旧 sizing 把所有 weight 按统一 w_byte 算, V4-Flash 高估 ~4× routed expert.
+    (原 V4-Flash fp4 expert 用例; 现在通过显式参数表达, 不再依赖 model.expert_fp4.)
     """
-    model = _v4_flash_like_moe()
-    # fp8 attention + fp4 expert (V4 production)
-    fp4_aware = estimate_param_bytes(model, w_byte=1.0)         # 自动 expert_w_byte=0.5
-    # 强制 routed expert 跟 attention 同 fp8
+    model = _large_moe_fixture()
+    fp4_aware = estimate_param_bytes(model, w_byte=1.0, expert_w_byte=0.5)
     no_fp4 = estimate_param_bytes(model, w_byte=1.0, expert_w_byte=1.0)
-    # routed expert 在总 bytes 中占主导, fp4 vs fp8 应当显著小
     assert fp4_aware < no_fp4 * 0.6, \
-        f"expert_fp4 应明显省字节; fp4_aware={fp4_aware:,} no_fp4={no_fp4:,}"
+        f"expert_w_byte=0.5 应明显省字节; fp4_aware={fp4_aware:,} no_fp4={no_fp4:,}"
 
 
 def test_ep_shard_equals_tp_shard_when_ep_eq_tp():
     """ep=tp 时 per-rank 应跟纯 TP 等价 (vLLM FusedMoE EP/TP-only 存储等价)."""
-    model = _v4_flash_like_moe()
+    model = _large_moe_fixture()
     tp_only = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=1)
     ep_eq_tp = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=8)
     assert tp_only == ep_eq_tp
@@ -188,9 +184,10 @@ def test_dp_plus_tp_dense_divides_by_tp_only():
 
 def test_dp_plus_tp_plus_ep_moe_shards_routed_by_ep_world():
     """DP+TP+EP MoE: 例 tp=8 dp=2 ep=16 → routed expert / 16, dense / 8.
-    V4-Pro / Qwen3-235B 多节点部署用此形态。
+
+    Qwen3-235B 等多节点部署用此形态.
     """
-    model = _v4_flash_like_moe()
+    model = _large_moe_fixture()
     tp_only = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=1)
     # ep_size=16 模拟 tp=8 + dp=2 + enable_ep
     tp_plus_dp_ep = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=16)
@@ -201,17 +198,16 @@ def test_dp_plus_tp_plus_ep_moe_shards_routed_by_ep_world():
     assert 0.4 < ratio < 0.95, f"ep_world 翻倍后 per-rank ratio {ratio} 应在 0.4-0.95"
 
 
-def test_v4_per_rank_fp4_aware_matches_expected():
-    """V4-Flash-like 总 weight ≈ 105B params; fp4 expert + fp8 attn / tp=8.
-    routed = 128 × 3 × 4096 × 2048 = 3.22G/layer × 43 layers = 138G params (fp4 → 69 GB)
-    fp4 / tp=8 ≈ 8.6 GB routed + 少量 attn/shared/embed; 总约 10-12 GB/rank.
-    旧公式 (无 fp4): ~22 GB/rank.
-    """
-    model = _v4_flash_like_moe()
-    fp4_aware = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=8) / 1e9
-    no_fp4 = per_rank_param_bytes(model, 1.0, tp_size=8, ep_size=8, expert_w_byte=1.0) / 1e9
-    assert fp4_aware < no_fp4 * 0.6
-    assert 8.0 < fp4_aware < 16.0, f"V4-Flash-like fp4 per-rank should be ~10-12 GB, got {fp4_aware:.2f}"
+def test_explicit_expert_w_byte_per_rank_matches_expected():
+    """显式 expert_w_byte=0.5 路径 (原 V4-Flash fp4 case): fp4 vs fp8 routed expert 区分."""
+    model = _large_moe_fixture()
+    fp4_aware = per_rank_param_bytes(
+        model, 1.0, tp_size=8, ep_size=8, expert_w_byte=0.5,
+    ) / 1e9
+    no_fp4 = per_rank_param_bytes(
+        model, 1.0, tp_size=8, ep_size=8, expert_w_byte=1.0,
+    ) / 1e9
+    assert fp4_aware < no_fp4 * 0.6, f"expert_w_byte=0.5 应明显省字节; fp4={fp4_aware} no_fp4={no_fp4}"
 
 
 def test_activation_scales_linearly():

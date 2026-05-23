@@ -4,8 +4,8 @@ from __future__ import annotations
 from typing import Any
 
 from llm_infer_sim.core.cost.roofline_analyzer import RooflineAnalyzer
-from llm_infer_sim.core.cost.trace import CostTraceEntry
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.cost.trace import CostTraceEntry, format_display_name
+from llm_infer_sim.core.operators.base import RooflineSpec
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
 
@@ -35,8 +35,8 @@ class RooflineBackend:
         )
 
     def estimate(self, op: Any) -> CostTraceEntry:
-        formula = self._formula(op)
-        result = self.analyzer.analyze(op.name, formula)
+        spec = self._roofline_spec(op)
+        result = self.analyzer.analyze(op.name, spec)
         return CostTraceEntry(
             op_name=op.name,
             op_kind=op.op_kind,
@@ -44,6 +44,8 @@ class RooflineBackend:
             latency_s=result.total_time,
             source="roofline",
             match_type="fallback",
+            layer_idx=getattr(op, "layer_idx", None),
+            display_name=format_display_name(op.name, getattr(op, "layer_idx", None)),
             roofline_s=result.total_time,
             roofline_gap=None,
             metadata={
@@ -60,14 +62,14 @@ class RooflineBackend:
         )
 
     @staticmethod
-    def _formula(op: Any) -> OperatorFormula:
-        formula_attr = getattr(op, "formula")
-        formula = formula_attr() if callable(formula_attr) else formula_attr
-        if isinstance(formula, OperatorFormula):
-            return formula
+    def _roofline_spec(op: Any) -> RooflineSpec:
+        spec_attr = getattr(op, "roofline_spec")
+        spec = spec_attr() if callable(spec_attr) else spec_attr
+        if isinstance(spec, RooflineSpec):
+            return spec
 
-        f = formula
-        return OperatorFormula(
+        f = spec
+        return RooflineSpec(
             op_category=f.get("op_category", "matmul"),
             flops=int(f.get("flops", 0)),
             load_weight=int(f.get("load_weight", 0)),

@@ -16,22 +16,31 @@ from llm_infer_sim.core.graph.step_plan import StepOpPlan
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
 from llm_infer_sim.core.operator_db.stores.memory import MemoryOperatorStore
 from llm_infer_sim.core.operator_schema import virtual_op_to_signature
-from llm_infer_sim.core.operators.ops import GemmOp
+from llm_infer_sim.core.operators.context import build_operator_context
+from llm_infer_sim.core.operators import GEMM
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
+from llm_infer_sim.core.profiles.model_config import ModelConfig
 
 
-def _gemm_op(m=128, subtype="qkv_proj") -> GemmOp:
-    return GemmOp(
-        name=f"layer0_{subtype}", op_subtype=subtype,
-        phase="prefill", layer_idx=0, dtype="bf16",
-        m=m, n=6144, k=2560, tp=1,
-        framework="vllm", framework_version="0.20.1",
-        execution_mode="eager", kernel_source="vllm_default",
+def _gemm_ctx():
+    return build_operator_context(
+        ModelConfig(),
+        DeployConfig(backend="vllm", backend_version="0.20.1"),
+        get_hardware_profile("RTX_4090"),
     )
 
 
-def _record(op: GemmOp, latency_us=234.5) -> OperatorRecord:
+def _gemm_op(m=128, subtype="qkv_proj") -> GEMM:
+    return GEMM(
+        name=subtype, op_subtype=subtype,
+        phase="prefill", layer_idx=0,
+        m=m, n=6144, k=2560,
+        ctx=_gemm_ctx(),
+    )
+
+
+def _record(op: GEMM, latency_us=234.5) -> OperatorRecord:
     sig = virtual_op_to_signature(op)
     return OperatorRecord(
         signature=sig, hardware="RTX_4090",

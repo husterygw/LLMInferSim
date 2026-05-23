@@ -1,60 +1,50 @@
 #!/bin/bash
-# 真 GPU vs 仿真 (LLMInferSim) TTFT/TPOT 对比 bench.
-#
-# 跑同一份 `vllm bench serve` 命令两次:
-#   1) 直连真 GPU 上的 vLLM server  → 实测 TTFT / TPOT
-#   2) 直连 LLMInferSim virtual backend 跑的 vLLM server → 仿真 TTFT / TPOT
-# 最后输出 5 个 scenario 的对比表 (gap%). 支持一次跑多模型对比.
-#
-# Usage:
-#   bash scripts/bench_compare.sh                                       # 默认 Qwen3-4B
-#   MODELS=/path/to/A,/path/to/B bash scripts/bench_compare.sh          # 多模型
-#   HW=H100 bash scripts/bench_compare.sh                               # 换硬件 profile
-#
-# Env vars (可选):
-#   MODELS             模型路径列表, 逗号分隔. 默认 = $MODEL (单模型 back-compat)
-#   MODEL              单模型路径 (默认 /data/ygw/models/Qwen3-4B-Instruct-2507)
-#   HW                 LLM_INFER_SIM_HW (默认 RTX_4090)
-#   CONDA_ENV          conda 环境名 (默认 llm_sim, 设 "" 跳过激活)
-#   CUDA_VISIBLE_DEVICES  默认 0
-#   RESULTS_DIR        输出根目录 (默认 /tmp/bench_compare_results), 多模型每个一子目录
-#   GPU_MEM_UTIL       gpu-memory-utilization (默认 0.5)
-#   MAX_MODEL_LEN      max-model-len (默认 4096)
-#   MAX_NUM_SEQS       max-num-seqs (默认 16)
-#   MAX_BATCH_TOKENS   max-num-batched-tokens (默认 8192)
-#   PREFIX_CACHE       on / off (默认 off, 干净对比)
-#   ENFORCE_EAGER      on / off (默认 on, 跟 cost model module 级 overhead 语义对齐)
-#   SCENARIO_OVERRIDE  一条单独的 scenario, 覆盖默认 5 条. 格式: "name input_len output_len num_prompts"
-#                      例: SCENARIO_OVERRIDE="case 256 256 10"
-#   ENABLE_EP          on / off (默认 off). on 时给 vllm serve 加 --enable-expert-parallel
-#   NUM_WARMUPS        bench --num-warmups (默认 1). 让 sim/real 各自跑 warmup prompt 排除冷启动
+# Execute case-driven real-vs-sim vLLM benchmark cases.
 
 set -e
 
-# ---------- defaults ----------
-MODEL="${MODEL:-/data/ygw/models/Qwen3-4B-Instruct-2507}"
-MODELS="${MODELS:-$MODEL}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CASES_JSONL=""
+CASE_JSON=""
+OUT_ROOT="${RESULTS_DIR:-/tmp/bench_compare_results}"
+DRY_RUN=0
 HW="${HW:-RTX_4090}"
 CONDA_ENV="${CONDA_ENV-llm_sim}"
-RESULTS_DIR_ROOT="${RESULTS_DIR:-/tmp/bench_compare_results}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.5}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
-MAX_BATCH_TOKENS="${MAX_BATCH_TOKENS:-8192}"
-PREFIX_CACHE="${PREFIX_CACHE:-off}"
-ENFORCE_EAGER="${ENFORCE_EAGER:-on}"
-ENABLE_EP="${ENABLE_EP:-off}"
-NUM_WARMUPS="${NUM_WARMUPS:-1}"
-TP="${TP:-1}"
-# 没显式给 CUDA_VISIBLE_DEVICES 时, 根据 TP 默认 0,1,...,TP-1
-if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
-  _gpus=$(seq -s, 0 $((TP - 1)))
-  export CUDA_VISIBLE_DEVICES="$_gpus"
-else
-  export CUDA_VISIBLE_DEVICES
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/bench_compare.sh --cases /tmp/cases.jsonl --out /tmp/bench_out
+  bash scripts/bench_compare.sh --case-json '{"case_id":"debug",...}' --out /tmp/bench_out
+  bash scripts/bench_compare.sh --cases /tmp/cases.jsonl --out /tmp/bench_out --dry-run
+
+The case JSONL is produced by scripts/bench_cases.py. bench_compare.sh is an
+executor only: it does not define benchmark matrix / batch settings.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cases) CASES_JSONL="$2"; shift 2 ;;
+    --case-json) CASE_JSON="$2"; shift 2 ;;
+    --out) OUT_ROOT="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "ERROR: unknown arg: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+if [ -z "$CASES_JSONL" ] && [ -z "$CASE_JSON" ]; then
+  echo "ERROR: provide --cases or --case-json" >&2
+  usage
+  exit 1
 fi
 
-# ---------- conda env ----------
+if [ -n "$CASES_JSONL" ] && [ -n "$CASE_JSON" ]; then
+  echo "ERROR: --cases and --case-json are mutually exclusive" >&2
+  exit 1
+fi
+
 if [ -n "$CONDA_ENV" ]; then
   CONDA_BASE="$(conda info --base 2>/dev/null || true)"
   if [ -z "$CONDA_BASE" ] && [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
@@ -67,67 +57,140 @@ if [ -n "$CONDA_ENV" ]; then
   fi
 fi
 
-# 必备 env
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export VLLM_USE_V1=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-mkdir -p "$RESULTS_DIR_ROOT"
+TMP_CASES=""
+if [ -n "$CASE_JSON" ]; then
+  TMP_CASES="$(mktemp)"
+  printf '%s\n' "$CASE_JSON" > "$TMP_CASES"
+  CASES_JSONL="$TMP_CASES"
+fi
+trap 'if [ -n "$TMP_CASES" ]; then rm -f "$TMP_CASES"; fi' EXIT
 
-# ---------- scenarios: name | input_len | output_len | num_prompts ----------
-if [ -n "${SCENARIO_OVERRIDE:-}" ]; then
-  SCENARIOS=("$SCENARIO_OVERRIDE")
-else
-  SCENARIOS=(
-    "128_128     128  128  10"
-    "256_256     256  256  10"
-    "512_512     512  512  10"
-    "1024_512    1024 512  10"
-    "2048_512    2048 512  10"
-  )
+mkdir -p "$OUT_ROOT"
+
+mapfile -t CASE_LINES < <(python3 - "$CASES_JSONL" "$SCRIPT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+cases_path = Path(sys.argv[1])
+script_dir = sys.argv[2]
+sys.path.insert(0, script_dir)
+from bench_cases import MODEL_ALIASES  # noqa: E402
+
+def b(value):
+    return "1" if bool(value) else "0"
+
+def s(value):
+    return "" if value is None else str(value)
+
+for line in cases_path.read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    c = json.loads(line)
+    workload = c.get("workload") or {}
+    input_len = c.get("input_len", workload.get("input_len"))
+    output_len = c.get("output_len", workload.get("output_len"))
+    if input_len is None or output_len is None:
+        raise SystemExit(f"case {c.get('case_id')} missing input_len/output_len")
+    suite = c.get("suite") or c.get("group") or "default"
+    model_key = c.get("model") or c.get("model_alias")
+    model_path = MODEL_ALIASES.get(model_key, model_key)
+    tp = c.get("tp", 1)
+    hint = c.get("topology_hint", "concentrated")
+    prefix = b(c.get("prefix_cache", False))
+    chunked = b(c.get("chunked_prefill", False))
+    mode = c.get("execution_mode", "cudagraph")
+    ep_on = b(c.get("enable_expert_parallel", False))
+    max_model_len = s(c.get("max_model_len"))
+    max_num_seqs = s(c.get("max_num_seqs"))
+    # Fallbacks keep ad-hoc --case-json usable. Generated suite cases set these
+    # fields explicitly in BenchCase, which remains the benchmark source of truth.
+    max_btoks = s(c.get("max_num_batched_tokens", 8192))
+    gpu_mem = s(c.get("gpu_mem_util", 0.5))
+    server_key = "|".join([
+        str(model_path), str(tp), hint, mode, prefix, chunked, ep_on,
+        max_model_len, max_num_seqs, max_btoks, gpu_mem,
+    ])
+    fields = [
+        server_key,
+        c["case_id"],
+        suite,
+        str(model_path),
+        str(tp),
+        str(c.get("ep", 1)),
+        hint,
+        mode,
+        str(c.get("concurrency", 1)),
+        str(c.get("num_prompts", c.get("concurrency", 1))),
+        str(c.get("num_warmups", 1)),
+        str(c.get("request_rate", "inf")),
+        str(input_len),
+        str(output_len),
+        prefix,
+        chunked,
+        ep_on,
+        max_model_len,
+        max_num_seqs,
+        max_btoks,
+        gpu_mem,
+    ]
+    print("\x1f".join(fields))
+PY
+)
+
+if [ "${#CASE_LINES[@]}" -eq 0 ]; then
+  echo "ERROR: no cases in $CASES_JSONL" >&2
+  exit 1
 fi
 
-PREFIX_FLAG=""
-if [ "$PREFIX_CACHE" = "off" ]; then
-  PREFIX_FLAG="--no-enable-prefix-caching"
-fi
+set_cuda_visible_devices() {
+  local tp=$1
+  local hint=$2
+  case "${tp}_${hint}" in
+    1_*)              export CUDA_VISIBLE_DEVICES="0" ;;
+    2_concentrated)   export CUDA_VISIBLE_DEVICES="0,1" ;;
+    2_balanced)       export CUDA_VISIBLE_DEVICES="0,4" ;;
+    4_concentrated)   export CUDA_VISIBLE_DEVICES="0,1,2,3" ;;
+    4_balanced)       export CUDA_VISIBLE_DEVICES="0,1,4,5" ;;
+    8_*)              export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" ;;
+    *)                export CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((tp - 1)))" ;;
+  esac
+}
 
-EAGER_FLAG=""
-if [ "$ENFORCE_EAGER" = "on" ]; then
-  EAGER_FLAG="--enforce-eager"
-fi
+build_server_cmd() {
+  local model_path=$1 tp=$2 mode=$3 prefix=$4 chunked=$5 ep_on=$6 max_len=$7 max_seqs=$8 max_btoks=$9 gpu_mem=${10} port=${11}
 
-EP_FLAG=""
-if [ "$ENABLE_EP" = "on" ]; then
-  EP_FLAG="--enable-expert-parallel"
-fi
+  local -a cmd=(vllm serve "$model_path"
+    --host 127.0.0.1 --port "$port"
+    --tensor-parallel-size "$tp"
+    --dtype bfloat16
+    --max-num-batched-tokens "$max_btoks"
+    --gpu-memory-utilization "$gpu_mem"
+    --max-logprobs 0
+    --disable-log-stats)
 
-# 关 vLLM V1 异步调度, 让 real 路径跟 sim 的串行 time.sleep 行为对齐
-# (默认开启时 GPU compute 跟 CPU prepare/emit 是 pipeline 的, sim time.sleep 重现不了)
-ASYNC_FLAG=""
-if [ "${DISABLE_ASYNC_SCHED:-off}" = "on" ]; then
-  ASYNC_FLAG="--no-async-scheduling"
-fi
+  if [ "$prefix" = "1" ]; then cmd+=(--enable-prefix-caching); else cmd+=(--no-enable-prefix-caching); fi
+  if [ "$chunked" = "1" ]; then cmd+=(--enable-chunked-prefill); else cmd+=(--no-enable-chunked-prefill); fi
+  if [ "$mode" = "eager" ]; then cmd+=(--enforce-eager); fi
+  if [ "$ep_on" = "1" ]; then cmd+=(--enable-expert-parallel); fi
+  if [ -n "$max_len" ]; then cmd+=(--max-model-len "$max_len"); fi
+  if [ -n "$max_seqs" ]; then cmd+=(--max-num-seqs "$max_seqs"); fi
+  if [ "${DISABLE_ASYNC_SCHED:-off}" = "on" ]; then cmd+=(--no-async-scheduling); fi
 
-# 当前 model / results_dir, set_for_model() 改写
-CUR_MODEL=""
-CUR_RESULTS_DIR=""
-
-set_for_model() {
-  CUR_MODEL="$1"
-  local short
-  short="$(basename "$CUR_MODEL")"
-  CUR_RESULTS_DIR="$RESULTS_DIR_ROOT/$short"
-  mkdir -p "$CUR_RESULTS_DIR"
+  printf '%q ' "${cmd[@]}"
 }
 
 start_server() {
-  local mode=$1   # "real" or "sim"
-  local port=$2
-  local logfile=$3
+  local run_mode=$1 model_path=$2 tp=$3 hint=$4 mode=$5 prefix=$6 chunked=$7 ep_on=$8 max_len=$9 max_seqs=${10} max_btoks=${11} gpu_mem=${12} port=${13} logfile=${14}
 
-  if [ "$mode" = "real" ]; then
+  set_cuda_visible_devices "$tp" "$hint"
+  export LLM_INFER_SIM_NUMA_HINT="$hint"
+  if [ "$run_mode" = "real" ]; then
     unset VLLM_VIRTUAL_BACKEND
     unset LLM_INFER_SIM_HW
     unset LLM_INFER_SIM_TIME_MODE
@@ -137,30 +200,21 @@ start_server() {
     export LLM_INFER_SIM_TIME_MODE="${LLM_INFER_SIM_TIME_MODE:-realtime}"
   fi
 
+  local cmd
+  cmd="$(build_server_cmd "$model_path" "$tp" "$mode" "$prefix" "$chunked" "$ep_on" "$max_len" "$max_seqs" "$max_btoks" "$gpu_mem" "$port")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "SERVER[$run_mode] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES $cmd"
+    return 0
+  fi
+
   # shellcheck disable=SC2086
-  vllm serve "$CUR_MODEL" \
-    --host 127.0.0.1 --port "$port" \
-    --tensor-parallel-size "$TP" \
-    --dtype bfloat16 \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --max-num-seqs "$MAX_NUM_SEQS" \
-    --max-num-batched-tokens "$MAX_BATCH_TOKENS" \
-    $PREFIX_FLAG \
-    $EAGER_FLAG \
-    $EP_FLAG \
-    $ASYNC_FLAG \
-    --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --max-logprobs 0 \
-    --disable-log-stats \
-    > "$logfile" 2>&1 &
+  eval "$cmd" > "$logfile" 2>&1 &
   echo $!
 }
 
 wait_ready() {
-  local port=$1
-  local pid=$2
-  local timeout=$3
-  for i in $(seq 1 $timeout); do
+  local port=$1 pid=$2 timeout=$3
+  for _ in $(seq 1 "$timeout"); do
     if curl -fsS "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
       return 0
     fi
@@ -172,122 +226,112 @@ wait_ready() {
   return 1
 }
 
-run_bench() {
-  local port=$1
-  local input_len=$2
-  local output_len=$3
-  local num_prompts=$4
-  local out_file=$5
+run_bench_case() {
+  local run_mode=$1 port=$2 case_id=$3 suite=$4 model_path=$5 num_prompts=$6 num_warmups=$7 rate=$8 input_len=$9 output_len=${10}
+  local case_dir="$OUT_ROOT/$suite/$case_id"
+  mkdir -p "$case_dir"
+  local out_file="$case_dir/${run_mode}_case.txt"
+  local -a cmd=(vllm bench serve
+    --backend vllm
+    --host 127.0.0.1 --port "$port"
+    --model "$model_path"
+    --dataset-name random
+    --num-prompts "$num_prompts"
+    --num-warmups "$num_warmups"
+    --random-input-len "$input_len"
+    --random-output-len "$output_len"
+    --request-rate "$rate"
+    --ignore-eos)
 
-  # Stage A 用 REQUEST_RATE=0.5 让 prompt 间隔 2s, 完全串行
-  # Stage C/D 用 REQUEST_RATE=inf 让所有 prompt 同时到达 (满并发)
-  local rate="${REQUEST_RATE:-inf}"
-  vllm bench serve \
-    --backend vllm \
-    --host 127.0.0.1 --port "$port" \
-    --model "$CUR_MODEL" \
-    --dataset-name random \
-    --num-prompts "$num_prompts" \
-    --num-warmups "$NUM_WARMUPS" \
-    --random-input-len "$input_len" \
-    --random-output-len "$output_len" \
-    --request-rate "$rate" \
-    --ignore-eos \
-    > "$out_file" 2>&1
-}
-
-extract_metric() {
-  local file=$1
-  local metric=$2
-  grep -m1 "Mean ${metric}" "$file" 2>/dev/null | awk -F: '{print $NF}' | tr -d ' '
-}
-
-run_all() {
-  local mode=$1
-  local port=$2
-
-  echo ">>> [$(basename "$CUR_MODEL")] starting $mode server on port $port..."
-  local srvlog="$CUR_RESULTS_DIR/${mode}_server.log"
-  : > "$srvlog"
-  local pid
-  pid=$(start_server "$mode" "$port" "$srvlog")
-
-  echo ">>> waiting for $mode server ready (max 240s)..."
-  if ! wait_ready "$port" "$pid" 240; then
-    echo "ERROR: $mode server failed to start"
-    tail -50 "$srvlog"
-    kill -9 "$pid" 2>/dev/null || true
-    return 1
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'BENCH[%s] case=%s ' "$run_mode" "$case_id"
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+    return 0
   fi
 
-  for scen in "${SCENARIOS[@]}"; do
-    # shellcheck disable=SC2086
-    read -r name input_len output_len num_prompts <<< "$scen"
-    local out="$CUR_RESULTS_DIR/${mode}_${name}.txt"
-    echo ">>> [$mode] scenario=$name input=$input_len output=$output_len num=$num_prompts"
-    run_bench "$port" "$input_len" "$output_len" "$num_prompts" "$out" || \
-      echo "  (bench failed for $name)"
-  done
-
-  kill "$pid" 2>/dev/null || true
-  pkill -P "$pid" 2>/dev/null || true
-  wait 2>/dev/null || true
-  sleep 5
+  echo ">>> [$run_mode] $case_id input=$input_len output=$output_len prompts=$num_prompts rate=$rate"
+  "${cmd[@]}" > "$out_file" 2>&1
 }
 
-print_summary_for_model() {
-  echo
-  echo "================================================================"
-  echo "Comparison: REAL vs SIM — $(basename "$CUR_MODEL")"
-  echo "  hw         = $HW"
-  echo "  TP         = $TP  (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
-  echo "  prefix     = $PREFIX_CACHE"
-  echo "  eager      = $ENFORCE_EAGER"
-  echo "  ep         = $ENABLE_EP"
-  echo "  warmups    = $NUM_WARMUPS"
-  echo "  max_seqs   = $MAX_NUM_SEQS"
-  echo "  max_btoks  = $MAX_BATCH_TOKENS"
-  echo "================================================================"
-  printf "%-15s %12s %12s %8s    %12s %12s %8s\n" \
-    "scenario" "real_TTFT" "sim_TTFT" "gap%" "real_TPOT" "sim_TPOT" "gap%"
-  echo "--------------------------------------------------------------------"
-  for scen in "${SCENARIOS[@]}"; do
-    read -r name _ <<< "$scen"
-    real_ttft=$(extract_metric "$CUR_RESULTS_DIR/real_${name}.txt" "TTFT (ms)")
-    sim_ttft=$(extract_metric "$CUR_RESULTS_DIR/sim_${name}.txt" "TTFT (ms)")
-    real_tpot=$(extract_metric "$CUR_RESULTS_DIR/real_${name}.txt" "TPOT (ms)")
-    sim_tpot=$(extract_metric "$CUR_RESULTS_DIR/sim_${name}.txt" "TPOT (ms)")
-    if [ -z "$real_ttft" ] || [ -z "$sim_ttft" ]; then
-      printf "%-15s %12s %12s %8s    %12s %12s %8s\n" \
-        "$name" "${real_ttft:-MISS}" "${sim_ttft:-MISS}" "-" "${real_tpot:-MISS}" "${sim_tpot:-MISS}" "-"
+write_metrics() {
+  local case_id=$1 suite=$2
+  local case_dir="$OUT_ROOT/$suite/$case_id"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    return 0
+  fi
+  python3 "$SCRIPT_DIR/_extract_metrics.py" \
+    --case-id "$case_id" --group "$suite" --case-dir "$case_dir" \
+    > "$case_dir/metrics.json" 2> "$case_dir/metrics.err" || \
+    echo "WARN: metrics extract failed for $case_id (see $case_dir/metrics.err)"
+}
+
+run_group_mode() {
+  local run_mode=$1 server_key=$2 port=$3
+  local first_line=""
+  local line
+  for line in "${CASE_LINES[@]}"; do
+    IFS=$'\037' read -r key _rest <<< "$line"
+    if [ "$key" = "$server_key" ]; then
+      first_line="$line"
+      break
+    fi
+  done
+  if [ -z "$first_line" ]; then
+    return 0
+  fi
+
+  IFS=$'\037' read -r _key _case_id suite model_path tp _ep hint mode _conc _np _nw _rate _i _o prefix chunked ep_on max_len max_seqs max_btoks gpu_mem <<< "$first_line"
+  local model_short
+  model_short="$(basename "$model_path")"
+  local server_dir="$OUT_ROOT/$suite/__server_logs"
+  mkdir -p "$server_dir"
+  local log="$server_dir/${run_mode}_${model_short}_tp${tp}_${hint}_${mode}.log"
+
+  echo ">>> starting $run_mode server: suite=$suite model=$model_short tp=$tp hint=$hint mode=$mode port=$port"
+  local pid=""
+  if [ "$DRY_RUN" -eq 1 ]; then
+    start_server "$run_mode" "$model_path" "$tp" "$hint" "$mode" "$prefix" "$chunked" "$ep_on" "$max_len" "$max_seqs" "$max_btoks" "$gpu_mem" "$port" "$log"
+  else
+    pid=$(start_server "$run_mode" "$model_path" "$tp" "$hint" "$mode" "$prefix" "$chunked" "$ep_on" "$max_len" "$max_seqs" "$max_btoks" "$gpu_mem" "$port" "$log")
+    echo ">>> waiting for $run_mode server ready (max 240s)..."
+    if ! wait_ready "$port" "$pid" 240; then
+      echo "ERROR: $run_mode server failed to start"
+      tail -50 "$log" || true
+      kill -9 "$pid" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  for line in "${CASE_LINES[@]}"; do
+    IFS=$'\037' read -r key case_id suite model_path _tp _ep _hint _mode _conc num_prompts num_warmups rate input_len output_len _prefix _chunked _ep_on _max_len _max_seqs _max_btoks _gpu_mem <<< "$line"
+    if [ "$key" != "$server_key" ]; then
       continue
     fi
-    ttft_gap=$(awk "BEGIN { printf \"%.1f\", ($sim_ttft - $real_ttft) / $real_ttft * 100 }" 2>/dev/null || echo "-")
-    tpot_gap=$(awk "BEGIN { printf \"%.1f\", ($sim_tpot - $real_tpot) / $real_tpot * 100 }" 2>/dev/null || echo "-")
-    printf "%-15s %12s %12s %7s%%    %12s %12s %7s%%\n" \
-      "$name" "$real_ttft" "$sim_ttft" "$ttft_gap" "$real_tpot" "$sim_tpot" "$tpot_gap"
+    run_bench_case "$run_mode" "$port" "$case_id" "$suite" "$model_path" "$num_prompts" "$num_warmups" "$rate" "$input_len" "$output_len" || \
+      echo "WARN: bench failed for $run_mode $case_id"
   done
-  echo "--------------------------------------------------------------------"
-  echo "raw results: $CUR_RESULTS_DIR"
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    kill "$pid" 2>/dev/null || true
+    pkill -P "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    sleep 5
+  fi
 }
 
-# ===== main loop: 每个模型独立 server pair + 独立 summary =====
-IFS=',' read -ra MODEL_LIST <<< "$MODELS"
-echo "Will benchmark ${#MODEL_LIST[@]} model(s):"
-for m in "${MODEL_LIST[@]}"; do
-  echo "  - $m"
+mapfile -t SERVER_KEYS < <(printf '%s\n' "${CASE_LINES[@]}" | awk -F $'\037' '{print $1}' | sort -u)
+
+echo ">>> cases=${#CASE_LINES[@]} server_groups=${#SERVER_KEYS[@]} out=$OUT_ROOT dry_run=$DRY_RUN"
+
+for key in "${SERVER_KEYS[@]}"; do
+  run_group_mode real "$key" 8810
+  run_group_mode sim "$key" 8811
 done
 
-for m in "${MODEL_LIST[@]}"; do
-  m="$(echo "$m" | xargs)"   # trim spaces
-  [ -z "$m" ] && continue
-  echo
-  echo "==================== model: $(basename "$m") ===================="
-  set_for_model "$m"
-  run_all real 8810
-  run_all sim 8811
-  print_summary_for_model
+for line in "${CASE_LINES[@]}"; do
+  IFS=$'\037' read -r _key case_id suite _rest <<< "$line"
+  write_metrics "$case_id" "$suite"
 done
 
-echo
-echo "ALL DONE. results root: $RESULTS_DIR_ROOT"
+echo ">>> done. results: $OUT_ROOT"

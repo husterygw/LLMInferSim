@@ -171,7 +171,7 @@ def test_shape_analysis_prints_eager_graph_pair_delta(tmp_path: Path):
     assert "40.000" in result.stdout
 
 
-def test_all_marks_non_gemm_as_unsupported_formula(tmp_path: Path):
+def test_all_marks_non_gemm_as_unsupported_roofline(tmp_path: Path):
     partition = tmp_path / "operator_db" / "RTX_4090" / "vllm-0.19.1"
     _write_jsonl(partition / "gemm.jsonl", [_gemm_record()])
     _write_jsonl(partition / "attention.jsonl", [_attention_record()])
@@ -179,9 +179,9 @@ def test_all_marks_non_gemm_as_unsupported_formula(tmp_path: Path):
 
     result = _run_report(tmp_path, "--op-kind", "all", "--csv", str(csv_path))
 
-    assert "unsupported_formula: attention=1" in result.stdout
+    assert "unsupported_roofline: attention=1" in result.stdout
     rows = list(csv.DictReader(csv_path.open()))
     by_kind = {row["op_kind"]: row for row in rows}
     assert by_kind["gemm"]["status"] == "ok"
-    assert by_kind["attention"]["status"] == "unsupported_formula"
+    assert by_kind["attention"]["status"] == "unsupported_roofline"
     assert by_kind["attention"]["roofline_us"] == ""

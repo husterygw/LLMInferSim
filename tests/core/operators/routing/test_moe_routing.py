@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from llm_infer_sim.core.operators.routing import (
+from llm_infer_sim.core.operators import (
     MoERoutingProfile,
     estimate_distinct_experts,
 )

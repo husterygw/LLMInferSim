@@ -66,6 +66,28 @@ def _decode(n: int, ctx: int) -> GlobalStepWorkload:
     )
 
 
+def _mixed(isl: int, decode_n: int, decode_ctx: int) -> GlobalStepWorkload:
+    """Mixed step: 1 个 prefill seq + decode_n 个 decode token."""
+    requests = [
+        RequestWorkload(
+            request_id="p", phase=StepPhase.PREFILL,
+            num_tokens=isl, context_len=0,
+        ),
+    ] + [
+        RequestWorkload(
+            request_id=f"d{i}", phase=StepPhase.DECODE,
+            num_tokens=1, context_len=decode_ctx,
+        )
+        for i in range(decode_n)
+    ]
+    return GlobalStepWorkload(
+        step_id=2, phase=StepPhase.MIXED, requests=requests,
+        num_prefill_tokens=isl, num_decode_tokens=decode_n,
+        total_scheduled_tokens=isl + decode_n,
+        num_prefill_requests=1, num_decode_requests=decode_n,
+    )
+
+
 @pytest.fixture
 def engine() -> StepCostEngine:
     return build_qwen_dense_roofline_engine(
@@ -123,10 +145,13 @@ def test_gemm_entries_carry_required_metadata(engine):
 
 
 def test_prefill_op_count_matches_template(engine):
-    """1 embedding + 36 × 11 per-layer + 1 lm_head = 398 ops (无 collective 跳过)."""
+    """1 embedding + 36 × 11 per-layer + 1 lm_head = 398 ops (无 collective 跳过).
+
+    Grouped trace: entries 折叠到 13, 但 entry.metadata['count'] 之和 == 398.
+    """
     trace = engine.estimate(_prefill(isl=128))
     expected = 1 + 36 * 11 + 1
-    assert len(trace.entries) == expected
+    assert sum(e.metadata.get("count", 1) for e in trace.entries) == expected
 
 
 def test_decode_total_latency_smaller_than_prefill_for_same_isl():
@@ -214,8 +239,30 @@ def test_to_report_dict_smoke(engine):
     assert isinstance(d["entries"], list)
     assert all("source" in e and "op_kind" in e for e in d["entries"])
     # 顶层 dense GEMM 应该是 compute-bound, attention 也是
+    # Grouped trace: each entry 含 count, GEMM compute-bound count 之和 ≥ num_layers
     gemm_compute = sum(
-        1 for e in d["entries"]
+        e["metadata"].get("count", 1) for e in d["entries"]
         if e["op_kind"] == "gemm" and e["metadata"]["bottleneck"] == "compute"
     )
     assert gemm_compute >= 36  # 至少 num_layers 个 GEMM 是 compute-bound (large ISL)
+
+
+def test_mixed_phase_smoke(engine):
+    """#156: 删 full path 后, Qwen grouped 必须自承担 mixed phase (走 mixed_attention 拆 2 op).
+
+    无 fallback, engine 不应抛.
+    """
+    wl = _mixed(isl=128, decode_n=4, decode_ctx=256)
+    trace = engine.estimate(wl)
+    assert trace.total_latency_s > 0
+    assert trace.bottleneck in ("compute", "memory")
+    # attention block 含 2 个 attn op (mixed_prefill + mixed_decode), 每个都 count=num_layers
+    attn_entries = [
+        e for e in trace.entries
+        if e.op_kind == "attention" and e.metadata.get("count", 1) == 36
+    ]
+    assert len(attn_entries) == 2, (
+        f"mixed 应有 2 个 attention group (prefill + decode segment), got {len(attn_entries)}"
+    )
+    subtypes = {e.op_subtype for e in attn_entries}
+    assert subtypes == {"mixed_prefill", "mixed_decode"}

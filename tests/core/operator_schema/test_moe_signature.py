@@ -12,8 +12,8 @@ from llm_infer_sim.core.operator_schema.moe import (
     moe_case_params_to_signature,
     moe_virtual_op_to_signature,
 )
-from llm_infer_sim.core.operators.ops import FusedMoeOp
-from llm_infer_sim.core.operators.specs import OperatorFormula
+from llm_infer_sim.core.operators import FusedMoE
+from llm_infer_sim.core.operators.base import RooflineSpec
 
 
 _CTX = dict(framework="vllm", framework_version="0.20.1", kernel_source="vllm_fused_moe")
@@ -30,22 +30,31 @@ def _moe_case(routing="balanced", alpha=0.0, tp=1, ep=4, mode="eager"):
     }
 
 
+def _moe_ctx(tp=1, ep=4, mode="eager"):
+    from llm_infer_sim.core.operators.context import build_operator_context
+    from llm_infer_sim.core.profiles.deploy import DeployConfig
+    from llm_infer_sim.core.profiles.hardware import get_hardware_profile
+    from llm_infer_sim.core.profiles.model_config import ModelConfig
+    return build_operator_context(
+        ModelConfig(),
+        DeployConfig(
+            tp_size=tp, ep_size=ep, execution_mode=mode,
+            backend="vllm", backend_version="0.20.1",
+        ),
+        get_hardware_profile("RTX_4090"),
+    )
+
+
 def _moe_op(routing="balanced", alpha=0.0, tp=1, ep=4, mode="eager"):
-    return FusedMoeOp(
-        name="layer0_fused_moe", op_kind="moe", op_subtype="fused_moe",
-        phase="prefill", layer_idx=0, dtype="bf16",
-        shape_fields={
-            "num_tokens": 128, "hidden": 2048,
-            "moe_intermediate": 768, "topk": 8, "num_experts": 128,
-            "routing_distribution": routing,
-            "power_law_alpha": alpha,
-        },
-        parallel_fields={"tp": tp, "ep": ep},
-        runtime_fields={
-            "framework": "vllm", "framework_version": "0.20.1",
-            "execution_mode": mode, "kernel_source": "vllm_fused_moe",
-        },
-        formula_value=OperatorFormula(flops=1, op_category="matmul"),
+    return FusedMoE(
+        name="fused_moe", op_subtype="fused_moe",
+        phase="prefill", layer_idx=0,
+        num_tokens=128, hidden=2048,
+        moe_intermediate=768, topk=8, num_experts=128,
+        routing_distribution=routing,
+        power_law_alpha=alpha,
+        ctx=_moe_ctx(tp=tp, ep=ep, mode=mode),
+        roofline_spec_value=RooflineSpec(flops=1, op_category="matmul"),
     )
 
 

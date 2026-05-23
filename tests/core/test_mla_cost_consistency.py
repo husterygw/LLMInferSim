@@ -1,6 +1,6 @@
 """MLA cost 公式手算 vs actual 对照 (V3 §4.1.4 + DeepSeekModelTemplate).
 
-链路: DeepSeekModelTemplate._build_mla_attn_block + DenseOpFactory.linear() + AttentionOpFactory.mla_attention.
+链路: DeepSeekModelTemplate._build_mla_attn_block 直接构造 GEMM (q/kv proj) + Attention (MLA).
 
 覆盖 5 个 MLA 核心 op 公式 (DeepSeek-V3 tp=8 decode tokens=1):
   1. q_a_proj:           h → q_lora_rank
@@ -85,7 +85,7 @@ def _layer_ops(model: ModelConfig, deploy: DeployConfig, *,
             num_decode_requests=tokens,
         )
     step = StepShape.from_workload(wl, deploy)
-    return engine.template._build_mla_attn_block(layer_idx, step, engine.factories)
+    return engine.template._build_mla_attn_block(layer_idx, step)
 
 
 def _chunked_prefill_layer_ops(model, deploy, *, current_tokens, total_ctx, layer_idx=0):
@@ -102,7 +102,7 @@ def _chunked_prefill_layer_ops(model, deploy, *, current_tokens, total_ctx, laye
         num_prefill_requests=1,
     )
     step = StepShape.from_workload(wl, deploy)
-    return engine.template._build_mla_attn_block(layer_idx, step, engine.factories)
+    return engine.template._build_mla_attn_block(layer_idx, step)
 
 
 def _find_by_subtype(ops, subtype):
@@ -146,7 +146,7 @@ def test_q_a_proj_handcheck():
     ops = _layer_ops(m, deploy, tokens=tokens, phase="decode")
     op = _find_by_subtype(ops, "q_a_proj")
     expected = 2 * tokens * m.hidden_dim * m.q_lora_rank
-    assert op.formula().flops == expected   # 2*1*7168*1536 = 22,020,096
+    assert op.roofline_spec().flops == expected   # 2*1*7168*1536 = 22,020,096
 
 
 def test_q_b_proj_handcheck():
@@ -158,7 +158,7 @@ def test_q_b_proj_handcheck():
     heads_per_tp = m.num_heads // deploy.tp_size
     q_head_dim = m.qk_nope_head_dim + m.rope_head_dim
     expected = 2 * tokens * m.q_lora_rank * heads_per_tp * q_head_dim
-    assert op.formula().flops == expected   # 2*1*1536*16*192 = 9,437,184
+    assert op.roofline_spec().flops == expected   # 2*1*1536*16*192 = 9,437,184
 
 
 def test_kv_a_proj_with_mqa_handcheck():
@@ -169,7 +169,7 @@ def test_kv_a_proj_with_mqa_handcheck():
     op = _find_by_subtype(ops, "kv_a_proj_with_mqa")
     expected_oc = m.kv_lora_rank + m.rope_head_dim
     expected_flops = 2 * tokens * m.hidden_dim * expected_oc
-    f = op.formula()
+    f = op.roofline_spec()
     assert f.flops == expected_flops   # 2*1*7168*576 = 8,257,536
     # 输出在 KV cache, 不在 activation
     assert f.store_kv_cache > 0
@@ -185,7 +185,7 @@ def test_kv_b_proj_handcheck():
     heads_per_tp = m.num_heads // deploy.tp_size
     expected_oc = heads_per_tp * (m.qk_nope_head_dim + m.v_head_dim)
     expected_flops = 2 * tokens * m.kv_lora_rank * expected_oc
-    f = op.formula()
+    f = op.roofline_spec()
     assert f.flops == expected_flops   # 2*1*512*16*(128+128) = 4,194,304
     assert f.store_act > 0
     assert f.store_kv_cache == 0
@@ -200,10 +200,10 @@ def test_o_proj_uses_v_head_dim_not_head_dim():
     heads_per_tp = m.num_heads // deploy.tp_size
     expected_ic = heads_per_tp * m.v_head_dim
     expected_flops = 2 * tokens * expected_ic * m.hidden_dim
-    assert op.formula().flops == expected_flops    # 2*1*16*128*7168 = 29,360,128
+    assert op.roofline_spec().flops == expected_flops    # 2*1*16*128*7168 = 29,360,128
     # 防御: 用错 head_dim=56, flops 会差 ~2.3×
     wrong_flops = 2 * tokens * heads_per_tp * m.head_dim * m.hidden_dim
-    assert op.formula().flops != wrong_flops
+    assert op.roofline_spec().flops != wrong_flops
 
 
 # ---- q_lora_rank == 0 路径 ----
@@ -227,7 +227,7 @@ def test_total_attn_proj_flops_significantly_higher_than_pre_fix():
     m, deploy = _deepseek_v3()
     ops = _layer_ops(m, deploy, tokens=1, phase="decode")
     subtypes = ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj")
-    total = sum(_find_by_subtype(ops, s).formula().flops for s in subtypes)
+    total = sum(_find_by_subtype(ops, s).roofline_spec().flops for s in subtypes)
     assert total > 70e6
     assert total < 80e6
 
@@ -239,7 +239,7 @@ def test_mla_prefill_new_token_does_not_read_kv_cache():
     m, deploy = _deepseek_v3(tp=8)
     ops = _layer_ops(m, deploy, tokens=128, phase="prefill")
     attn = next(op for op in ops if op.op_kind == "attention")
-    assert attn.formula().load_kv_cache == 0
+    assert attn.roofline_spec().load_kv_cache == 0
 
 
 def test_mla_prefill_kv_staging_in_load_act_not_kv_cache():
@@ -251,7 +251,7 @@ def test_mla_prefill_kv_staging_in_load_act_not_kv_cache():
     qk_dim = m.qk_nope_head_dim + m.rope_head_dim
     v_dim = m.v_head_dim
     min_staging = int(128 * (qk_dim + v_dim) * 1 * heads_per_tp * A_BYTE)
-    assert attn.formula().load_act >= min_staging
+    assert attn.roofline_spec().load_act >= min_staging
 
 
 def test_mla_prefill_chunked_reads_c_kv_cache():
@@ -262,7 +262,7 @@ def test_mla_prefill_chunked_reads_c_kv_cache():
     # prior_ctx = 896, c_kv 维 = kv_latent_dim = 576
     expected_min = int(896 * 576 * 1 * 2.0 * 0.5)
     expected_max = int(896 * 576 * 1 * 2.0 * 2.0)
-    assert expected_min <= attn.formula().load_kv_cache <= expected_max
+    assert expected_min <= attn.roofline_spec().load_kv_cache <= expected_max
 
 
 def test_mla_prefill_kv_io_far_smaller_than_pre_fix():
@@ -274,20 +274,20 @@ def test_mla_prefill_kv_io_far_smaller_than_pre_fix():
     qk_dim = m.qk_nope_head_dim + m.rope_head_dim
     v_dim = m.v_head_dim
     old_bug_io = 128 * (qk_dim + v_dim) * heads_per_tp * 2.0
-    assert attn.formula().load_kv_cache * 100 < old_bug_io
+    assert attn.roofline_spec().load_kv_cache * 100 < old_bug_io
 
 
 def test_mla_uses_dedicated_op_not_generic_fused_attention():
-    """MLA 应该用 dedicated attention path: name endswith '_mla_attention' + tags 含 'mla'."""
+    """MLA 应该用 dedicated attention path: name='mla_attention' + tags 含 'mla'."""
     m, deploy = _deepseek_v3(tp=8)
     ops_dec = _layer_ops(m, deploy, tokens=1, phase="decode")
     attn_dec = next(op for op in ops_dec if op.op_kind == "attention")
-    assert attn_dec.name.endswith("_mla_attention")
+    assert attn_dec.name == "mla_attention"
     assert "mla" in attn_dec.tags
 
     ops_pre = _layer_ops(m, deploy, tokens=128, phase="prefill")
     attn_pre = next(op for op in ops_pre if op.op_kind == "attention")
-    assert attn_pre.name.endswith("_mla_attention")
+    assert attn_pre.name == "mla_attention"
     assert "mla" in attn_pre.tags
 
 
@@ -314,7 +314,7 @@ def test_non_mla_prefill_kv_io_unchanged():
         num_prefill_requests=1,
     )
     step = StepShape.from_workload(wl, deploy)
-    plan = engine.template.build_step(step, engine.factories)
+    plan = engine.template.build_grouped_step(step)
     attn = next(op for op in plan.ops if op.op_kind == "attention" and op.layer_idx == 0)
     # GQA flash: kv_io = n_blocks_r × seqlen × head_dim × num_kv_heads × kv_byte × 2 > 0
-    assert attn.formula().load_kv_cache > 0
+    assert attn.roofline_spec().load_kv_cache > 0

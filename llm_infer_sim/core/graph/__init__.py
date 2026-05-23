@@ -1,8 +1,9 @@
-"""Graph 层 — V3 §4.2 + §4.4: StepShape / StepOpPlan.
+"""Graph 层 — V3 §4.2 + §4.4: StepShape / StepOpPlan / GroupedStepPlan.
 
 Operator 协议在 llm_infer_sim.core.operators (V3 §4.3).
 """
+from llm_infer_sim.core.graph.grouped_plan import GroupedOperator, GroupedStepPlan
 from llm_infer_sim.core.graph.step_plan import StepOpPlan
 from llm_infer_sim.core.graph.step_shape import StepShape
 
-__all__ = ["StepShape", "StepOpPlan"]
+__all__ = ["StepShape", "StepOpPlan", "GroupedOperator", "GroupedStepPlan"]
