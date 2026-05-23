@@ -131,6 +131,17 @@ class VirtualModelRunner:
 
         cost = self._estimate_cost(workload)
 
+        # ---- vLLM framework overhead on prefill steps (HTTP/scheduler/tokenize) ----
+        # Roofline doesn't capture per-request CPU overhead in the vLLM stack.
+        # Apply only when this step contains prefill work.
+        prefill_oh = self.bundle.deploy.prefill_worker_overhead_s
+        if prefill_oh > 0 and workload.num_prefill_requests > 0:
+            cost = dataclasses.replace(
+                cost,
+                total_latency_s=cost.total_latency_s + prefill_oh,
+                runtime_time_s=cost.runtime_time_s + prefill_oh,
+            )
+
         # ---- KV block allocator: 跟踪每 step alloc/free/dedup ----
         block_stats = self._step_block_allocator(
             scheduler_output, workload.num_prefix_cached_tokens

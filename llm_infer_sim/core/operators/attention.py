@@ -118,21 +118,28 @@ class Attention:
     ) -> "Attention":
         """FlashAttention prefill: causal attention on seqlen × seqlen, per-batch.
 
-        n_q / n_kv 已 / TP. flops = QK + SV + softmax; KV IO 按 FlashAttn tiling 估.
+        n_q / n_kv 已 / TP. flops = QK + SV + softmax (causal ×0.5);
+        KV IO 按 FlashAttn-2 tiling 估 (SRAM 需容纳 Q+K+V+O 四 tile).
         """
         a_byte = ctx.a_byte
         kv_byte = ctx.kv_byte
         onchip = ctx.hw.onchip_buffer
+        # causal mask: effective pairs ≈ seqlen*(seqlen+1)/2
+        causal_factor = (seqlen + 1) / (2 * seqlen)
         flops = (
             seqlen * seqlen * head_dim * n_q * bs * 2          # Q @ K^T
             + seqlen * head_dim * seqlen * n_q * bs * 2        # softmax @ V
             + bs * n_q * seqlen * seqlen * 5                   # softmax
-        )
-        block_size_r = min(math.ceil(onchip / (kv_byte * head_dim)), head_dim)
+        ) * causal_factor
+        # FA-2 tiling: SRAM holds Q tile + K tile + V tile + O accum (4 buffers)
+        block_size_r = min(math.ceil(onchip / (4 * kv_byte * head_dim)), head_dim)
         n_blocks_r = math.ceil(seqlen / block_size_r)
         q_numel = seqlen * head_dim * bs * n_q * a_byte
         o_numel = seqlen * head_dim * bs * n_q * a_byte
-        kv_io = int(n_blocks_r * seqlen * head_dim * bs * n_kv * kv_byte * 2)
+        # causal: Q block i reads KV blocks 0..i, total ≈ full × (Tr+1)/(2·Tr)
+        kv_causal_factor = (n_blocks_r + 1) / (2 * n_blocks_r)
+        kv_io = int(n_blocks_r * seqlen * head_dim * bs * n_kv * kv_byte * 2
+                    * kv_causal_factor)
         spec = RooflineSpec(
             op_category="attention",
             flops=int(flops),
@@ -175,7 +182,8 @@ class Attention:
             + head_dim * ctx_len * n_q * bs * 2
             + bs * n_q * ctx_len * 5
         )
-        block_size_r = min(math.ceil(onchip / (kv_byte * head_dim)), head_dim)
+        # FA-2 tiling: SRAM holds Q tile + K tile + V tile + O accum (4 buffers)
+        block_size_r = min(math.ceil(onchip / (4 * kv_byte * head_dim)), head_dim)
         n_blocks_r = math.ceil(1 / block_size_r)
         q_numel = head_dim * bs * n_q * a_byte
         o_numel = head_dim * bs * n_q * a_byte
@@ -221,16 +229,22 @@ class Attention:
         a_byte = ctx.a_byte
         kv_byte = ctx.kv_byte
         onchip = ctx.hw.onchip_buffer
-        qk_ops = seqlen * seqlen * qk_head_dim * heads_per_tp * bs * 2
-        sv_ops = seqlen * v_dim * seqlen * heads_per_tp * bs * 2
-        softmax_ops = bs * heads_per_tp * seqlen * seqlen * 5
+        # causal mask: effective pairs ≈ seqlen*(seqlen+1)/2
+        causal_factor = (seqlen + 1) / (2 * seqlen)
+        qk_ops = seqlen * seqlen * qk_head_dim * heads_per_tp * bs * 2 * causal_factor
+        sv_ops = seqlen * v_dim * seqlen * heads_per_tp * bs * 2 * causal_factor
+        softmax_ops = bs * heads_per_tp * seqlen * seqlen * 5 * causal_factor
 
-        block_size_r = min(math.ceil(onchip / (kv_byte * qk_head_dim)), qk_head_dim)
+        # FA-2 tiling: SRAM holds Q tile + K tile + V tile + O accum (4 buffers)
+        block_size_r = min(math.ceil(onchip / (4 * kv_byte * qk_head_dim)), qk_head_dim)
         n_blocks_r = math.ceil(seqlen / block_size_r)
         q_numel = seqlen * qk_head_dim * bs * heads_per_tp * a_byte
         o_numel = seqlen * v_dim * bs * heads_per_tp * a_byte
+        # causal: Q block i reads KV blocks 0..i, staging act scales similarly
+        kv_causal_factor = (n_blocks_r + 1) / (2 * n_blocks_r)
         kv_staging_act = int(
             n_blocks_r * seqlen * (qk_head_dim + v_dim) * bs * heads_per_tp * a_byte
+            * kv_causal_factor
         )
         prior_ctx = max(0, ctx_len - seqlen)
         kv_io = int(prior_ctx * kv_latent_dim * bs * kv_byte) if prior_ctx > 0 else 0
@@ -279,7 +293,8 @@ class Attention:
         sv_ops = 1 * _sv * ctx_len * heads_per_tp * bs * 2
         softmax_ops = bs * heads_per_tp * ctx_len * 1 * 5
 
-        block_size_r = min(math.ceil(onchip / (kv_byte * _qk)), _qk)
+        # FA-2 tiling: SRAM holds Q tile + K tile + V tile + O accum (4 buffers)
+        block_size_r = min(math.ceil(onchip / (4 * kv_byte * _qk)), _qk)
         n_blocks_r = math.ceil(1 / block_size_r)
         q_numel = 1 * _qk * bs * heads_per_tp * a_byte
         o_numel = 1 * _sv * bs * heads_per_tp * a_byte
@@ -335,7 +350,8 @@ class Attention:
         sv_ops = int(attended_sum * v_dim * heads_per_tp * bs * 2)
         softmax_ops = int(bs * heads_per_tp * attended_sum * 5)
 
-        block_size_r = min(math.ceil(onchip / (kv_byte * qk_head_dim)), qk_head_dim)
+        # FA-2 tiling: SRAM holds Q tile + K tile + V tile + O accum (4 buffers)
+        block_size_r = min(math.ceil(onchip / (4 * kv_byte * qk_head_dim)), qk_head_dim)
         n_blocks_r = math.ceil(seqlen / block_size_r)
         q_numel = seqlen * qk_head_dim * bs * heads_per_tp * a_byte
         o_numel = seqlen * v_dim * bs * heads_per_tp * a_byte
@@ -394,7 +410,8 @@ class Attention:
         sv_ops = 1 * _sv * attended * heads_per_tp * bs * 2
         softmax_ops = bs * heads_per_tp * attended * 1 * 5
 
-        block_size_r = min(math.ceil(onchip / (kv_byte * _qk)), _qk)
+        # FA-2 tiling: SRAM holds Q tile + K tile + V tile + O accum (4 buffers)
+        block_size_r = min(math.ceil(onchip / (4 * kv_byte * _qk)), _qk)
         n_blocks_r = math.ceil(1 / block_size_r)
         q_numel = 1 * _qk * bs * heads_per_tp * a_byte
         o_numel = 1 * _sv * bs * heads_per_tp * a_byte

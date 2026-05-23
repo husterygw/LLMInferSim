@@ -96,5 +96,10 @@ class DeployConfig:
     backend: str = "vllm"
     backend_version: str | None = None
 
+    # vLLM framework constant overhead on prefill steps (HTTP entry / scheduler
+    # dispatch / tokenize / Python stack). Roofline doesn't model these; observed
+    # ~5-8ms per prefill step on RTX_4090 + Qwen3-4B short-isl baselines.
+    prefill_worker_overhead_s: float = 0.005
+
     # V3 §4.6 minimal 之外的可选扩展 (PD disaggregation, 详设 §7.6)
     pd: PDDisaggConfig | None = None
