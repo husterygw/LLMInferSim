@@ -1,8 +1,11 @@
 """QwenModelGraphTemplate — #158 ctx-based.
 
-阶段 1: Qwen3 dense, 每层:
+阶段 1: Qwen3 dense TP=1, 每层:
     attn_norm → qkv_proj → rope → attention → o_proj → attn_add
         → mlp_norm → gate_up_proj → mlp_act → down_proj → mlp_add
+
+TP>1 时 dense path 在 o_proj / down_proj 后追加 row-parallel allreduce:
+    tp_o_proj_allreduce / tp_down_proj_allreduce
 
 阶段 3a: Qwen3 MoE (e.g. Qwen3-30B-A3B), MoE 层把 FFN 部分换成:
     mlp_norm → moe_gate
@@ -238,13 +241,13 @@ class QwenModelGraphTemplate:
         step: StepShape,
         ctx: OperatorContext,
     ) -> list[Operator]:
-        """attn_norm → qkv → rope → attention → o → attn_add. Qwen3 dense+MoE 共用."""
+        """attn_norm → qkv → rope → attention → o → [tp_ar] → attn_add."""
         tokens = step.total_tokens
         phase = step.phase
         tp = ctx.tp_size
         n_q = self.model.num_heads // tp
         n_kv = self.model.num_kv_heads // tp
-        return [
+        ops: list[Operator] = [
             Norm(
                 name="attn_norm", op_subtype="attn_norm",
                 phase=phase, layer_idx=layer_idx,
@@ -272,12 +275,25 @@ class QwenModelGraphTemplate:
                 kernel_source="vllm_row_parallel_linear",
                 ctx=ctx,
             ),
+        ]
+        if tp > 1:
+            ops.append(make_collective(
+                kind="allreduce",
+                name="tp_o_proj_allreduce",
+                message_bytes=_comm_bytes_hidden(tokens, ctx),
+                phase=phase,
+                layer_idx=layer_idx,
+                world_size=tp,
+                ctx=ctx,
+            ))
+        ops.append(
             ElementWise(
                 name="attn_add", op_subtype="attn_add",
                 phase=phase, layer_idx=layer_idx,
                 tokens=tokens, hidden=self.model.hidden_dim, ctx=ctx,
             ),
-        ]
+        )
+        return ops
 
     def _build_dense_ffn_block(
         self,
@@ -285,10 +301,11 @@ class QwenModelGraphTemplate:
         step: StepShape,
         ctx: OperatorContext,
     ) -> list[Operator]:
-        """mlp_norm → gate_up → act → down → mlp_add."""
+        """mlp_norm → gate_up → act → down → [tp_ar] → mlp_add."""
         tokens = step.total_tokens
         phase = step.phase
-        return [
+        tp = ctx.tp_size
+        ops: list[Operator] = [
             Norm(
                 name="mlp_norm", op_subtype="mlp_norm",
                 phase=phase, layer_idx=layer_idx,
@@ -313,12 +330,25 @@ class QwenModelGraphTemplate:
                 kernel_source="vllm_row_parallel_linear",
                 ctx=ctx,
             ),
+        ]
+        if tp > 1:
+            ops.append(make_collective(
+                kind="allreduce",
+                name="tp_down_proj_allreduce",
+                message_bytes=_comm_bytes_hidden(tokens, ctx),
+                phase=phase,
+                layer_idx=layer_idx,
+                world_size=tp,
+                ctx=ctx,
+            ))
+        ops.append(
             ElementWise(
                 name="mlp_add", op_subtype="mlp_add",
                 phase=phase, layer_idx=layer_idx,
                 tokens=tokens, hidden=self.model.hidden_dim, ctx=ctx,
             ),
-        ]
+        )
+        return ops
 
     # ---- per-layer composition helpers (for tests / introspection) ----
 

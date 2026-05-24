@@ -13,7 +13,9 @@ from collector.schemas import Case, OpKind
 DEFAULT_PREFILL_ISLS: list[int] = [128, 512, 2048, 4096, 8192]
 DEFAULT_DECODE_BATCHES: list[int] = [1, 4, 16, 32]
 DEFAULT_DECODE_CTX_LENS: list[int] = [128, 512, 2048, 4096, 8192]
-DEFAULT_TP_SIZES: list[int] = [1]
+# TP shard 后每 rank 的 attention: num_heads 切, num_kv_heads 切 (GQA 不够分时复制).
+# 单 GPU 直接跑切分后的 head 数, 不需要多 GPU runner.
+DEFAULT_TP_SIZES: list[int] = [1, 2, 4, 8]
 DEFAULT_DTYPES: list[str] = ["bf16"]
 DEFAULT_EXECUTION_MODES: list[str] = ["eager", "cudagraph"]
 
@@ -37,29 +39,42 @@ def get_cases_for_profile(
     dtypes = dtypes or DEFAULT_DTYPES
     execution_modes = execution_modes or DEFAULT_EXECUTION_MODES
 
-    head_info = {
-        "num_heads": profile.num_heads,
-        "num_kv_heads": profile.num_kv_heads,
-        "head_dim": profile.head_dim,
-    }
     cases: list[Case] = []
+
+    def head_info_for_tp(tp: int) -> dict:
+        # TP shard: num_heads / tp 必整除; num_kv_heads 不够分时 GQA 复制 (per-rank ≥1).
+        # 不整除的 tp 跳过该 case (典型: Qwen3-4B kv=8 → tp ≤ 8 ok; tp=16 跳过).
+        if profile.num_heads % tp != 0:
+            return None
+        n_kv_per_rank = max(1, profile.num_kv_heads // tp)
+        return {
+            "num_heads": profile.num_heads // tp,
+            "num_kv_heads": n_kv_per_rank,
+            "head_dim": profile.head_dim,
+        }
 
     if include_prefill:
         for mode in execution_modes:
             for tp in tp_sizes:
+                hi = head_info_for_tp(tp)
+                if hi is None:
+                    continue
                 for dtype in dtypes:
                     for isl in prefill_isls:
                         cases.append(_attention_case(
                             "prefill",
                             batch_size=1, isl=isl, kv_prefill=0,
                             n_decode=0, kv_decode=0,
-                            dtype=dtype, tp=tp, head_info=head_info,
+                            dtype=dtype, tp=tp, head_info=hi,
                             execution_mode=mode,
                         ))
 
     if include_decode:
         for mode in execution_modes:
             for tp in tp_sizes:
+                hi = head_info_for_tp(tp)
+                if hi is None:
+                    continue
                 for dtype in dtypes:
                     for batch in decode_batches:
                         for ctx in decode_ctx_lens:
@@ -67,7 +82,7 @@ def get_cases_for_profile(
                                 "decode",
                                 batch_size=batch, isl=0, kv_prefill=0,
                                 n_decode=batch, kv_decode=ctx,
-                                dtype=dtype, tp=tp, head_info=head_info,
+                                dtype=dtype, tp=tp, head_info=hi,
                                 execution_mode=mode,
                             ))
 

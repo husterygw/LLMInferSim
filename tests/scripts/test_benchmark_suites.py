@@ -40,6 +40,7 @@ def test_single_tp1_roofline_suite_generation(tmp_path: Path):
     assert all(case["max_model_len"] == 8192 for case in cases)
     assert all(case["max_num_batched_tokens"] == 8192 for case in cases)
     assert all(case["max_num_seqs"] is None for case in cases)
+    assert all(case["num_gpu_blocks_override"] is None for case in cases)
 
 
 def test_batch_tp1_sweep_contains_expected_concurrency(tmp_path: Path):
@@ -101,6 +102,41 @@ def test_bench_compare_dry_run_prints_server_and_bench_commands(tmp_path: Path):
     assert "--no-enable-chunked-prefill" in result.stdout
     assert "--max-model-len 8192" in result.stdout
     assert "--max-num-seqs" not in result.stdout
+    assert "--num-gpu-blocks-override" not in result.stdout
+
+
+def test_bench_compare_dry_run_honors_explicit_num_gpu_blocks_override(tmp_path: Path):
+    case = {
+        "case_id": "debug_blocks",
+        "suite": "debug",
+        "model": "qwen3_4b",
+        "tp": 1,
+        "ep": 1,
+        "topology_hint": "concentrated",
+        "input_len": 128,
+        "output_len": 128,
+        "concurrency": 1,
+        "num_prompts": 1,
+        "request_rate": "inf",
+        "execution_mode": "cudagraph",
+        "prefix_cache": False,
+        "chunked_prefill": False,
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 8192,
+        "num_gpu_blocks_override": 512,
+    }
+
+    result = _run(
+        "bash",
+        "scripts/bench_compare.sh",
+        "--case-json",
+        json.dumps(case),
+        "--out",
+        str(tmp_path / "out"),
+        "--dry-run",
+    )
+
+    assert result.stdout.count("--num-gpu-blocks-override 512") == 2
 
 
 def test_run_bench_suite_legacy_alias_dry_run(tmp_path: Path):

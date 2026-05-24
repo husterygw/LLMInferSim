@@ -87,10 +87,8 @@ def _build_batch_spec(p: dict) -> BatchSpec:
 
 def run_case(case: Case, device: int) -> RawRecord:
     p = case.params
-    if p.get("tp", 1) != 1:
-        raise NotImplementedError(
-            f"vllm_attention runner: tp={p['tp']} 需 distributed runner, 本 runner 只 tp=1"
-        )
+    # TP>1: cases/attention.py 已经把 num_heads/num_kv_heads 切到 per-rank,
+    # 这里直接跑切分后的 shape (单 GPU 模拟 1 rank 的工作量), 不需要多 GPU runner.
     if p["dtype"] != "bf16":
         raise NotImplementedError(f"dtype={p['dtype']} not supported (BF16 only)")
 

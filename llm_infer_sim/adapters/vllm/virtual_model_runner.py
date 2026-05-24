@@ -120,6 +120,13 @@ class VirtualModelRunner:
         rank: int = 0,
     ) -> ModelRunnerOutput:
         num_tokens = scheduler_output.total_num_scheduled_tokens
+        new_count = len(scheduler_output.scheduled_new_reqs)
+        cached_count = len(scheduler_output.scheduled_cached_reqs.req_ids)
+        _log(
+            f"[debug-sched] step={step_id} total_tok={num_tokens} "
+            f"new_reqs={new_count} cached_reqs={cached_count} "
+            f"finished={len(scheduler_output.finished_req_ids)}"
+        )
         if num_tokens == 0:
             return self._empty_output()
 
@@ -162,6 +169,13 @@ class VirtualModelRunner:
                 )
 
         step_line = format_step_breakdown(cost)
+        step_line += (
+            f" | bs={workload.batch_size} "
+            f"prefill_req={workload.num_prefill_requests} "
+            f"prefill_tok={workload.num_prefill_tokens} "
+            f"decode_req={workload.num_decode_requests} "
+            f"decode_tok={workload.num_decode_tokens}"
+        )
         if workload.num_prefix_cached_tokens > 0:
             step_line += (
                 f" | cached={workload.num_prefix_cached_tokens} "

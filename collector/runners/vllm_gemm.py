@@ -82,12 +82,8 @@ def run_case(case: Case, device: int) -> RawRecord:
     """
     params = case.params
 
-    # 先检查 case.params['tp'] — 当前只支持 tp=1, 多卡走 distributed runner
-    if params.get("tp", 1) != 1:
-        raise NotImplementedError(
-            f"vllm_gemm runner: tp={params['tp']} 需要走 distributed runner, 本 runner 只 tp=1"
-        )
-
+    # TP>1: cases/gemm.py 已经把 n/k 切到 per-rank (qkv/gate_up 切 n, o/down 切 k),
+    # 这里直接跑切分后的 shape (单 GPU 模拟 1 rank 的工作量), 不需要多 GPU runner.
     # 当前只 bf16, 后续按 dtype 加 FP8 path
     dtype_str = params["dtype"]
     if dtype_str != "bf16":

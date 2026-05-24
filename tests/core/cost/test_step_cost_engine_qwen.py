@@ -205,10 +205,13 @@ def test_deploy_change_changes_parallel_metadata():
     t1 = engine_tp1.estimate(wl)
     t2 = engine_tp2.estimate(wl)
 
-    # latency 必然不同 (n 维 GEMM 减半)
+    # latency 必然不同: TP 改变 GEMM shape, 且 TP>1 现在会计入 allreduce.
     assert t1.total_latency_s != t2.total_latency_s
-    # tp=2 下 dense compute 减半, 总时间应明显 < tp=1
-    assert t2.total_latency_s < t1.total_latency_s
+    assert t1.comm_time_s == 0.0
+    assert t2.comm_time_s > 0.0
+    assert t2.compute_time_s < t1.compute_time_s
+    assert any(e.op_name == "tp_o_proj_allreduce" for e in t2.entries)
+    assert any(e.op_name == "tp_down_proj_allreduce" for e in t2.entries)
 
 
 def test_execution_mode_change_affects_kernel_overhead():

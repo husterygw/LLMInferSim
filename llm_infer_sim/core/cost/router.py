@@ -5,16 +5,15 @@
     roofline_only      -> 不查 DB, 全走 roofline (阶段 1 行为)
     require_operator_db-> 必须 hit, miss → 抛 LookupError
 
-阶段 5 引入 CommunicationRooflineBackend, 阶段 6 引入 ModuleProfileBackend,
-按 V3 §7.1 完整优先级排列.
-
-collective op 阶段 1-3 内默认跳过, 直到阶段 5 接通信 backend.
+阶段 6.1: collective op 走 CommunicationRooflineBackend; GEMM/attention/etc.
+仍按 OperatorDBBackend / RooflineBackend policy 处理.
 """
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
 
+from llm_infer_sim.core.cost.backends.communication import CommunicationRooflineBackend
 from llm_infer_sim.core.cost.backends.operator_db import OperatorDBBackend
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
@@ -41,10 +40,14 @@ class CostRouter:
         roofline: RooflineBackend,
         *,
         operator_db: OperatorDBBackend | None = None,
+        communication: CommunicationRooflineBackend | None = None,
         policy: CostPolicy | None = None,
     ):
         self.roofline = roofline
         self.operator_db = operator_db
+        self.communication = communication or CommunicationRooflineBackend(
+            roofline.hw, roofline.deploy,
+        )
         self.policy = policy or CostPolicy(
             mode="roofline_only" if operator_db is None else "operator_db_first",
             enable_operator_db=operator_db is not None,
@@ -53,15 +56,14 @@ class CostRouter:
     def estimate(self, plan: StepOpPlan) -> StepCostTrace:
         entries: list[CostTraceEntry] = []
         for op in plan.ops:
-            if op.op_kind == "collective":
-                continue   # 阶段 5 接 CommunicationRooflineBackend
             entry = self._estimate_op(op)
             entries.append(entry)
 
         total = sum(e.latency_s for e in entries)
         compute = sum(float(e.metadata.get("t_compute", 0.0)) for e in entries)
         memory = sum(float(e.metadata.get("t_memory", 0.0)) for e in entries)
-        bottleneck = "compute" if compute >= memory else "memory"
+        comm = sum(float(e.metadata.get("t_comm", 0.0)) for e in entries)
+        bottleneck = self._bottleneck(compute, memory, comm)
 
         return StepCostTrace(
             step_id=plan.step_id,
@@ -69,7 +71,7 @@ class CostRouter:
             total_latency_s=total,
             compute_time_s=compute,
             memory_time_s=memory,
-            comm_time_s=0.0,
+            comm_time_s=comm,
             runtime_time_s=0.0,
             entries=tuple(entries),
             bottleneck=bottleneck,
@@ -85,18 +87,24 @@ class CostRouter:
         total = 0.0
         compute = 0.0
         memory = 0.0
+        comm = 0.0
         for group in plan.groups:
             op = group.op
-            if op.op_kind == "collective":
-                continue
             base_entry = self._estimate_op(op)
             count = group.count
             scaled_latency = base_entry.latency_s * count
             scaled_compute = float(base_entry.metadata.get("t_compute", 0.0)) * count
             scaled_memory = float(base_entry.metadata.get("t_memory", 0.0)) * count
+            scaled_comm = float(base_entry.metadata.get("t_comm", 0.0)) * count
             new_md = dict(base_entry.metadata)
             new_md["count"] = count
             new_md["layer_indices"] = list(group.layer_indices)
+            if "t_compute" in new_md:
+                new_md["t_compute"] = scaled_compute
+            if "t_memory" in new_md:
+                new_md["t_memory"] = scaled_memory
+            if "t_comm" in new_md:
+                new_md["t_comm"] = scaled_comm
             display = (
                 f"{base_entry.op_name}[count={count}]"
                 if count > 1 else base_entry.op_name
@@ -116,20 +124,24 @@ class CostRouter:
             total += scaled_latency
             compute += scaled_compute
             memory += scaled_memory
-        bottleneck = "compute" if compute >= memory else "memory"
+            comm += scaled_comm
+        bottleneck = self._bottleneck(compute, memory, comm)
         return StepCostTrace(
             step_id=plan.step_id,
             phase=plan.phase,
             total_latency_s=total,
             compute_time_s=compute,
             memory_time_s=memory,
-            comm_time_s=0.0,
+            comm_time_s=comm,
             runtime_time_s=0.0,
             entries=tuple(entries),
             bottleneck=bottleneck,
         )
 
     def _estimate_op(self, op) -> CostTraceEntry:
+        if op.op_kind == "collective":
+            return self.communication.estimate(op)
+
         mode = self.policy.mode
 
         if mode == "roofline_only":
@@ -152,3 +164,12 @@ class CostRouter:
             return self.roofline.estimate(op)
 
         raise ValueError(f"unknown CostPolicy.mode: {mode!r}")
+
+    @staticmethod
+    def _bottleneck(compute: float, memory: float, comm: float) -> str:
+        values = {
+            "compute": compute,
+            "memory": memory,
+            "communication": comm,
+        }
+        return max(values, key=values.get)

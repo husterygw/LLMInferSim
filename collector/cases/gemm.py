@@ -18,7 +18,9 @@ from collector.schemas import Case, OpKind
 
 # 默认 sweep 维度. CLI 可 override.
 DEFAULT_M_VALUES: list[int] = [1, 4, 16, 32, 128, 512, 2048, 4096, 8192]
-DEFAULT_TP_SIZES: list[int] = [1]
+# TP shard 后每 rank 的 GEMM 是更小 shape (n // tp 或 k // tp 已在公式里).
+# 单 GPU 直接跑切分后的 shape, 不需要多 GPU runner.
+DEFAULT_TP_SIZES: list[int] = [1, 2, 4, 8]
 DEFAULT_DTYPES: list[str] = ["bf16"]
 # 跟 vLLM production 部署对齐: --enforce-eager (eager) 跟 V1 default (cudagraph) 两路.
 DEFAULT_EXECUTION_MODES: list[str] = ["eager", "cudagraph"]

@@ -86,6 +86,12 @@ def main() -> int:
         "group": args.group,
         "scenarios": [],
     }
+    meta_path = case_dir / "block_metadata.json"
+    if meta_path.exists():
+        try:
+            result.update(json.loads(meta_path.read_text()))
+        except json.JSONDecodeError:
+            pass
 
     # 多 scenario 兜底 (虽然 case-driven 通常 1 个)
     for scen in scenarios:

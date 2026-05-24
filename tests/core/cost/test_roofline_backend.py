@@ -5,7 +5,7 @@
   - estimate() 返 CostTraceEntry, source=roofline, match_type=fallback
   - 大 GEMM (compute-bound) / 小 GEMM (memory-bound) bottleneck 区分
   - CostRouter aggregate StepOpPlan -> StepCostTrace
-  - collective op 在阶段 1 被跳过
+  - collective op 走 communication roofline 并计入 comm_time_s
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import pytest
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.router import CostRouter
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
+from llm_infer_sim.core.graph.grouped_plan import GroupedOperator, GroupedStepPlan
 from llm_infer_sim.core.graph.step_plan import StepOpPlan
 from llm_infer_sim.core.operators import Collective, GEMM
 from llm_infer_sim.core.operators.base import RooflineSpec
@@ -134,17 +135,15 @@ def test_router_aggregates_step_plan(backend_eager):
     assert trace.bottleneck in ("compute", "memory")
 
 
-def test_router_skips_collective_in_stage_1(backend_eager):
-    """阶段 5 才接 communication backend, 阶段 1 collective op 直接跳过不入 trace."""
+def _collective_op() -> Collective:
     from llm_infer_sim.core.operators.context import build_operator_context
     from llm_infer_sim.core.profiles.model_config import ModelConfig
-    gemm = _gemm_op(m=128, n=6144, k=2560)
     coll_ctx = build_operator_context(
         ModelConfig(),
         DeployConfig(tp_size=2, backend="vllm", backend_version="0.20.1"),
         get_hardware_profile("RTX_4090"),
     )
-    coll = Collective(
+    return Collective(
         name="attn_allreduce", op_subtype="allreduce",
         phase="prefill", layer_idx=0,
         message_bytes=128 * 2560 * 2, world_size=2,
@@ -155,11 +154,45 @@ def test_router_skips_collective_in_stage_1(backend_eager):
             op_category="communication",
         ),
     )
+
+
+def test_router_estimates_collective_comm_time(backend_eager):
+    """Collective op 走 CommunicationRooflineBackend, 不再静默跳过."""
+    gemm = _gemm_op(m=128, n=6144, k=2560)
+    coll = _collective_op()
     plan = StepOpPlan(step_id=0, phase="prefill", ops=(gemm, coll))
     router = CostRouter(backend_eager)
     trace = router.estimate(plan)
-    assert len(trace.entries) == 1
-    assert trace.entries[0].op_name == "qkv_proj"
+    assert len(trace.entries) == 2
+    assert trace.comm_time_s > 0
+    assert trace.entries[1].op_name == "attn_allreduce"
+    assert trace.entries[1].source == "comm_roofline"
+    assert trace.entries[1].metadata["comm_type"] == "allreduce"
+    assert trace.entries[1].metadata["message_bytes"] == 128 * 2560 * 2
+    assert trace.entries[1].metadata["world_size"] == 2
+    assert trace.entries[1].metadata["topology_hint"] in ("concentrated", "balanced")
+    assert trace.entries[1].metadata["execution_mode"] == "eager"
+
+
+def test_grouped_collective_scales_comm_time(backend_eager):
+    coll = _collective_op()
+    plan = GroupedStepPlan(
+        step_id=0,
+        phase="prefill",
+        groups=(GroupedOperator(
+            op=coll,
+            count=36,
+            layer_indices=tuple(range(36)),
+        ),),
+    )
+    router = CostRouter(backend_eager)
+    base = router.estimate(StepOpPlan(step_id=0, phase="prefill", ops=(coll,)))
+    grouped = router.estimate_grouped(plan)
+    assert grouped.comm_time_s == pytest.approx(base.comm_time_s * 36)
+    assert grouped.total_latency_s == pytest.approx(base.total_latency_s * 36)
+    assert grouped.entries[0].display_name == "attn_allreduce[count=36]"
+    assert grouped.entries[0].metadata["count"] == 36
+    assert grouped.entries[0].metadata["t_comm"] == pytest.approx(base.comm_time_s * 36)
 
 
 def test_to_report_dict_round_trip(backend_eager):

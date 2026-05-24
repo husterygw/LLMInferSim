@@ -78,6 +78,7 @@ def collect(out_root: Path, suite_filter: str | None, cases: dict[str, dict]) ->
                 continue
             case_id = m.get("case_id", case_dir.name)
             meta = cases.get(case_id, {})
+            kv_blocks = m.get("kv_blocks", {})
             for s in m.get("scenarios", []):
                 rows.append({
                     "suite": suite,
@@ -103,6 +104,10 @@ def collect(out_root: Path, suite_filter: str | None, cases: dict[str, dict]) ->
                     "gap_TTFT_p99":  s.get("gap_pct", {}).get("TTFT_p99"),
                     "gap_TPOT_p99":  s.get("gap_pct", {}).get("TPOT_p99"),
                     "gap_thru":      s.get("gap_pct", {}).get("throughput_req"),
+                    "real_num_gpu_blocks": (kv_blocks.get("real") or {}).get("num_gpu_blocks"),
+                    "sim_num_gpu_blocks": (kv_blocks.get("sim") or {}).get("num_gpu_blocks"),
+                    "sim_num_gpu_blocks_override": kv_blocks.get("sim_num_gpu_blocks_override"),
+                    "blocks_source": kv_blocks.get("blocks_source"),
                 })
     return rows
 
@@ -121,11 +126,15 @@ def fmt_ms(v):
 
 def print_table(rows: list[dict]) -> None:
     print(f"{'suite':<28} {'case_id':<64} {'TP':>3} {'C':>3} "
+          f"{'real_blk':>8} {'sim_blk':>8} {'blk_src':>12} "
           f"{'real_TTFT':>10} {'sim_TTFT':>10} {'TTFT_gap':>10} "
           f"{'real_TPOT':>10} {'sim_TPOT':>10} {'TPOT_gap':>10}")
-    print("-" * 155)
+    print("-" * 185)
     for r in rows:
         print(f"{r['suite']:<28} {r['case_id']:<64} {r['tp']:>3} {r['concurrency']:>3} "
+              f"{str(r.get('real_num_gpu_blocks') or 'N/A'):>8} "
+              f"{str(r.get('sim_num_gpu_blocks_override') or r.get('sim_num_gpu_blocks') or 'N/A'):>8} "
+              f"{str(r.get('blocks_source') or 'N/A'):>12} "
               f"{fmt_ms(r['real_TTFT_mean']):>10} {fmt_ms(r['sim_TTFT_mean']):>10} {fmt_pct(r['gap_TTFT_mean']):>10} "
               f"{fmt_ms(r['real_TPOT_mean']):>10} {fmt_ms(r['sim_TPOT_mean']):>10} {fmt_pct(r['gap_TPOT_mean']):>10}")
 

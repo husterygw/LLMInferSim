@@ -46,6 +46,7 @@ class BenchCase:
     max_model_len: int | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int = 8192
+    num_gpu_blocks_override: int | None = None
     num_warmups: int = 1
     gpu_mem_util: float = 0.5
     enable_expert_parallel: bool = False
@@ -92,6 +93,7 @@ def _case(
     max_model_len: int | None = None,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int = 8192,
+    num_gpu_blocks_override: int | None = None,
     num_warmups: int = 1,
     gpu_mem_util: float = 0.5,
     enable_expert_parallel: bool = False,
@@ -121,6 +123,7 @@ def _case(
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        num_gpu_blocks_override=num_gpu_blocks_override,
         num_warmups=num_warmups,
         gpu_mem_util=gpu_mem_util,
         enable_expert_parallel=enable_expert_parallel,
@@ -186,7 +189,9 @@ def build_batch_tp1_sweep() -> list[BenchCase]:
                     request_rate="inf",
                     execution_mode="cudagraph",
                     max_model_len=8192,
-                    max_num_batched_tokens=max(8192, c * i),
+                    # cap 32768 防 RTX 4090 (24GB) real 启动失败 (No available
+                    # memory for cache blocks). 65536+ 让 activation > 1.34GB.
+                    max_num_batched_tokens=min(max(8192, c * i), 32768),
                     tags=("dense", "batch", "tp1", f"c{c}"),
                     description=f"Qwen3-4B TP=1 batch sweep c={c}, ISL={i}, OSL={o}",
                 )

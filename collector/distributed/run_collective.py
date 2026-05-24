@@ -39,19 +39,141 @@ from collector.schemas import (
 _DTYPE_BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
 
 
+# vLLM AR + graph_capture 句柄, _init_nccl 里初始化一次, 多次 case 复用.
+_VLLM_TMP_AR = None
+_VLLM_GRAPH_CAPTURE = None
+
+
 def _torch_dtype(dtype_str: str):
     import torch
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[dtype_str]
 
 
 def _init_nccl(local_rank: int) -> tuple[int, int]:
-    """初始化 torch.distributed NCCL, 返 (rank, world_size)."""
+    """初始化 torch.distributed NCCL + vLLM distributed (供 AR 用真 vLLM 路径).
+
+    AR 用 vllm.distributed.tensor_model_parallel_all_reduce, 它内部按 size 分发
+    到 custom_all_reduce / pynccl / torch.dist (跟 production vLLM step 一致).
+    裸 torch.dist.all_reduce 只覆盖 NCCL 一条, 小 size 跟生产路径偏差大.
+    """
     import torch
     import torch.distributed as dist
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
-    return dist.get_rank(), dist.get_world_size()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    global _VLLM_TMP_AR, _VLLM_GRAPH_CAPTURE
+    from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
+    from vllm.distributed.parallel_state import (
+        graph_capture,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    init_distributed_environment(
+        world_size=world_size, rank=rank,
+        distributed_init_method="env://",
+        local_rank=local_rank, backend="nccl",
+    )
+    # vLLM >= 0.14 要求 initialize_model_parallel() 在 VllmConfig context 内.
+    try:
+        from vllm.config import VllmConfig, set_current_vllm_config
+        with set_current_vllm_config(VllmConfig()):
+            initialize_model_parallel(
+                tensor_model_parallel_size=world_size,
+                pipeline_model_parallel_size=1,
+            )
+    except ImportError:
+        initialize_model_parallel(
+            tensor_model_parallel_size=world_size,
+            pipeline_model_parallel_size=1,
+        )
+
+    _VLLM_TMP_AR = tensor_model_parallel_all_reduce
+    _VLLM_GRAPH_CAPTURE = graph_capture
+
+    return rank, world_size
+
+
+def _measure_vllm_ar_cudagraph(
+    kernel_func, n_warmups: int = 3, n_iters: int = 20, repeat_n: int = 5,
+) -> tuple[float, float, float]:
+    """vLLM custom AR cudagraph 测量 (AIC 风格).
+
+    vLLM TMP_AR 必须在 `vllm.graph_capture()` context 下 capture (custom_all_reduce
+    + pynccl 依赖该 context 选 stream). 通用 harness 的 side-stream 路径不行.
+
+    repeat_n 个 AR 串入同一 graph, replay×n_iters 取 p10/p50/p90, 单 AR latency
+    = elapsed / repeat_n. 短 AR (<50us) 噪声明显降低.
+    """
+    import torch
+
+    with _VLLM_GRAPH_CAPTURE(device=torch.cuda.current_device()) as gc_ctx:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=gc_ctx.stream):
+            for _ in range(repeat_n):
+                kernel_func()
+
+    torch.cuda.synchronize()
+    for _ in range(n_warmups):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    latencies_us: list[float] = []
+    for _ in range(n_iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        latencies_us.append(start.elapsed_time(end) * 1000.0 / repeat_n)
+
+    latencies_us.sort()
+    n = len(latencies_us)
+    return (
+        latencies_us[max(0, int(0.10 * n))],
+        latencies_us[n // 2],
+        latencies_us[min(n - 1, int(0.90 * n))],
+    )
+
+
+def _measure_vllm_ar_eager(
+    kernel_func, n_warmups: int = 3, n_iters: int = 100, repeat_n: int = 5,
+) -> tuple[float, float, float]:
+    """vLLM custom AR eager 模式 (AIC 风格, 多次 repeat_n 串行).
+
+    eager 模式 vLLM TMP_AR 不需要 graph_capture context. n_iters 比 cudagraph
+    高 5× 抵消单次启动开销; 单 AR latency = elapsed / repeat_n.
+    """
+    import torch
+
+    for _ in range(n_warmups):
+        for _ in range(repeat_n):
+            kernel_func()
+    torch.cuda.synchronize()
+
+    latencies_us: list[float] = []
+    for _ in range(n_iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(repeat_n):
+            kernel_func()
+        end.record()
+        torch.cuda.synchronize()
+        latencies_us.append(start.elapsed_time(end) * 1000.0 / repeat_n)
+
+    latencies_us.sort()
+    n = len(latencies_us)
+    return (
+        latencies_us[max(0, int(0.10 * n))],
+        latencies_us[n // 2],
+        latencies_us[min(n - 1, int(0.90 * n))],
+    )
 
 
 def _bench_collective(
@@ -72,44 +194,61 @@ def _bench_collective(
 
     op = params["op_subtype"]
     device = torch.cuda.current_device()
+    mode = params.get("execution_mode", "cudagraph")
+    use_graph = (mode == "cudagraph")
+
+    # barrier so all ranks reach measure together (avoid skew)
+    dist.barrier()
 
     if op == "allreduce":
+        # 走 vLLM 真路径 (TMP_AR 内部分发到 custom_all_reduce / pynccl / torch.dist).
+        if _VLLM_TMP_AR is None:
+            raise RuntimeError("vLLM AR not initialized; _init_nccl must run first")
         x = torch.randn(n_elems, dtype=dtype, device=device)
 
         def kernel_func() -> None:
-            dist.all_reduce(x)
+            _VLLM_TMP_AR(x)
+
+        if use_graph:
+            p10, p50, p90 = _measure_vllm_ar_cudagraph(kernel_func)
+        else:
+            p10, p50, p90 = _measure_vllm_ar_eager(kernel_func)
+        return (p10, p50, p90, use_graph, None)
+
     elif op == "alltoall":
-        # input shape: [W, n_per_rank]; n_elems must divide by W
+        # vLLM 的 MoE EP dispatch/combine 调用栈太特殊 (DeepEP / pplx / naive),
+        # 这一版先保留 torch.dist.all_to_all_single 做 baseline.
         if n_elems % world_size != 0:
             raise ValueError(
                 f"alltoall n_elems={n_elems} not divisible by world_size={world_size}"
             )
-        n_per = n_elems // world_size
         x = torch.randn(n_elems, dtype=dtype, device=device)
         out = torch.empty_like(x)
 
         def kernel_func() -> None:
             dist.all_to_all_single(out, x)
-    else:
-        raise NotImplementedError(f"op_subtype {op!r} not supported")
 
-    # barrier so all ranks reach measure together (avoid skew)
-    dist.barrier()
+        cfg = (
+            BenchConfig(n_warmups=3, n_iters=10, use_cuda_graph=True, allow_graph_fail=False)
+            if use_graph
+            else BenchConfig(n_warmups=3, n_iters=10, use_cuda_graph=False)
+        )
+        bench = measure(kernel_func, cfg)
+        return (
+            bench.latency_us_p10, bench.latency_us_p50, bench.latency_us_p90,
+            bench.used_cuda_graph, bench.fallback_reason,
+        )
 
-    mode = params.get("execution_mode", "cudagraph")
-    if mode == "eager":
-        cfg = BenchConfig(n_warmups=3, n_iters=10, use_cuda_graph=False)
-    elif mode == "cudagraph":
-        cfg = BenchConfig(n_warmups=3, n_iters=10, use_cuda_graph=True,
-                          allow_graph_fail=False)
-    else:
-        raise NotImplementedError(f"execution_mode {mode!r} not supported")
+    raise NotImplementedError(f"op_subtype {op!r} not supported")
 
-    bench = measure(kernel_func, cfg)
-    return (
-        bench.latency_us_p10, bench.latency_us_p50, bench.latency_us_p90,
-        bench.used_cuda_graph, bench.fallback_reason,
-    )
+
+_KERNEL_SOURCE_BY_OP = {
+    # vLLM 的 TMP_AR 内部按 size 分发 (custom_all_reduce / pynccl / torch.dist),
+    # 跟 production vLLM step 一致.
+    "allreduce": "vllm_tensor_model_parallel_all_reduce",
+    # alltoall 还是裸 torch.dist (vLLM EP path 这版未接).
+    "alltoall": "torch_dist_nccl",
+}
 
 
 def _build_record(
@@ -121,6 +260,13 @@ def _build_record(
     framework_version: str,
     device_name: str,
 ) -> RawRecord:
+    op = case.params.get("op_subtype", "unknown")
+    # n_iters 跟实际测量函数对齐: vLLM AR cudagraph 用 20 (repeat_n=5), eager 用 100;
+    # alltoall 走 harness 默认 10.
+    if op == "allreduce":
+        n_iters_used = 20 if used_graph else 100
+    else:
+        n_iters_used = 10
     return RawRecord(
         case_id=case.case_id,
         op_kind=OpKind.COLLECTIVE,
@@ -130,11 +276,11 @@ def _build_record(
         execution_mode=(
             ExecutionMode.CUDAGRAPH if used_graph else ExecutionMode.EAGER
         ),
-        kernel_source="torch_dist_nccl",
+        kernel_source=_KERNEL_SOURCE_BY_OP.get(op, "torch_dist_nccl"),
         params=dict(case.params),
         metrics=Metrics(
             latency_us_p50=p50, latency_us_p10=p10, latency_us_p90=p90,
-            used_cuda_graph=used_graph, n_warmups=3, n_iters=10,
+            used_cuda_graph=used_graph, n_warmups=3, n_iters=n_iters_used,
         ),
         metadata={"fallback_reason": fallback_reason},
     )

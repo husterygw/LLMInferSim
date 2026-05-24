@@ -4,7 +4,7 @@
   - Qwen3-4B prefill / decode 生成 op list
   - per-layer 顺序 + 跨 layer 数量
   - 各 op 携带 op_kind / op_subtype / shape / parallel / runtime
-  - search-ready: TP 改变后 shape/parallel 跟变, 总 op 数不变
+  - search-ready: TP 改变后 shape/parallel 跟变, TP>1 生成 dense allreduce
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pytest
 
 from llm_infer_sim.core.graph.step_shape import StepShape
 from llm_infer_sim.core.models.qwen import QwenModelGraphTemplate
-from llm_infer_sim.core.operators import GEMM
+from llm_infer_sim.core.operators import Collective, GEMM
 from llm_infer_sim.core.operators.base import Operator
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import get_hardware_profile
@@ -213,6 +213,37 @@ def test_tp_affects_qkv_shape():
     assert qkv2.shape["n"] == qkv1.shape["n"] // 2
     assert qkv1.parallel["tp"] == 1
     assert qkv2.parallel["tp"] == 2
+
+
+def test_tp1_has_no_dense_allreduce():
+    model = _qwen3_4b()
+    step = _prefill_step(isl=128)
+    plan = QwenModelGraphTemplate(
+        model, ctx=_make_ctx(model, DeployConfig(tp_size=1)),
+    ).build_grouped_step(step)
+    names = {op.name for op in plan.ops}
+    assert "tp_o_proj_allreduce" not in names
+    assert "tp_down_proj_allreduce" not in names
+
+
+def test_tp_dense_allreduce_grouped_shape_and_bytes():
+    model = _qwen3_4b()
+    deploy = DeployConfig(tp_size=2)
+    ctx = _make_ctx(model, deploy)
+    step = _prefill_step(isl=128)
+    plan = QwenModelGraphTemplate(model, ctx=ctx).build_grouped_step(step)
+
+    groups = {g.op.name: g for g in plan.groups}
+    expected_bytes = int(step.total_tokens * model.hidden_dim * ctx.a_byte)
+    for name in ("tp_o_proj_allreduce", "tp_down_proj_allreduce"):
+        group = groups[name]
+        op = group.op
+        assert isinstance(op, Collective)
+        assert op.op_subtype == "allreduce"
+        assert op.message_bytes == expected_bytes
+        assert op.parallel["world_size"] == 2
+        assert group.count == model.num_layers
+        assert group.layer_indices == tuple(range(model.num_layers))
 
 
 def test_all_ops_have_required_metadata():
