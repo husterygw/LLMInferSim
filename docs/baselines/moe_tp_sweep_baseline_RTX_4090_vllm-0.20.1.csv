@@ -1,0 +1,6 @@
+case_id,tp,ep,shape,real_TTFT_ms,sim_TTFT_ms,TTFT_gap_pct,real_TPOT_ms,sim_TPOT_ms,TPOT_gap_pct,real_throughput_tok_per_s,sim_throughput_tok_per_s,is_ep_driver_for_step5b
+moe_tp_sweep__qwen3_30b_a3b__i1024_o128__tp4,4,1,i1024_o128,182.86,180.78,-1.14,5.4,6.07,12.41,55.89,55.22,
+moe_tp_sweep__qwen3_30b_a3b__i128_o128__tp4,4,1,i128_o128,50.8,59.75,17.62,5.42,6.11,12.73,56.96,56.07,
+moe_tp_sweep__qwen3_30b_a3b__i128_o2048__tp4,4,1,i128_o2048,59.39,60.69,2.19,8.22,8.25,0.36,269.15,268.21,
+moe_tp_sweep__qwen3_30b_a3b__i4096_o1024__tp4,4,1,i4096_o1024,942.78,598.99,-36.47,9.24,8.61,-6.82,199.93,206.56,
+moe_tp_sweep__qwen3_30b_a3b__i4096_o128__tp4,4,1,i4096_o128,624.65,595.61,-4.65,5.42,6.1,12.55,52.51,52.07,

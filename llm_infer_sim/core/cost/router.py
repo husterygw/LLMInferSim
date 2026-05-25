@@ -5,15 +5,15 @@
     roofline_only      -> 不查 DB, 全走 roofline (阶段 1 行为)
     require_operator_db-> 必须 hit, miss → 抛 LookupError
 
-阶段 6.1: collective op 走 CommunicationRooflineBackend; GEMM/attention/etc.
-仍按 OperatorDBBackend / RooflineBackend policy 处理.
+comm_plan Step 3: collective dispatch 收回 RooflineBackend 内部, CostRouter 不再
+按 op_kind 特判. collective op 走 OperatorDBBackend (当前 always miss for collective)
+→ fallback RooflineBackend._estimate_collective() 跟其它 op 同一条 policy 流水.
 """
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
 
-from llm_infer_sim.core.cost.backends.communication import CommunicationRooflineBackend
 from llm_infer_sim.core.cost.backends.operator_db import OperatorDBBackend
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
@@ -40,14 +40,10 @@ class CostRouter:
         roofline: RooflineBackend,
         *,
         operator_db: OperatorDBBackend | None = None,
-        communication: CommunicationRooflineBackend | None = None,
         policy: CostPolicy | None = None,
     ):
         self.roofline = roofline
         self.operator_db = operator_db
-        self.communication = communication or CommunicationRooflineBackend(
-            roofline.hw, roofline.deploy,
-        )
         self.policy = policy or CostPolicy(
             mode="roofline_only" if operator_db is None else "operator_db_first",
             enable_operator_db=operator_db is not None,
@@ -139,9 +135,6 @@ class CostRouter:
         )
 
     def _estimate_op(self, op) -> CostTraceEntry:
-        if op.op_kind == "collective":
-            return self.communication.estimate(op)
-
         mode = self.policy.mode
 
         if mode == "roofline_only":

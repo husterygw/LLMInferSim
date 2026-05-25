@@ -33,6 +33,8 @@ from llm_infer_sim.core.graph.step_shape import StepShape
 from llm_infer_sim.core.models.layer_partition import partition_ffn_layers
 from llm_infer_sim.core.operators.context import OperatorContext
 from llm_infer_sim.core.operators import (
+    AllReduce,
+    AllToAll,
     Attention,
     ElementWise,
     Embedding,
@@ -40,7 +42,6 @@ from llm_infer_sim.core.operators import (
     GEMM,
     MoERoutingProfile,
     Norm,
-    make_collective,
 )
 from llm_infer_sim.core.operators.base import Operator
 from llm_infer_sim.core.profiles.model_config import ModelConfig
@@ -277,8 +278,7 @@ class QwenModelGraphTemplate:
             ),
         ]
         if tp > 1:
-            ops.append(make_collective(
-                kind="allreduce",
+            ops.append(AllReduce(
                 name="tp_o_proj_allreduce",
                 message_bytes=_comm_bytes_hidden(tokens, ctx),
                 phase=phase,
@@ -332,8 +332,7 @@ class QwenModelGraphTemplate:
             ),
         ]
         if tp > 1:
-            ops.append(make_collective(
-                kind="allreduce",
+            ops.append(AllReduce(
                 name="tp_down_proj_allreduce",
                 message_bytes=_comm_bytes_hidden(tokens, ctx),
                 phase=phase,
@@ -403,7 +402,7 @@ class QwenModelGraphTemplate:
         ]
 
         if ep > 1:
-            ops.append(make_collective(kind="alltoall",
+            ops.append(AllToAll(
                 name="ep_alltoall_dispatch",
                 message_bytes=comm_bytes_h,
                 phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
@@ -415,13 +414,13 @@ class QwenModelGraphTemplate:
         ))
 
         if ep == 1 and tp > 1:
-            ops.append(make_collective(kind="allreduce",
+            ops.append(AllReduce(
                 name="routed_expert_allreduce",
                 message_bytes=comm_bytes_h,
                 phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
             ))
         elif ep > 1:
-            ops.append(make_collective(kind="alltoall",
+            ops.append(AllToAll(
                 name="ep_alltoall_combine",
                 message_bytes=comm_bytes_h,
                 phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
@@ -452,7 +451,7 @@ class QwenModelGraphTemplate:
                 ctx=ctx,
             ))
             if tp > 1:
-                ops.append(make_collective(kind="allreduce",
+                ops.append(AllReduce(
                     name="shared_expert_allreduce",
                     message_bytes=comm_bytes_h,
                     phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,

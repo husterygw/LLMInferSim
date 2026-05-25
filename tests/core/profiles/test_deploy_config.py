@@ -40,6 +40,7 @@ def test_field_set_is_minimal():
         "max_num_batched_tokens", "max_num_seqs",
         "block_size", "num_gpu_blocks",
         "execution_mode", "backend", "backend_version",
+        "prefill_worker_overhead_s",   # vLLM framework overhead, 接到 virtual_model_runner
         "pd",
     }
     assert names == expected

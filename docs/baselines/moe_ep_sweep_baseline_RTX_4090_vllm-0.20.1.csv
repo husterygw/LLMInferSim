@@ -1,0 +1,4 @@
+case_id,tp,ep,shape,real_TTFT_ms,sim_TTFT_ms,TTFT_gap_pct,real_TPOT_ms,sim_TPOT_ms,TPOT_gap_pct,real_throughput_tok_per_s,sim_throughput_tok_per_s,is_ep_driver_for_step5b
+moe_ep_sweep__qwen3_30b_a3b__i128_o128__tp4__ep4,4,4,i128_o128,52.64,61.31,16.47,6.19,7.42,19.87,56.1,54.57,
+moe_ep_sweep__qwen3_30b_a3b__i128_o2048__tp4__ep4,4,4,i128_o2048,58.89,59.19,0.51,9.48,9.57,0.95,241.62,239.71,
+moe_ep_sweep__qwen3_30b_a3b__i2048_o128__tp4__ep4,4,4,i2048_o128,327.47,360.02,9.94,6.18,7.68,24.27,53.97,52.35,YES (largest |TPOT_gap| in moe_ep_sweep)

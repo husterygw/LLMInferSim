@@ -6,7 +6,7 @@ Each op class in its own module:
   - elementwise.py ElementWise
   - embedding.py   Embedding
   - attention.py   Attention
-  - collective.py  Collective + make_collective()
+  - collective.py  Collective + AllReduce/AllGather/ReduceScatter/AllToAll/P2P + make_collective() (deprecated)
   - moe.py         FusedMoE
   - base.py        Operator protocol + RooflineSpec + legacy RooflineOperator / KVTransfer
   - context.py     OperatorContext + ModelBuildContext
@@ -22,7 +22,15 @@ from llm_infer_sim.core.operators.base import (
     Operator,
     RooflineSpec,
 )
-from llm_infer_sim.core.operators.collective import Collective, make_collective
+from llm_infer_sim.core.operators.collective import (
+    AllGather,
+    AllReduce,
+    AllToAll,
+    Collective,
+    P2P,
+    ReduceScatter,
+    make_collective,
+)
 from llm_infer_sim.core.operators.context import (
     ModelBuildContext,
     OperatorContext,
@@ -40,9 +48,14 @@ from llm_infer_sim.core.operators.moe import (
 from llm_infer_sim.core.operators.norm import Norm
 
 __all__ = [
+    "AllGather",
+    "AllReduce",
+    "AllToAll",
     "Attention",
     "Collective",
     "ElementWise",
+    "P2P",
+    "ReduceScatter",
     "Embedding",
     "RooflineOperator",
     "FusedMoE",

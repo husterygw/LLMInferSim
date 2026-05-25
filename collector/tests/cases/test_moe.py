@@ -1,4 +1,7 @@
-"""MoE case generation — routing distribution + parallel + dedup."""
+"""MoE case generation — distribution + parallel + dedup.
+
+moe_plan Phase 2: cases/moe.py 改 AIC 字段口径; 此测试同步更新.
+"""
 from __future__ import annotations
 
 from collector.cases import moe
@@ -36,8 +39,9 @@ def _dummy_dense(**overrides) -> ProfileSpec:
 class TestGetCasesForProfile:
     def test_non_moe_profile_returns_empty(self):
         p = _dummy_dense()
-        assert moe.get_cases_for_profile(p,
-            execution_modes=["cudagraph"]) == []
+        assert moe.get_cases_for_profile(
+            p, execution_modes=["cudagraph"],
+        ) == []
 
     def test_minimal_moe_profile(self):
         p = _dummy_moe()
@@ -45,66 +49,63 @@ class TestGetCasesForProfile:
             p,
             num_tokens_values=[128],
             parallel_configs=[(4, 1)],
-            routings=[("balanced", 0.0)],
-            dtypes=["bf16"],
-        execution_modes=["cudagraph"],
+            distributions=["balanced"],
+            moe_dtypes=["bfloat16"],
+            execution_modes=["cudagraph"],
         )
         assert len(cases) == 1
         c = cases[0]
         assert c.op_kind == OpKind.MOE
+        # AIC-aligned 字段
         assert c.params["num_tokens"] == 128
         assert c.params["topk"] == 8
         assert c.params["num_experts"] == 128
-        assert c.params["moe_intermediate"] == 768
-        assert c.params["tp"] == 4
-        assert c.params["ep"] == 1
-        assert c.params["routing_distribution"] == "balanced"
+        assert c.params["inter_size"] == 768
+        assert c.params["hidden_size"] == 2048
+        assert c.params["moe_tp_size"] == 4
+        assert c.params["moe_ep_size"] == 1
+        assert c.params["distribution"] == "balanced"
+        assert c.params["moe_dtype"] == "bfloat16"
 
-    def test_three_routings(self):
+    def test_three_distributions(self):
         """balanced + power_law_1.01 + power_law_1.2 = 3 cases."""
         p = _dummy_moe()
         cases = moe.get_cases_for_profile(
             p,
             num_tokens_values=[128],
             parallel_configs=[(4, 1)],
-        
             execution_modes=["cudagraph"],
         )
-        assert len(cases) == 3   # 3 routings
-        routings = {(c.params["routing_distribution"], c.params["power_law_alpha"])
-                    for c in cases}
-        assert routings == {
-            ("balanced", 0.0),
-            ("power_law", 1.01),
-            ("power_law", 1.2),
-        }
+        assert len(cases) == 3   # 3 distributions
+        dists = {c.params["distribution"] for c in cases}
+        assert dists == {"balanced", "power_law_1.01", "power_law_1.2"}
 
     def test_parallel_configs(self):
+        """vLLM 限定: moe_tp>1 AND moe_ep>1 同时不支持, (4,4) 被自动跳过."""
         p = _dummy_moe()
         cases = moe.get_cases_for_profile(
             p,
             num_tokens_values=[1],
             parallel_configs=[(1, 1), (1, 4), (4, 1), (4, 4)],
-            routings=[("balanced", 0.0)],
-        
+            distributions=["balanced"],
             execution_modes=["cudagraph"],
         )
-        assert len(cases) == 4
-        configs = {(c.params["tp"], c.params["ep"]) for c in cases}
-        assert configs == {(1, 1), (1, 4), (4, 1), (4, 4)}
+        # (4, 4) 被新规则跳, 剩 3 个
+        assert len(cases) == 3
+        configs = {(c.params["moe_tp_size"], c.params["moe_ep_size"]) for c in cases}
+        assert configs == {(1, 1), (1, 4), (4, 1)}
 
     def test_ep_exceeds_experts_skipped(self):
-        """EP > num_experts 应跳过."""
+        """moe_ep_size > num_experts 应跳过."""
         p = _dummy_moe(moe_num_experts=8)
         cases = moe.get_cases_for_profile(
             p,
             num_tokens_values=[1],
-            parallel_configs=[(1, 8), (1, 16)],   # EP=8 OK, EP=16 跳
-            routings=[("balanced", 0.0)],
-        
+            parallel_configs=[(1, 8), (1, 16)],   # ep=8 OK, ep=16 跳
+            distributions=["balanced"],
             execution_modes=["cudagraph"],
         )
-        eps = {c.params["ep"] for c in cases}
+        eps = {c.params["moe_ep_size"] for c in cases}
         assert 8 in eps
         assert 16 not in eps
 
@@ -114,7 +115,6 @@ class TestGetCasesForProfile:
             p,
             num_tokens_values=[1],
             parallel_configs=[(4, 1)],
-        
             execution_modes=["cudagraph"],
         )
         for c in cases:
@@ -124,53 +124,50 @@ class TestGetCasesForProfile:
 
     def test_all_cases_op_moe(self):
         p = _dummy_moe()
-        cases = moe.get_cases_for_profile(p,
-            execution_modes=["cudagraph"])
+        cases = moe.get_cases_for_profile(
+            p, execution_modes=["cudagraph"],
+        )
         assert all(c.op_kind == OpKind.MOE for c in cases)
 
     def test_default_sweep_count(self):
-        """默认: 9 num_tokens × 4 parallel × 3 routing × 1 dtype = 108."""
+        """默认 (moe_plan Phase 2):
+        10 num_tokens × 2 parallel × 3 distribution × 1 dtype × 1 mode = 60."""
         p = _dummy_moe()
-        cases = moe.get_cases_for_profile(p,
-            execution_modes=["cudagraph"])
-        assert len(cases) == 9 * 4 * 3 * 1   # 108
+        cases = moe.get_cases_for_profile(p)
+        assert len(cases) == 10 * 2 * 3 * 1 * 1   # = 60
 
 
 # ---------------------------------------------------------------------------
-# routing distribution + alpha 进 case_id
+# distribution 进 case_id (区分 balanced / power_law / alpha)
 # ---------------------------------------------------------------------------
 
-class TestRoutingInCaseId:
-    def test_different_routing_different_id(self):
-        """balanced 跟 power_law alpha=1.2 case_id 必须不同."""
+class TestDistributionInCaseId:
+    def test_different_distribution_different_id(self):
+        """balanced 跟 power_law_1.2 case_id 必须不同."""
         p = _dummy_moe()
         balanced = moe.get_cases_for_profile(
             p, num_tokens_values=[128], parallel_configs=[(4, 1)],
-            routings=[("balanced", 0.0)],
-        
+            distributions=["balanced"],
             execution_modes=["cudagraph"],
         )[0]
         pw = moe.get_cases_for_profile(
             p, num_tokens_values=[128], parallel_configs=[(4, 1)],
-            routings=[("power_law", 1.2)],
-        
+            distributions=["power_law_1.2"],
             execution_modes=["cudagraph"],
         )[0]
         assert balanced.case_id != pw.case_id
 
     def test_different_alpha_different_id(self):
-        """power_law alpha=1.01 vs 1.2 case_id 不同."""
+        """power_law_1.01 vs power_law_1.2 case_id 不同."""
         p = _dummy_moe()
         a = moe.get_cases_for_profile(
             p, num_tokens_values=[128], parallel_configs=[(4, 1)],
-            routings=[("power_law", 1.01)],
-        
+            distributions=["power_law_1.01"],
             execution_modes=["cudagraph"],
         )[0]
         b = moe.get_cases_for_profile(
             p, num_tokens_values=[128], parallel_configs=[(4, 1)],
-            routings=[("power_law", 1.2)],
-        
+            distributions=["power_law_1.2"],
             execution_modes=["cudagraph"],
         )[0]
         assert a.case_id != b.case_id
@@ -189,10 +186,9 @@ class TestMultiProfileDedup:
             [dense, moe_p],
             num_tokens_values=[1],
             parallel_configs=[(4, 1)],
-        
             execution_modes=["cudagraph"],
         )
-        assert len(cases) == 3   # 3 routings, only from moe_a
+        assert len(cases) == 3   # 3 distributions, only from moe_a
         for c in cases:
             assert sources[c.case_id] == ["moe_a"]
 
@@ -204,7 +200,6 @@ class TestMultiProfileDedup:
             [p1, p2],
             num_tokens_values=[1],
             parallel_configs=[(4, 1)],
-        
             execution_modes=["cudagraph"],
         )
         assert len(cases) == 3   # 不是 6, dedup 了
@@ -219,7 +214,6 @@ class TestMultiProfileDedup:
             [p1, p2],
             num_tokens_values=[1],
             parallel_configs=[(4, 1)],
-        
             execution_modes=["cudagraph"],
         )
         assert len(cases) == 6   # 3 + 3
@@ -235,24 +229,24 @@ class TestQwen3_30B_A3B_Real:
         cases = moe.get_cases_for_profile(
             qwen3_30b_a3b.PROFILE,
             num_tokens_values=[128],
-            parallel_configs=[(4, 1), (4, 4)],
-            routings=[("balanced", 0.0), ("power_law", 1.2)],
-        
+            parallel_configs=[(4, 1), (1, 4)],
+            distributions=["balanced", "power_law_1.2"],
             execution_modes=["cudagraph"],
         )
-        # 2 parallel × 2 routing × 1 num_tokens = 4
+        # 2 parallel × 2 distribution × 1 num_tokens = 4
         assert len(cases) == 4
         for c in cases:
-            assert c.params["hidden"] == 2048
-            assert c.params["moe_intermediate"] == 768
+            assert c.params["hidden_size"] == 2048
+            assert c.params["inter_size"] == 768
             assert c.params["topk"] == 8
             assert c.params["num_experts"] == 128
 
     def test_qwen3_4b_returns_empty(self):
         """dense profile 不产 MoE case."""
         from collector.profiles import qwen3_4b
-        assert moe.get_cases_for_profile(qwen3_4b.PROFILE,
-            execution_modes=["cudagraph"]) == []
+        assert moe.get_cases_for_profile(
+            qwen3_4b.PROFILE, execution_modes=["cudagraph"],
+        ) == []
 
     def test_two_profiles_only_moe_contributes(self):
         from collector.profiles import qwen3_4b, qwen3_30b_a3b
@@ -260,9 +254,8 @@ class TestQwen3_30B_A3B_Real:
             [qwen3_4b.PROFILE, qwen3_30b_a3b.PROFILE],
             num_tokens_values=[1],
             parallel_configs=[(4, 1)],
-        
             execution_modes=["cudagraph"],
         )
-        assert len(cases) == 3   # 3 routings, only from qwen3_30b_a3b
+        assert len(cases) == 3   # 3 distributions, only from qwen3_30b_a3b
         for c in cases:
             assert sources[c.case_id] == ["qwen3_30b_a3b"]

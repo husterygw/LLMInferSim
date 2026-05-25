@@ -1,0 +1,80 @@
+loaded 108 AR records
+baseline hw: comm_step_latency=9.6us intra_node_protocol_efficiency=0.625
+
+BASELINE gap stats: log_rms=0.430 median=0.896 p10=0.477 p90=1.334 max_dev=2.62
+
+sweep grid: alpha=[3.0, 3.5, 4.0, 5.0, 7.0, 9.6] eff=[0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.625] eager_extra=[0, 20.0, 25.0, 30.0]
+  total combos: 168
+
+======================================================================
+(a) ALL records sweep
+======================================================================
+
+=== ALL data top-10 by log_rms ===
+rank combo                                       log_rms  median    p10    p90  max_dev
+   1 α=5.0us eff=0.625 eager+0us                   0.337   0.978  0.554  1.453     2.20
+   2 α=4.0us eff=0.500 eager+0us                   0.342   0.821  0.570  1.312     2.20
+   3 α=4.0us eff=0.625 eager+0us                   0.344   1.020  0.577  1.549     2.34
+   4 α=5.0us eff=0.500 eager+0us                   0.346   0.817  0.543  1.239     2.29
+   5 α=3.5us eff=0.500 eager+0us                   0.347   0.822  0.587  1.460     2.20
+   6 α=3.5us eff=0.625 eager+0us                   0.355   1.026  0.591  1.602     2.49
+   7 α=3.0us eff=0.500 eager+0us                   0.360   0.822  0.594  1.620     2.33
+   8 α=7.0us eff=0.625 eager+0us                   0.365   0.942  0.512  1.367     2.37
+   9 α=4.0us eff=0.450 eager+0us                   0.367   0.740  0.560  1.282     2.25
+  10 α=3.5us eff=0.450 eager+0us                   0.370   0.740  0.572  1.427     2.21
+
+======================================================================
+(b) SPLIT @ 8KB — small (≤8KB) vs large (>8KB) sweep
+======================================================================
+split: small=12 large=96
+
+=== SMALL (≤8KB) top-5 by log_rms ===
+rank combo                                       log_rms  median    p10    p90  max_dev
+   1 α=4.0us eff=0.350 eager+0us                   0.429   0.815  0.535  1.244     1.94
+   2 α=4.0us eff=0.400 eager+0us                   0.429   0.824  0.537  1.265     1.93
+   3 α=4.0us eff=0.300 eager+0us                   0.429   0.803  0.534  1.217     1.95
+   4 α=4.0us eff=0.450 eager+0us                   0.430   0.831  0.538  1.282     1.92
+   5 α=4.0us eff=0.500 eager+0us                   0.430   0.836  0.539  1.295     1.92
+
+=== LARGE (>8KB) top-5 by log_rms ===
+rank combo                                       log_rms  median    p10    p90  max_dev
+   1 α=5.0us eff=0.625 eager+0us                   0.322   1.000  0.581  1.510     2.20
+   2 α=4.0us eff=0.500 eager+0us                   0.329   0.821  0.579  1.312     2.20
+   3 α=4.0us eff=0.625 eager+0us                   0.331   1.020  0.607  1.552     2.34
+   4 α=5.0us eff=0.500 eager+0us                   0.332   0.817  0.565  1.250     2.29
+   5 α=3.5us eff=0.500 eager+0us                   0.332   0.822  0.591  1.320     2.20
+
+======================================================================
+(c) split threshold sensitivity (best single combo per side)
+======================================================================
+
+  threshold 4KB: skip (small=0 large=108)
+
+  threshold 8KB:
+    small (n=12): α=4.0us eff=0.350 eager+0us                log_rms=0.429
+    large (n=96): α=5.0us eff=0.625 eager+0us                log_rms=0.322
+    combined log_rms = 0.336
+
+  threshold 16KB:
+    small (n=12): α=4.0us eff=0.350 eager+0us                log_rms=0.429
+    large (n=96): α=5.0us eff=0.625 eager+0us                log_rms=0.322
+    combined log_rms = 0.336
+
+  threshold 32KB:
+    small (n=24): α=4.0us eff=0.400 eager+0us                log_rms=0.436
+    large (n=84): α=5.0us eff=0.625 eager+0us                log_rms=0.303
+    combined log_rms = 0.337
+
+======================================================================
+(d) Single-knob sweep — change only alpha, hold eff=0.625, eager=25us
+======================================================================
+
+=== alpha-only (eff=0.625 fixed) top-7 by log_rms ===
+rank combo                                       log_rms  median    p10    p90  max_dev
+   1 α=5.0us eff=0.625 eager+25us                  0.429   0.976  0.435  1.453     2.72
+   2 α=4.0us eff=0.625 eager+25us                  0.432   1.015  0.454  1.535     2.64
+   3 α=3.5us eff=0.625 eager+25us                  0.440   1.024  0.461  1.602     2.60
+   4 α=7.0us eff=0.625 eager+25us                  0.453   0.942  0.414  1.367     2.89
+   5 α=3.0us eff=0.625 eager+25us                  0.454   1.025  0.471  1.716     2.67
+   6 α=9.6us eff=0.625 eager+25us                  0.509   0.888  0.389  1.334     3.11
+   7 α=12.0us eff=0.625 eager+25us                 0.567   0.858  0.368  1.320     3.39

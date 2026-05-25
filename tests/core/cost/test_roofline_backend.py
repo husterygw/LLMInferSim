@@ -157,7 +157,7 @@ def _collective_op() -> Collective:
 
 
 def test_router_estimates_collective_comm_time(backend_eager):
-    """Collective op 走 CommunicationRooflineBackend, 不再静默跳过."""
+    """Collective op 走 RooflineBackend._estimate_collective (comm_plan Step 3)."""
     gemm = _gemm_op(m=128, n=6144, k=2560)
     coll = _collective_op()
     plan = StepOpPlan(step_id=0, phase="prefill", ops=(gemm, coll))

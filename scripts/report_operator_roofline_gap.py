@@ -1,8 +1,7 @@
 """Report measured operator latency vs roofline lower bound.
 
-Stage-3 scope: GEMM has a complete measured-vs-roofline path. Other op kinds are
-reported as coverage rows until their formula backends are promoted in later
-stages.
+Compares real collector JSONL rows with the roofline backend for every op kind
+that can be reconstructed as a runtime operator.
 """
 from __future__ import annotations
 
@@ -15,12 +14,30 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.operator_db.importers.collector_v2 import import_record
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
-from llm_infer_sim.core.operators import GEMM
+from llm_infer_sim.core.operators import (
+    AllGather,
+    AllReduce,
+    AllToAll,
+    Attention,
+    Collective,
+    FusedMoE,
+    GEMM,
+    MoERoutingProfile,
+    P2P,
+    ReduceScatter,
+)
+from llm_infer_sim.core.operators.context import OperatorContext
 from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.profiles.hardware import HardwareConfig, get_hardware_profile
+from llm_infer_sim.core.profiles.model_config import ModelConfig
+from llm_infer_sim.core.operators.gemm import dtype_to_bytes
 
 
 FIELDNAMES = [
@@ -47,6 +64,8 @@ FIELDNAMES = [
     "source_profiles",
 ]
 
+SUPPORTED_ROOFLINE_OP_KINDS = {"gemm", "attention", "moe", "collective"}
+
 
 def load_records(path: Path | str, hardware: str) -> list[OperatorRecord]:
     records: list[OperatorRecord] = []
@@ -64,13 +83,143 @@ def load_records(path: Path | str, hardware: str) -> list[OperatorRecord]:
     return records
 
 
-def record_to_operator(record: OperatorRecord, *, hw) -> GEMM:
-    if record.signature.op_kind != "gemm":
+def _dtype_bytes(dtype: str) -> float:
+    return dtype_to_bytes(dtype)
+
+
+def _deploy_from_record(record: OperatorRecord) -> DeployConfig:
+    parallel = dict(record.signature.parallel)
+    runtime = dict(record.signature.runtime)
+    return DeployConfig(
+        tp_size=int(parallel.get("tp", 1) or 1),
+        ep_size=int(parallel.get("ep", 1) or 1),
+        execution_mode=runtime.get("execution_mode", record.execution_mode),
+        backend=runtime.get("framework", record.framework),
+        backend_version=runtime.get("framework_version", record.framework_version),
+        block_size=int(runtime.get("block_size", 16) or 16),
+    )
+
+
+def _ctx_from_record(
+    record: OperatorRecord,
+    *,
+    hw: HardwareConfig,
+    model: ModelConfig | None = None,
+) -> OperatorContext:
+    elem_bytes = _dtype_bytes(record.signature.dtype)
+    return OperatorContext(
+        model=model or ModelConfig(),
+        deploy=_deploy_from_record(record),
+        hw=hw,
+        w_byte=elem_bytes,
+        a_byte=elem_bytes,
+        kv_byte=elem_bytes,
+        dtype=record.signature.dtype,
+    )
+
+
+def _attention_from_record(record: OperatorRecord, *, hw: HardwareConfig) -> Attention:
+    shape = dict(record.signature.shape)
+    runtime = dict(record.signature.runtime)
+    ctx = _ctx_from_record(record, hw=hw)
+    common = dict(
+        layer_idx=0,
+        bs=int(shape["num_seqs"]),
+        n_q=int(shape["num_q_heads"]),
+        n_kv=int(shape["num_kv_heads"]),
+        head_dim=int(shape["head_dim"]),
+        ctx=ctx,
+        name=f"attention_{record.signature.op_subtype}_{record.source.get('case_id')}",
+        op_subtype=record.signature.op_subtype,
+        kernel_source=runtime.get("kernel_source", record.kernel_source),
+    )
+    if record.signature.op_subtype == "prefill":
+        return Attention.flash_prefill(seqlen=int(shape["q_len"]), **common)
+    if record.signature.op_subtype == "decode":
+        return Attention.flash_decode(ctx_len=int(shape["kv_len"]), **common)
+    raise ValueError(
+        f"unsupported attention subtype: {record.signature.op_subtype!r}"
+    )
+
+
+def _moe_from_record(record: OperatorRecord, *, hw: HardwareConfig) -> FusedMoE:
+    shape = dict(record.signature.shape)
+    runtime = dict(record.signature.runtime)
+    model = ModelConfig(
+        name="collector_moe",
+        hidden_dim=int(shape["hidden"]),
+        is_moe=True,
+        num_experts=int(shape["num_experts"]),
+        num_activated_experts=int(shape["topk"]),
+        expert_dim=int(shape["moe_intermediate"]),
+    )
+    ctx = _ctx_from_record(record, hw=hw, model=model)
+    distribution = str(shape["routing_distribution"])
+    alpha = float(shape["power_law_alpha"])
+    routing = (
+        MoERoutingProfile.power_law(alpha)
+        if distribution == "power_law"
+        else MoERoutingProfile.balanced()
+    )
+    return FusedMoE.routed_experts(
+        layer_idx=0,
+        tokens=int(shape["num_tokens"]),
+        ctx=ctx,
+        routing=routing,
+        name=f"moe_{record.source.get('case_id')}",
+        op_subtype=record.signature.op_subtype,
+        kernel_source=runtime.get("kernel_source", record.kernel_source),
+    )
+
+
+def _collective_from_record(
+    record: OperatorRecord,
+    *,
+    hw: HardwareConfig,
+) -> Collective:
+    shape = dict(record.signature.shape)
+    parallel = dict(record.signature.parallel)
+    runtime = dict(record.signature.runtime)
+    cls_by_subtype: dict[str, type[Collective]] = {
+        "allreduce": AllReduce,
+        "allgather": AllGather,
+        "reducescatter": ReduceScatter,
+        "reduce_scatter": ReduceScatter,
+        "alltoall": AllToAll,
+        "p2p": P2P,
+    }
+    cls = cls_by_subtype.get(record.signature.op_subtype)
+    if cls is None:
         raise ValueError(
-            f"only GEMM formula is supported in stage-3 report, got "
-            f"{record.signature.op_kind!r}"
+            f"unsupported collective subtype: {record.signature.op_subtype!r}"
         )
-    return GEMM.from_record(record, hw=hw)
+    return cls(
+        name=f"collective_{record.source.get('case_id')}",
+        phase="operator_report",
+        layer_idx=None,
+        message_bytes=int(shape["message_bytes"]),
+        world_size=int(parallel.get("world_size", 1) or 1),
+        ctx=_ctx_from_record(record, hw=hw),
+        dtype_override=record.signature.dtype,
+        kernel_source=runtime.get("kernel_source", record.kernel_source),
+        comm_backend=runtime.get("backend", "nccl") or "nccl",
+        algo=runtime.get("algo") or "",
+        protocol=runtime.get("protocol") or "",
+        topology=runtime.get("topology") or "",
+    )
+
+
+def record_to_operator(record: OperatorRecord, *, hw: HardwareConfig) -> Any:
+    op_kind = record.signature.op_kind
+    if op_kind == "gemm":
+        return GEMM.from_record(record, hw=hw)
+    if op_kind == "attention":
+        return _attention_from_record(record, hw=hw)
+    if op_kind == "moe":
+        return _moe_from_record(record, hw=hw)
+    if op_kind == "collective":
+        return _collective_from_record(record, hw=hw)
+    raise ValueError(f"unsupported roofline op_kind: {op_kind!r}")
 
 
 def estimate_gap(
@@ -103,10 +252,10 @@ def estimate_gap(
         "source_profiles": ",".join(record.source.get("source_profiles") or []),
     }
 
-    if record.signature.op_kind != "gemm":
+    if record.signature.op_kind not in SUPPORTED_ROOFLINE_OP_KINDS:
         return row
     if roofline_backend is None:
-        raise ValueError("GEMM record requires a RooflineBackend")
+        raise ValueError(f"{record.signature.op_kind} record requires a RooflineBackend")
 
     op = record_to_operator(record, hw=roofline_backend.hw)
     entry = roofline_backend.estimate(op)
@@ -167,28 +316,28 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
     if not ok_rows:
         return
 
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in ok_rows:
-        groups[(row["op_subtype"], row["execution_mode"])].append(row)
+        groups[(row["op_kind"], row["op_subtype"], row["execution_mode"])].append(row)
 
     print()
-    print("=== GEMM roofline gap by (op_subtype, execution_mode) ===")
+    print("=== Roofline gap by (op_kind, op_subtype, execution_mode) ===")
     print(
-        f"{'op_subtype':<16} {'mode':<10} {'N':>4} "
+        f"{'op_kind':<12} {'op_subtype':<16} {'mode':<10} {'N':>4} "
         f"{'meas_p50_us':>12} {'roof_us':>12} "
         f"{'gap_p50':>10} {'gap_p90':>10} {'gap_max':>10} "
         f"{'compute':>8} {'memory':>8}"
     )
-    print("-" * 112)
+    print("-" * 125)
 
-    for (subtype, mode), recs in sorted(groups.items()):
+    for (op_kind, subtype, mode), recs in sorted(groups.items()):
         measured = [float(r["measured_us_p50"]) for r in recs]
         roofline = [float(r["roofline_us"]) for r in recs]
         gaps = [float(r["roofline_gap"]) for r in recs]
         compute_count = sum(1 for r in recs if r["roofline_bottleneck"] == "compute")
         memory_count = sum(1 for r in recs if r["roofline_bottleneck"] == "memory")
         print(
-            f"{subtype:<16} {mode:<10} {len(recs):>4} "
+            f"{op_kind:<12} {subtype:<16} {mode:<10} {len(recs):>4} "
             f"{_median(measured):>12.3f} {_median(roofline):>12.3f} "
             f"{_median(gaps):>10.2f} {_quantile(gaps, 0.9):>10.2f} "
             f"{max(gaps):>10.2f} {compute_count:>8} {memory_count:>8}"
@@ -196,7 +345,7 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
 
 
 def print_shape_analysis(rows: list[dict[str, Any]], *, top_n: int = 12) -> None:
-    ok_rows = [r for r in rows if r["status"] == "ok"]
+    ok_rows = [r for r in rows if r["status"] == "ok" and r["op_kind"] == "gemm"]
     if not ok_rows:
         return
 
@@ -369,14 +518,12 @@ def main() -> int:
 
     rows: list[dict[str, Any]] = []
     for record in records:
-        backend = None
-        if record.signature.op_kind == "gemm":
-            mode = record.execution_mode
-            if mode not in backends:
-                backends[mode] = RooflineBackend(
-                    hw, DeployConfig(execution_mode=mode),
-                )
-            backend = backends[mode]
+        mode = record.execution_mode
+        if mode not in backends:
+            backends[mode] = RooflineBackend(
+                hw, DeployConfig(execution_mode=mode),
+            )
+        backend = backends[mode]
         rows.append(estimate_gap(record, backend))
 
     print_summary(rows)

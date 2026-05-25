@@ -134,6 +134,73 @@ def test_qwen3_30b_a3b_moe_parse():
     assert all(m.is_moe_layer(i) for i in range(m.num_layers))
 
 
+# ---------------------------------------------------------------------------
+# moe_plan Phase 1 step 2: 从真实本地 config.json parse, 锁住目标 MoE 模型
+# 和 dense alias 防误用. mock-only 测试 (test_qwen3_30b_a3b_moe_parse) 仍保留作
+# 单元测试; 这两条是 end-to-end 防 alias 错配的 guard.
+# ---------------------------------------------------------------------------
+
+import json
+from pathlib import Path
+
+import pytest
+
+_QWEN3_30B_A3B_PATH = Path("/data/ygw/models/Qwen3-30B-A3B-Instruct-2507/config.json")
+_QWEN3_32B_PATH = Path("/data/ygw/models/Qwen3-32B/config.json")
+
+
+def _hf_config_from_json(path: Path) -> SimpleNamespace:
+    """读 config.json 转成 SimpleNamespace, 跟 extract_profile_bundle 期待的 hf_config 接口对齐."""
+    cfg = json.loads(path.read_text())
+    return SimpleNamespace(**cfg)
+
+
+@pytest.mark.skipif(
+    not _QWEN3_30B_A3B_PATH.exists(),
+    reason=f"target MoE model config absent: {_QWEN3_30B_A3B_PATH}",
+)
+def test_qwen3_30b_a3b_real_config_parse_is_moe():
+    """moe_plan §0 / Phase 1 step 2: 从真实 config.json parse, 锁住目标 MoE 模型字段."""
+    hf = _hf_config_from_json(_QWEN3_30B_A3B_PATH)
+    bundle = extract_profile_bundle(_make_vllm_config(hf, "Qwen3-30B-A3B-Instruct-2507"))
+    m = bundle.model
+    assert m.is_moe, "Qwen3-30B-A3B must be detected as MoE"
+    assert m.num_experts == 128
+    assert m.num_activated_experts == 8
+    assert m.expert_dim == 768
+    assert m.num_shared_experts == 0           # A3B 没有 shared expert
+    assert m.hidden_dim == 2048
+    assert m.num_layers == 48
+    assert m.num_heads == 32
+    assert m.num_kv_heads == 4
+    assert m.head_dim == 128
+    assert all(m.is_moe_layer(i) for i in range(m.num_layers))
+
+
+@pytest.mark.skipif(
+    not _QWEN3_32B_PATH.exists(),
+    reason=f"dense alias guard model config absent: {_QWEN3_32B_PATH}",
+)
+def test_qwen3_32b_dense_alias_not_used_for_moe():
+    """moe_plan §0 / Phase 1 step 2 guard: Qwen3-32B 是 dense, 必须 is_moe == False.
+
+    防误用: `qwen3_32b` alias 不应被放进 MoE sweep, 因为它的 config.json 没有
+    num_experts / moe_intermediate_size 字段. 这个 guard 一旦 fail, 说明:
+      - 要么 Qwen3-32B 本身被换成 MoE 变体 (极不可能)
+      - 要么 profile_extractor 把 dense 错检成 MoE (regression)
+    """
+    hf = _hf_config_from_json(_QWEN3_32B_PATH)
+    bundle = extract_profile_bundle(_make_vllm_config(hf, "Qwen3-32B"))
+    m = bundle.model
+    assert not m.is_moe, "Qwen3-32B is dense, must NOT be detected as MoE"
+    assert m.num_experts == 0
+    assert m.expert_dim == 0
+    assert m.num_shared_experts == 0
+    assert m.hidden_dim == 5120
+    assert m.num_layers == 64
+    assert m.ffn_dim == 25600                  # dense FFN, 没有 moe_intermediate_size
+
+
 def test_deepseek_naming_still_works():
     """DeepSeek 命名 (n_routed_experts / n_shared_experts / first_k_dense_replace) 不能破坏。"""
     hf = SimpleNamespace(

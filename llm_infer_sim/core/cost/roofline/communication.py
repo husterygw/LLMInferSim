@@ -15,18 +15,29 @@ Phase 5 重构(详 docs/COMMUNICATION_MODELING.md):
       + cross_node_term if cross_node                         [跨节点 hook, 仅留路由]
 
 NCCL 算法选择: `min(candidate × algo_bias)` 近似 NCCL 的"选最优"启发。
+
+comm_plan Step 4: AllReduce 统一走 NCCL allreduce 参数化候选:
+ll_tree / ll128_tree / simple_ring / simple_tree (+ nvls), 不再共享全局
+comm_step_latency, 也不再保留旧 ring/tree fallback.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
+from llm_infer_sim.core.profiles.communication import AllReduceParams
 from llm_infer_sim.core.profiles.hardware import HardwareConfig
 
 
 CollectiveMode = Literal["eager", "cudagraph"]
 TopologyHint = Literal["concentrated", "balanced"]
+
+
+DEFAULT_NCCL_ALLREDUCE_PARAMS = AllReduceParams(
+    ll_tree_alpha_s=7.0e-6,
+    ll_tree_max_bytes=8 * 1024,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,24 +119,6 @@ def _is_cross_node(n: int, hw: HardwareConfig) -> bool:
 # data 约定: 各函数内部已说明的"per-rank input bytes"。
 # ---------------------------------------------------------------------------
 
-def _allreduce_ring(n: int, data: float, alpha: float, beta: float) -> float:
-    """Ring AllReduce. data = per-rank input bytes.
-
-    Reduce-scatter (n-1) hops × data/n bytes + AllGather (n-1) hops × data/n bytes
-    = 2(n-1) latency + 2(n-1)/n × data/β
-    """
-    return 2 * (n - 1) * alpha + (2 * (n - 1) / n) * data / beta
-
-
-def _allreduce_tree(n: int, data: float, alpha: float, beta: float) -> float:
-    """Tree AllReduce. Reduce up + Broadcast down.
-
-    Latency: 2 × depth, Data: 2 × data (each hop pipelines full data).
-    """
-    depth = math.ceil(math.log2(n))
-    return 2 * depth * alpha + 2 * data / beta
-
-
 def _allreduce_nvls(n: int, data: float, alpha: float, beta_aggregate: float) -> float:
     """NVSwitch SHARP / NVLS AllReduce (粗略上界).
 
@@ -173,8 +166,166 @@ def _p2p_single(data: float, alpha: float, beta: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Step 4: AllReduce — 走 NCCL allreduce candidates
+# 候选 ll_tree / ll128_tree / simple_ring / simple_tree (+ nvls).
+# 详 comm_plan §7.2.
+# ---------------------------------------------------------------------------
+
+def _nccl_allreduce_params(hw: HardwareConfig) -> AllReduceParams:
+    """Return NCCL AllReduce params, falling back to module defaults.
+
+    这里的 fallback 仍然是新版 NCCL 候选模型的默认参数, 不是旧 ring/tree 公式。
+    """
+    if hw.communication is None:
+        return DEFAULT_NCCL_ALLREDUCE_PARAMS
+    backend = hw.communication.backends.get("nccl")
+    if backend is None:
+        return DEFAULT_NCCL_ALLREDUCE_PARAMS
+    return backend.allreduce
+
+
+def _fabric_bw_no_protocol(
+    hw: HardwareConfig,
+    n: int,
+    topology_hint: TopologyHint,
+    visible_devices: Optional[list],
+) -> float:
+    """Step 4 fabric β: 保留 topology contention, 去掉旧全局 protocol_efficiency,
+    让每个候选用自己的 beta_scale 当 protocol 因子."""
+    bw_with_protocol = hw.effective_intra_bw(
+        n=n, topology_hint=topology_hint, visible_devices=visible_devices,
+    )
+    return bw_with_protocol / max(hw.intra_node_protocol_efficiency, 1e-9)
+
+
+def _allreduce_candidates_nccl(
+    hw: HardwareConfig,
+    n: int,
+    message_bytes: float,
+    *,
+    topology_hint: TopologyHint,
+    visible_devices: Optional[list],
+    protocol_hint: Optional[str] = None,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Step 4 候选生成. 返回 (candidate_name -> latency_s, name -> bias)."""
+    params = _nccl_allreduce_params(hw)
+    fabric_bw = _fabric_bw_no_protocol(hw, n, topology_hint, visible_devices)
+    if fabric_bw <= 0:
+        return {}, {}
+
+    depth = max(math.ceil(math.log2(n)), 1)
+    candidates: dict[str, float] = {}
+
+    if message_bytes <= params.ll_tree_max_bytes and protocol_hint in (None, "ll"):
+        beta_ll = fabric_bw * params.ll_tree_beta_scale
+        candidates["ll_tree"] = (
+            2 * depth * params.ll_tree_alpha_s + 2 * message_bytes / beta_ll
+        )
+
+    if message_bytes <= params.ll128_tree_max_bytes and protocol_hint in (None, "ll128"):
+        beta_ll128 = fabric_bw * params.ll128_tree_beta_scale
+        candidates["ll128_tree"] = (
+            2 * depth * params.ll128_tree_alpha_s + 2 * message_bytes / beta_ll128
+        )
+
+    if protocol_hint in (None, "simple"):
+        beta_ring = fabric_bw * params.ring_beta_scale
+        candidates["simple_ring"] = (
+            2 * (n - 1) * params.ring_startup_alpha_s
+            + (2 * (n - 1) / n) * message_bytes / beta_ring
+        )
+
+        beta_tree = fabric_bw * params.tree_beta_scale
+        candidates["simple_tree"] = (
+            2 * depth * params.tree_startup_alpha_s + 2 * message_bytes / beta_tree
+        )
+
+    if hw.has_nvlink_sharp and hw.enable_nvls_model:
+        candidates["nvls"] = _allreduce_nvls(
+            n, message_bytes,
+            alpha=params.ring_startup_alpha_s,
+            beta_aggregate=fabric_bw * n,
+        )
+
+    return candidates, dict(params.algorithm_bias or {})
+
+
+def _select_with_bias(
+    candidates: dict[str, float], biases: dict[str, float], algo: str,
+) -> tuple[str, float]:
+    """min(candidate × bias). 若 algo != 'auto' 强制单选."""
+    if algo != "auto" and algo in candidates:
+        return algo, candidates[algo]
+    best_algo: Optional[str] = None
+    best_time = float("inf")
+    for name, t in candidates.items():
+        adj = t * biases.get(name, 1.0)
+        if adj < best_time:
+            best_time = adj
+            best_algo = name
+    assert best_algo is not None, "no candidates produced"
+    return best_algo, candidates[best_algo]
+
+
+# ---------------------------------------------------------------------------
 # Public API: top-level dispatch per collective
 # ---------------------------------------------------------------------------
+
+def allreduce_time_with_breakdown(
+    data_bytes: float,
+    n: int,
+    hw: HardwareConfig,
+    *,
+    mode: CollectiveMode = "eager",
+    topology_hint: TopologyHint = "concentrated",
+    visible_devices: Optional[list] = None,
+    algo: str = "auto",
+    protocol_hint: Optional[str] = None,
+) -> tuple[float, dict[str, Any]]:
+    """Step 4: AllReduce wall-clock + algorithm breakdown.
+
+    Returns:
+        (latency_s, breakdown)
+        breakdown keys:
+          path: "nccl"
+          candidates: {name: time_s}
+          selected: 选中算法名
+          algorithm_term: 选中算法的 algorithm time (s, 不含 framework_overhead/floor)
+          framework_overhead_s: launch overhead
+    """
+    if n <= 1 or data_bytes <= 0:
+        return 0.0, {
+            "path": "nccl",
+            "candidates": {},
+            "selected": None,
+            "algorithm_term": 0.0,
+            "framework_overhead_s": 0.0,
+        }
+
+    candidates, biases = _allreduce_candidates_nccl(
+        hw, n, data_bytes,
+        topology_hint=topology_hint,
+        visible_devices=visible_devices,
+        protocol_hint=protocol_hint,
+    )
+    if not candidates:
+        raise ValueError(
+            "NCCL AllReduce produced no candidates; check intra-node bandwidth "
+            "and protocol_hint"
+        )
+    selected, algo_term = _select_with_bias(candidates, biases, algo)
+    fo = _framework_overhead(hw, "allreduce", mode)
+    return (
+        _optional_collective_floor(hw, "allreduce") + algo_term + fo,
+        {
+            "path": "nccl",
+            "candidates": candidates,
+            "selected": selected,
+            "algorithm_term": algo_term,
+            "framework_overhead_s": fo,
+        },
+    )
+
 
 def allreduce_time(
     data_bytes: float,
@@ -184,58 +335,17 @@ def allreduce_time(
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
     visible_devices: Optional[list] = None,
-    cross_node: bool = False,
-    algo: str = "auto",   # back-compat: 老调用可能传 algo, Phase 5 改用 min(候选)
+    algo: str = "auto",
+    protocol_hint: Optional[str] = None,
 ) -> float:
-    """AllReduce wall-clock time (seconds).
-
-    Args:
-        data_bytes: per-rank input tensor bytes.
-        n: world size for this collective.
-        mode: "eager" or "cudagraph". cudagraph 下不加 framework_call_overhead.
-        topology_hint: 当 visible_devices 没给时的拓扑假设(concentrated / balanced).
-        visible_devices: 实际 GPU id list (例 [0,1,4,5]); 给定时优先用来推 n_per_root.
-        cross_node: 跨节点路由; Phase 5 保持现状, 走旧 hierarchical 公式.
-        algo: 兼容老接口, Phase 5 内部用 min(候选) 选, 该参数仅当 != "auto" 时强制.
-    """
-    if n <= 1 or data_bytes <= 0:
-        return 0.0
-
-    if cross_node or _is_cross_node(n, hw):
-        # 跨节点路径只算 algorithm; framework_overhead 顶层加, 跟 single-node 对称
-        return (
-            _hierarchical_allreduce(data_bytes, n, hw)
-            + _framework_overhead(hw, "allreduce", mode)
-        )
-
-    alpha = hw.comm_step_latency
-    beta = hw.effective_intra_bw(
-        n=n, topology_hint=topology_hint, visible_devices=visible_devices,
+    """AllReduce wall-clock time (seconds). Step 4: thin wrapper over
+    allreduce_time_with_breakdown(), 老调用方拿 scalar."""
+    latency, _ = allreduce_time_with_breakdown(
+        data_bytes, n, hw,
+        mode=mode, topology_hint=topology_hint, visible_devices=visible_devices,
+        algo=algo, protocol_hint=protocol_hint,
     )
-    if beta == 0:
-        return float("inf")
-
-    # 算法候选
-    candidates: dict[str, float] = {
-        "ring": _allreduce_ring(n, data_bytes, alpha, beta),
-        "tree": _allreduce_tree(n, data_bytes, alpha, beta),
-    }
-    if hw.has_nvlink_sharp and hw.enable_nvls_model:
-        candidates["nvls"] = _allreduce_nvls(
-            n, data_bytes, alpha, beta_aggregate=beta * n
-        )
-
-    # 老 algo 参数兼容: 强制指定算法时单选, 否则 min(候选 × bias)
-    if algo != "auto" and algo in candidates:
-        algo_term = candidates[algo]
-    else:
-        _, algo_term = _select_min_candidate(hw, "allreduce", candidates)
-
-    return (
-        _optional_collective_floor(hw, "allreduce")
-        + algo_term
-        + _framework_overhead(hw, "allreduce", mode)
-    )
+    return latency
 
 
 def broadcast_time(
@@ -320,6 +430,116 @@ def reducescatter_time(
     )
 
 
+def _alltoall_candidates_v2(
+    hw: HardwareConfig,
+    n: int,
+    data_bytes: float,
+    *,
+    topology_hint: TopologyHint,
+    visible_devices: Optional[list],
+) -> dict[str, float]:
+    """Step 6-A AllToAll v2 候选. 详 comm_plan §8.3.
+
+    pairwise: (n-1)*alpha + (n-1)/n * data/beta_pairwise, 再 × contention_factor
+              (n>4 时 root 抢带宽).
+    后续 batched_pairwise / hierarchical_alltoall 跟 calibration 同步落地.
+    """
+    backend = hw.communication.backends["nccl"]
+    params = backend.alltoall
+    fabric_bw = _fabric_bw_no_protocol(hw, n, topology_hint, visible_devices)
+    if fabric_bw <= 0:
+        return {}
+
+    beta_pairwise = fabric_bw * params.pairwise_beta_scale
+    base = (n - 1) * params.pairwise_alpha_s + ((n - 1) / n) * data_bytes / beta_pairwise
+    contention = params.contention_factor if n > 4 else 1.0
+    return {"pairwise": base * contention}
+
+
+def alltoall_time_with_breakdown(
+    data_bytes: float,
+    n: int,
+    hw: HardwareConfig,
+    *,
+    mode: CollectiveMode = "eager",
+    topology_hint: TopologyHint = "concentrated",
+    visible_devices: Optional[list] = None,
+    algo: str = "auto",
+) -> tuple[float, dict[str, Any]]:
+    """Step 6-A: AllToAll wall-clock + algorithm breakdown.
+
+    Returns:
+        (latency_s, breakdown). breakdown keys 跟 allreduce_time_with_breakdown 对称:
+        path / candidates / selected / algorithm_term / framework_overhead_s.
+    """
+    if n <= 1 or data_bytes <= 0:
+        return 0.0, {
+            "path": "v2" if hw.communication else "legacy_intra",
+            "candidates": {}, "selected": None,
+            "algorithm_term": 0.0, "framework_overhead_s": 0.0,
+        }
+
+    if _is_cross_node(n, hw):
+        algo_term = _hierarchical_alltoall(data_bytes, n, hw)
+        fo = _framework_overhead(hw, "alltoall", mode)
+        return algo_term + fo, {
+            "path": "legacy_hierarchical",
+            "candidates": {},
+            "selected": "hierarchical",
+            "algorithm_term": algo_term,
+            "framework_overhead_s": fo,
+        }
+
+    if (
+        hw.communication is not None
+        and "nccl" in hw.communication.backends
+    ):
+        candidates = _alltoall_candidates_v2(
+            hw, n, data_bytes,
+            topology_hint=topology_hint, visible_devices=visible_devices,
+        )
+        if candidates:
+            if algo != "auto" and algo in candidates:
+                selected, algo_term = algo, candidates[algo]
+            else:
+                selected = min(candidates, key=candidates.get)
+                algo_term = candidates[selected]
+            fo = _framework_overhead(hw, "alltoall", mode)
+            total = (
+                _optional_collective_floor(hw, "alltoall")
+                + algo_term
+                + fo
+            )
+            return total, {
+                "path": "v2",
+                "candidates": candidates,
+                "selected": selected,
+                "algorithm_term": algo_term,
+                "framework_overhead_s": fo,
+            }
+
+    # Legacy fallback (hw 没配 communication)
+    alpha = hw.comm_step_latency
+    beta = hw.effective_intra_bw(n, topology_hint, visible_devices)
+    if beta == 0:
+        return float("inf"), {
+            "path": "legacy_intra", "candidates": {}, "selected": None,
+            "algorithm_term": float("inf"), "framework_overhead_s": 0.0,
+        }
+    algo_term = _alltoall_pairwise(n, data_bytes, alpha, beta)
+    fo = _framework_overhead(hw, "alltoall", mode)
+    return (
+        _optional_collective_floor(hw, "alltoall") + algo_term + fo,
+        {
+            "path": "legacy_intra",
+            "candidates": {"pairwise": algo_term},
+            "selected": "pairwise",
+            "algorithm_term": algo_term,
+            "framework_overhead_s": fo,
+        },
+    )
+
+
 def alltoall_time(
     data_bytes: float,
     n: int,
@@ -330,24 +550,14 @@ def alltoall_time(
     visible_devices: Optional[list] = None,
     algo: str = "auto",
 ) -> float:
-    """AllToAll wall-clock time (s). data_bytes = per-rank total input bytes (sent to all peers)."""
-    if n <= 1 or data_bytes <= 0:
-        return 0.0
-    if _is_cross_node(n, hw):
-        return (
-            _hierarchical_alltoall(data_bytes, n, hw)
-            + _framework_overhead(hw, "alltoall", mode)
-        )
-    alpha = hw.comm_step_latency
-    beta = hw.effective_intra_bw(n, topology_hint, visible_devices)
-    if beta == 0:
-        return float("inf")
-    algo_term = _alltoall_pairwise(n, data_bytes, alpha, beta)
-    return (
-        _optional_collective_floor(hw, "alltoall")
-        + algo_term
-        + _framework_overhead(hw, "alltoall", mode)
+    """AllToAll wall-clock time (s). Step 6-A: thin wrapper over
+    alltoall_time_with_breakdown(). data_bytes = per-rank total input bytes."""
+    latency, _ = alltoall_time_with_breakdown(
+        data_bytes, n, hw,
+        mode=mode, topology_hint=topology_hint, visible_devices=visible_devices,
+        algo=algo,
     )
+    return latency
 
 
 def p2p_time(
@@ -379,21 +589,6 @@ def p2p_time(
 # ---------------------------------------------------------------------------
 # Hierarchical (cross-node) helpers — Phase 5 不重构, 沿用现公式 + 新 β/α 接口
 # ---------------------------------------------------------------------------
-
-def _hierarchical_allreduce(
-    data_bytes: float, n: int, hw: HardwareConfig
-) -> float:
-    """Hierarchical 2-level ring allreduce (详 §4.7.3). Phase 5 暂不改公式主体."""
-    n1 = hw.intra_node_size
-    n2 = (n + n1 - 1) // n1
-    alpha_intra = hw.comm_step_latency
-    alpha_inter = hw.inter_node_latency
-    beta_intra = hw.effective_intra_bw(n1)
-    beta_inter = hw.effective_inter_bw
-    intra_part = 2 * (n1 - 1) * (alpha_intra + data_bytes / (n1 * beta_intra))
-    inter_part = 2 * (n2 - 1) * (alpha_inter + data_bytes / (n1 * n2 * beta_inter))
-    return intra_part + inter_part
-
 
 def _hierarchical_allgather(
     data_bytes: float, n: int, hw: HardwareConfig

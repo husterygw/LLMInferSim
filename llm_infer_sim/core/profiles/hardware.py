@@ -15,6 +15,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
+from llm_infer_sim.core.profiles.communication import (
+    CommunicationProfile,
+    rtx_4090_nccl_communication,
+)
+
 
 TopologyHint = Literal["concentrated", "balanced"]
 
@@ -100,6 +105,10 @@ class HardwareConfig:
     # 含义混杂 (GPU kernel start floor + 隐式 framework overhead). 违反"独立实测"原则.
     # Stage A 校准时若发现需要, 走 scripts/measure_compute_overhead.py (待写) 独测.
     kernel_overhead: dict = field(default_factory=dict)
+
+    # comm_plan Step 2: per-collective 通信参数 (替代 comm_step_latency 这种"万能 alpha").
+    # 默认 None, 由 profile entry 显式注入. Step 4 接通 RooflineBackend 后取代旧字段.
+    communication: Optional[CommunicationProfile] = None
 
     def __post_init__(self):
         if self.peak_flops_bf16 == 0.0:
@@ -479,6 +488,9 @@ KNOWN_PROFILES: dict[str, dict] = {
         has_nvlink_sharp=False,                    # Ada 没 NVLink/NVLS
         inter_node_bandwidth=0.0,         # 单卡, 不 inter-node
         inter_node_latency=0.0,
+        # comm_plan Step 2: 新通信参数结构. AllReduce 已统一走 NCCL candidate 模型;
+        # comm_step_latency / intra_node_protocol_efficiency 仍供其它 legacy collective 使用.
+        communication=rtx_4090_nccl_communication(),
     ),
 }
 

@@ -1,27 +1,36 @@
 """vLLM MoE runner — 测一个 rank 的 fused_experts 本地 compute (单 GPU).
 
-任意 (tp, ep) 都在单 GPU 上 sim:
-    local_inter   = moe_intermediate // tp
-    local_experts = num_experts // ep
-    expert_map    = [-1 if global_id not in this_rank's slice else local_idx]
+moe_plan Phase 2: 字段口径 AIC-aligned (raw record 直接产 AIC 字段).
+    moe_dtype       - bfloat16 / float16 (默认 bf16)
+    num_tokens
+    hidden_size     - 替代 internal 'hidden'
+    inter_size      - 替代 internal 'moe_intermediate'
+    topk
+    num_experts
+    moe_tp_size     - 替代 internal 'tp'
+    moe_ep_size     - 替代 internal 'ep'
+    distribution    - 'balanced' / 'power_law_<alpha>'
+    execution_mode  - cudagraph / eager
 
-跟 AIC `collector/vllm/collect_moe_v2.py` 同思路: 单 GPU compute,
+任意 (moe_tp, moe_ep) 都在单 GPU 上 sim 一个 rank 的本地 compute:
+    local_inter   = inter_size // moe_tp
+    local_experts = num_experts // moe_ep
+    expert_map    = vLLM determine_expert_map(ep_size=moe_ep, ep_rank=0, ...)
+
+跟 AIC `aiconfigurator/collector/vllm/collect_moe_v2.py` 同思路: 单 GPU compute,
 通信 (AllReduce for TP / AllToAll for EP) 由 collective collector 单独测,
-sim cost model 自己加. 这样 op 数据语义干净:
+sim cost model 自己加. 数据语义干净:
     MoE 数据    = 一个 rank 的 fused_experts compute (无 dist)
     collective 数据 = AllReduce / AllToAll 单独
 
-Routing:
-    balanced              - 每 expert 收到 ~mean(M × topk / num_experts)
-    power_law(α)          - 按 rank^(-α) 偏置, 少数 expert 拿走大头
-跟 case.params 字段对齐 (cases/moe.py).
-
-BF16 unquantized 第一版.
+Routing logits 生成跟 AIC 对齐 (`aiconfigurator/collector/helper.py` 内嵌简化版):
+    balanced              - balanced_logits + topk → (topk_weights, topk_ids)
+    power_law_<alpha>     - power_law_logits + topk
 """
 from __future__ import annotations
 
 from collector.harness import BenchConfig, BenchResult, measure
-from collector.runners._vllm_dist import ensure_initialized, torch_dtype
+from collector.runners._vllm_dist import ensure_initialized
 from collector.schemas import (
     Case,
     ExecutionMode,
@@ -32,13 +41,123 @@ from collector.schemas import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Dtype: AIC moe_dtype (bfloat16/float16) → torch dtype
+# (不复用 collector/runners/_vllm_dist.torch_dtype 因为它读 internal 'bf16'/'fp16' 命名)
+# ---------------------------------------------------------------------------
+
+def _moe_dtype_to_torch(moe_dtype: str):
+    import torch
+    table = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    if moe_dtype not in table:
+        raise NotImplementedError(
+            f"moe_dtype={moe_dtype!r} not supported "
+            f"(Phase 2 仅 bfloat16/float16; int4_wo/fp8/fp4/mxfp4 后续 phase)"
+        )
+    return table[moe_dtype]
+
+
+# ---------------------------------------------------------------------------
+# AIC-aligned routing logits (内嵌简化版, 跟 aiconfigurator/collector/helper.py
+# balanced_logits / power_law_logits_v3 数学等价, 不依赖 EPLB / WideEP / num_slots)
+# ---------------------------------------------------------------------------
+
+def _balanced_logits(num_tokens: int, num_experts: int, topk: int, device: str):
+    """AIC balanced_logits 复刻: 返 (num_tokens, num_experts) softmax logits."""
+    import math
+    import torch
+    import torch.nn.functional as F
+
+    stride = math.ceil(num_experts / topk)
+    token_indices = torch.arange(num_tokens).unsqueeze(1)
+    topk_indices = torch.arange(topk).unsqueeze(0)
+    if num_tokens >= stride:
+        h_selected = (token_indices + topk_indices * stride) % num_experts
+    else:
+        h_selected = (
+            (token_indices * stride / num_tokens + topk_indices * stride).long()
+            % num_experts
+        )
+    expert_one_hot = F.one_hot(h_selected.long(), num_classes=num_experts).sum(1)
+    return F.softmax(expert_one_hot.to(torch.bfloat16), dim=1).to(device)
+
+
+def _power_law_logits(
+    num_tokens: int, num_experts: int, topk: int, alpha: float,
+    device: str, seed: int = 0xA15,
+):
+    """AIC power_law_logits_v3 复刻 (无 EPLB / WideEP / num_slots 路径).
+
+    rank r ∈ [1..E], P(r) ∝ r^(-alpha). 采样后通过 expert permutation 打乱
+    rank→expert 映射, 避免 expert id=0 永远是热门. fixed seed 保证 case_id
+    跟 latency 1:1 可重现.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    ranks = torch.arange(1, num_experts + 1, dtype=torch.float64)
+    probs = ranks ** (-alpha)
+    probs = probs / probs.sum()
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    sampled = torch.multinomial(
+        probs, num_samples=num_tokens * topk,
+        replacement=True, generator=gen,
+    ).reshape(num_tokens, topk)
+    perm = torch.randperm(num_experts, generator=gen)
+    sampled = perm[sampled]
+    expert_one_hot = F.one_hot(sampled.long(), num_classes=num_experts).sum(1)
+    return F.softmax(expert_one_hot.to(torch.bfloat16), dim=1).to(device)
+
+
+def _build_routing(
+    num_tokens: int, topk: int, num_experts: int,
+    distribution: str, device: str,
+):
+    """生成 (topk_weights, topk_ids) 给 fused_experts.
+
+    distribution 解码:
+        'balanced'         → balanced_logits + topk
+        'power_law_<alpha>'→ power_law_logits(alpha=<alpha>) + topk
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if distribution == "balanced":
+        logits = _balanced_logits(num_tokens, num_experts, topk, device)
+    elif distribution.startswith("power_law_"):
+        try:
+            alpha = float(distribution[len("power_law_"):])
+        except ValueError as e:
+            raise ValueError(
+                f"distribution={distribution!r} 不是有效 power_law_<alpha> 格式"
+            ) from e
+        logits = _power_law_logits(num_tokens, num_experts, topk, alpha, device)
+    else:
+        raise NotImplementedError(
+            f"distribution={distribution!r} not supported "
+            f"(仅 balanced / power_law_<alpha>)"
+        )
+
+    weights, ids = torch.topk(logits, topk, dim=-1)
+    topk_weights = F.softmax(weights, dim=-1).to(torch.float32)
+    topk_ids = ids.to(torch.int32)
+    return topk_weights, topk_ids
+
+
+# ---------------------------------------------------------------------------
+# Record builder
+# ---------------------------------------------------------------------------
+
 def build_record(
     case: Case,
     bench: BenchResult,
     *,
     framework_version: str,
     device_name: str,
-    kernel_source: str = "vllm_fused_experts",
+    kernel_source: str = "vllm_fused_moe",
 ) -> RawRecord:
     return RawRecord(
         case_id=case.case_id,
@@ -65,88 +184,49 @@ def build_record(
     )
 
 
-def _build_routing(
-    num_tokens: int,
-    topk: int,
-    num_experts: int,
-    distribution: str,
-    alpha: float,
-    device: str,
-):
-    """构造 (topk_weights, topk_ids) 模拟指定分布. 返 (M, topk) shape."""
-    import torch
-
-    if distribution == "balanced":
-        # round-robin: 每 token 的 topk 个槽顺序覆盖所有 expert,
-        # 起点跟着 token id 偏一下避免 row 之间完全一样.
-        ids = torch.arange(num_tokens * topk, device=device, dtype=torch.int32)
-        topk_ids = (ids % num_experts).view(num_tokens, topk).to(torch.int32)
-    elif distribution == "power_law":
-        # rank r ∈ [1..E], P(r) ∝ r^(-alpha). 采样后映射到随机 expert permutation,
-        # 保证每次 case 一致但 expert 顺序不偏 expert id=0.
-        ranks = torch.arange(1, num_experts + 1, dtype=torch.float64)
-        probs = ranks ** (-alpha)
-        probs = probs / probs.sum()
-        gen = torch.Generator(device="cpu").manual_seed(0xA15)
-        sampled = torch.multinomial(
-            probs, num_samples=num_tokens * topk, replacement=True, generator=gen,
-        ).to(torch.int32)
-        # 把 rank → expert id permutation, 避免 expert 0 永远是热门
-        perm = torch.randperm(num_experts, generator=gen).to(torch.int32)
-        topk_ids = perm[sampled].view(num_tokens, topk).to(device).to(torch.int32)
-    else:
-        raise NotImplementedError(f"routing distribution {distribution!r} not supported")
-
-    # topk_weights: 简单 uniform 1/topk, fused_experts 不依赖具体值 (仅做加权和)
-    topk_weights = torch.full(
-        (num_tokens, topk), 1.0 / topk, device=device, dtype=torch.float32,
-    )
-    return topk_weights, topk_ids
-
+# ---------------------------------------------------------------------------
+# run_case
+# ---------------------------------------------------------------------------
 
 def run_case(case: Case, device: int) -> RawRecord:
-    """跑单 MoE case (任意 tp, ep, 单 GPU sim 一个 rank 的本地 compute).
+    """跑单 MoE case (单 GPU sim 一个 rank 的本地 compute).
 
-    case.params 必含: num_tokens, hidden, moe_intermediate, topk, num_experts,
-                     tp, ep, routing_distribution, power_law_alpha, dtype, execution_mode
+    case.params 必含 (AIC-aligned, moe_plan §3.6.1):
+        num_tokens, hidden_size, inter_size, topk, num_experts,
+        moe_tp_size, moe_ep_size, distribution, moe_dtype, execution_mode
     """
     p = case.params
-
-    if p["dtype"] != "bf16":
-        raise NotImplementedError(
-            f"vllm_moe runner: dtype={p['dtype']} not supported (BF16 only)"
-        )
-
-    tp = int(p.get("tp", 1))
-    ep = int(p.get("ep", 1))
 
     import torch
     import vllm
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.fused_moe import fused_experts
+    from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
 
-    dtype = torch_dtype(p["dtype"])
+    dtype = _moe_dtype_to_torch(p["moe_dtype"])
     device_str = f"cuda:{device}"
 
     M = int(p["num_tokens"])
-    hidden = int(p["hidden"])
-    moe_inter = int(p["moe_intermediate"])
+    hidden = int(p["hidden_size"])
+    moe_inter = int(p["inter_size"])
     topk = int(p["topk"])
     E_global = int(p["num_experts"])
+    moe_tp = int(p["moe_tp_size"])
+    moe_ep = int(p["moe_ep_size"])
+    distribution = str(p["distribution"])
 
-    if moe_inter % tp != 0:
+    if moe_inter % moe_tp != 0:
         raise NotImplementedError(
-            f"moe_intermediate={moe_inter} not divisible by tp={tp}"
+            f"inter_size={moe_inter} not divisible by moe_tp_size={moe_tp}"
         )
-    if E_global % ep != 0:
+    if E_global % moe_ep != 0:
         raise NotImplementedError(
-            f"num_experts={E_global} not divisible by ep={ep}"
+            f"num_experts={E_global} not divisible by moe_ep_size={moe_ep}"
         )
 
-    local_inter = moe_inter // tp
-    E_local = E_global // ep
+    local_inter = moe_inter // moe_tp
+    E_local = E_global // moe_ep
 
-    # 一个 rank 持有: [E/ep experts, 2 × N/tp gate+up, hidden] / [E/ep, hidden, N/tp]
     w1_shape = (E_local, 2 * local_inter, hidden)
     w2_shape = (E_local, hidden, local_inter)
 
@@ -157,21 +237,17 @@ def run_case(case: Case, device: int) -> RawRecord:
         w1 = torch.randn(w1_shape, dtype=dtype, device=device_str)
         w2 = torch.randn(w2_shape, dtype=dtype, device=device_str)
         topk_weights, topk_ids = _build_routing(
-            M, topk, E_global,
-            p["routing_distribution"], float(p["power_law_alpha"]),
-            device_str,
+            M, topk, E_global, distribution, device_str,
         )
 
-        # expert_map: global expert id → local idx, 不在本 rank 的 expert 标 -1
-        # ep=1 时全 expert 都在本地, 不需要 expert_map.
-        if ep > 1:
-            expert_map = torch.full(
-                (E_global,), -1, dtype=torch.int32, device=device_str,
+        # expert_map: vLLM determine_expert_map (ep_rank=0).
+        # ep=1 → expert_map=None (全 expert local).
+        if moe_ep > 1:
+            _, expert_map, _ = determine_expert_map(
+                ep_size=moe_ep, ep_rank=0, global_num_experts=E_global,
             )
-            # rank 0 的 ep_rank=0 → 持 expert [0, E_local)
-            expert_map[:E_local] = torch.arange(
-                E_local, dtype=torch.int32, device=device_str,
-            )
+            if expert_map is not None:
+                expert_map = expert_map.to(device_str)
         else:
             expert_map = None
 
@@ -189,8 +265,10 @@ def run_case(case: Case, device: int) -> RawRecord:
         if mode == "eager":
             cfg = BenchConfig(n_warmups=3, n_iters=10, use_cuda_graph=False)
         elif mode == "cudagraph":
-            cfg = BenchConfig(n_warmups=3, n_iters=10,
-                              use_cuda_graph=True, allow_graph_fail=False)
+            cfg = BenchConfig(
+                n_warmups=3, n_iters=10,
+                use_cuda_graph=True, allow_graph_fail=False,
+            )
         else:
             raise NotImplementedError(f"execution_mode {mode!r} not supported")
         bench = measure(kernel_func, cfg)

@@ -1,14 +1,21 @@
-"""MoE canonicalizer 单测 — Step 2.3.
+"""MoE canonicalizer 单测 — Step 2.3 + moe_plan Phase 2.
 
 锁住:
   - balanced 与 power_law signature 不同 (IMPL_PLAN §2.4 测试点 2)
   - power_law alpha 不同 → 不同 signature
   - tp / ep 都进 parallel key
   - collector ↔ runtime signature 一致 (Stage 4 后才会真正生成 runtime MoE op)
+  - moe_plan Phase 2: AIC-aligned raw params 转 internal canonical 等价于 legacy raw
+  - moe_plan Phase 2: AIC distribution 单字段 ("balanced", "power_law_1.01", "power_law_1.2") 解码正确
+  - moe_plan Phase 2: latency 单位约定 (metrics.latency_us_*) 不被打破
 """
 from __future__ import annotations
 
+import pytest
+
 from llm_infer_sim.core.operator_schema.moe import (
+    _aic_distribution_to_internal,
+    _moe_dtype_to_internal,
     moe_case_params_to_signature,
     moe_virtual_op_to_signature,
 )
@@ -20,6 +27,7 @@ _CTX = dict(framework="vllm", framework_version="0.20.1", kernel_source="vllm_fu
 
 
 def _moe_case(routing="balanced", alpha=0.0, tp=1, ep=4, mode="eager"):
+    """Legacy internal-format raw params (用于 _legacy archive 数据兼容验证)."""
     return {
         "num_tokens": 128, "hidden": 2048,
         "moe_intermediate": 768, "topk": 8, "num_experts": 128,
@@ -27,6 +35,17 @@ def _moe_case(routing="balanced", alpha=0.0, tp=1, ep=4, mode="eager"):
         "routing_distribution": routing,
         "power_law_alpha": alpha,
         "dtype": "bf16", "execution_mode": mode,
+    }
+
+
+def _aic_moe_case(distribution="balanced", moe_tp=1, moe_ep=4, mode="eager", moe_dtype="bfloat16"):
+    """AIC-aligned raw params (Phase 2 新采集格式)."""
+    return {
+        "num_tokens": 128, "hidden_size": 2048,
+        "inter_size": 768, "topk": 8, "num_experts": 128,
+        "moe_tp_size": moe_tp, "moe_ep_size": moe_ep,
+        "distribution": distribution,
+        "moe_dtype": moe_dtype, "execution_mode": mode,
     }
 
 
@@ -96,3 +115,99 @@ def test_eager_cudagraph_differ():
     sig_e = moe_case_params_to_signature(_moe_case(mode="eager"), **_CTX)
     sig_g = moe_case_params_to_signature(_moe_case(mode="cudagraph"), **_CTX)
     assert sig_e != sig_g
+
+
+# ---------------------------------------------------------------------------
+# moe_plan Phase 2: AIC-aligned raw params 转 internal canonical
+# ---------------------------------------------------------------------------
+
+def test_aic_distribution_balanced_decodes_correctly():
+    rd, alpha = _aic_distribution_to_internal("balanced")
+    assert rd == "balanced"
+    assert alpha == 0.0
+
+
+def test_aic_distribution_power_law_decodes_alpha():
+    rd, alpha = _aic_distribution_to_internal("power_law_1.01")
+    assert rd == "power_law"
+    assert alpha == pytest.approx(1.01)
+    rd2, alpha2 = _aic_distribution_to_internal("power_law_1.2")
+    assert rd2 == "power_law"
+    assert alpha2 == pytest.approx(1.2)
+
+
+def test_aic_distribution_invalid_raises():
+    with pytest.raises(ValueError):
+        _aic_distribution_to_internal("unknown_routing")
+    with pytest.raises(ValueError):
+        _aic_distribution_to_internal("power_law_abc")    # alpha 非数
+
+
+def test_moe_dtype_mapping_bf16_fp16():
+    assert _moe_dtype_to_internal("bfloat16") == "bf16"
+    assert _moe_dtype_to_internal("float16") == "fp16"
+    # 未映射的 dtype 原样返 (后续 fp8/fp4 phase 扩展)
+    assert _moe_dtype_to_internal("fp8") == "fp8"
+
+
+def test_aic_params_to_signature_equivalent_to_legacy():
+    """AIC raw params 转出的 signature 必须跟 legacy raw params 等价 — 单点 importer 不漂."""
+    sig_aic = moe_case_params_to_signature(
+        _aic_moe_case(distribution="balanced", moe_tp=4, moe_ep=1, mode="cudagraph"),
+        **_CTX,
+    )
+    sig_legacy = moe_case_params_to_signature(
+        _moe_case(routing="balanced", alpha=0.0, tp=4, ep=1, mode="cudagraph"),
+        **_CTX,
+    )
+    assert sig_aic == sig_legacy
+    assert sig_aic.stable_hash() == sig_legacy.stable_hash()
+
+
+def test_aic_power_law_params_to_signature_equivalent_to_legacy():
+    sig_aic = moe_case_params_to_signature(
+        _aic_moe_case(distribution="power_law_1.2", moe_tp=1, moe_ep=4, mode="cudagraph"),
+        **_CTX,
+    )
+    sig_legacy = moe_case_params_to_signature(
+        _moe_case(routing="power_law", alpha=1.2, tp=1, ep=4, mode="cudagraph"),
+        **_CTX,
+    )
+    assert sig_aic == sig_legacy
+
+
+def test_aic_runtime_signature_match_with_op():
+    """走 AIC raw params 产的 signature 必须跟 runtime FusedMoE op 产的 signature 一致."""
+    sig_aic = moe_case_params_to_signature(
+        _aic_moe_case(distribution="balanced", moe_tp=1, moe_ep=4, mode="eager"),
+        **_CTX,
+    )
+    sig_op = moe_virtual_op_to_signature(_moe_op())
+    assert sig_aic == sig_op
+
+
+# ---------------------------------------------------------------------------
+# moe_plan §3.6.3: latency 单位约定 — RawRecord.metrics.latency_us_* 固定 us
+# (AIC helper output 是 ms, 但 LLMInferSim 内部 collector 写的就是 us;
+#  外部 AIC csv importer 后续接入时必须 ×1000, plan §3.6.3 已锁该规则)
+# ---------------------------------------------------------------------------
+
+def test_metrics_latency_unit_is_microseconds():
+    """RawRecord.Metrics 字段名约定: latency_us_*, 不能改成 latency_ms_* 或 latency_*.
+
+    这条 lock 防止后续 import AIC ms 数据时单位混淆: 任何 importer 必须显式做
+    ms → us 转换 (× 1000) 再填进 latency_us_*, 不允许在字段名上模糊.
+    """
+    from collector.schemas import Metrics
+    import dataclasses
+    field_names = {f.name for f in dataclasses.fields(Metrics)}
+    # 必须存在 us 命名
+    assert "latency_us_p50" in field_names
+    assert "latency_us_p10" in field_names
+    assert "latency_us_p90" in field_names
+    # 不能出现混淆命名
+    for f in field_names:
+        assert not f.startswith("latency_ms_"), (
+            f"{f}: 不允许 latency_ms_* 命名, 会跟 AIC ms 原始数据混淆 "
+            f"(see moe_plan §3.6.3)"
+        )

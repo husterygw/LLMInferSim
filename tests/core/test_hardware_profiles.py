@@ -38,8 +38,10 @@ def test_rtx_4090_specs_match_ada_whitepaper():
     assert hw.mem_bandwidth == pytest.approx(1008e9, rel=0.01)
     # 24 GB
     assert hw.mem_capacity_gb == 24
-    # L2 72 MB
-    assert hw.onchip_buffer == 72 * 1024 * 1024
+    # On-chip = register file aggregate (跟 A100/H100 一个口径),
+    # AD102 128 SM × 256 KB/SM = 32 MB. 不是 L2 (L2 是 72 MB,
+    # 跨 kernel 共享, 跟 FA tile sizing 无关).
+    assert hw.onchip_buffer == pytest.approx(32 * 1000 * 1000, rel=0.05)
 
 
 def test_rtx_4090_no_nvlink_pcie_only():

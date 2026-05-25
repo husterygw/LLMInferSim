@@ -3,13 +3,12 @@
 按记忆 `feedback_cost_formula_handcheck.md` 必做。
 
 覆盖:
-  1. n ≤ intra_node_size 时退化到 flat ring 旧路径 (阶段 0-6 baseline 不变)
-  2. n > intra_node_size 时启用 hierarchical 公式
+  1. allreduce 顶层入口统一走 NCCL candidates
+  2. n > intra_node_size 时 allgather/alltoall 仍启用 hierarchical 公式
   3. inter_node_bandwidth = 0 (旧 KNOWN_PROFILES) 时 fallback 到 intra
-  4. allreduce hierarchical 公式手算
-  5. allgather hierarchical 公式手算
-  6. alltoall hierarchical 公式手算
-  7. 边界:n=intra_node_size (单节点满) / n=intra_node_size+1 (跨节点边)
+  4. allgather hierarchical 公式手算
+  5. alltoall hierarchical 公式手算
+  6. 边界:n=intra_node_size (单节点满) / n=intra_node_size+1 (跨节点边)
 """
 import math
 
@@ -17,11 +16,11 @@ import pytest
 
 from llm_infer_sim.core.cost.roofline.communication import (
     _hierarchical_allgather,
-    _hierarchical_allreduce,
     _hierarchical_alltoall,
     _is_cross_node,
     allgather_time,
     allreduce_time,
+    allreduce_time_with_breakdown,
     alltoall_time,
 )
 from llm_infer_sim.core.profiles.hardware import HardwareConfig, get_hardware_profile
@@ -51,64 +50,32 @@ def test_is_cross_node_fallback_when_inter_bw_zero():
     assert t > 0 and math.isfinite(t)
 
 
-# ------- 阶段 0-6 baseline 不变 -------
+# ------- allreduce: unified NCCL path -------
 
-def test_flat_ring_unchanged_for_single_node():
-    """n ≤ intra_node_size 时 allreduce 数字应跟阶段 0-6 旧 flat ring 公式一致.
-    (cudagraph 模式跳过 framework_overhead, 测纯 algorithm 公式)."""
+def test_allreduce_single_node_uses_nccl_candidates():
+    """n ≤ intra_node_size 时 allreduce 也统一走 NCCL candidates."""
     hw = get_hardware_profile("H100")
     data = 1024 * 1024  # 1 MB
-    # flat ring N=8: 2*(N-1) * (α + data/(N*β))
-    expected = 2 * 7 * (hw.comm_step_latency + data / (8 * hw.effective_intra_bw(8)))
-    actual = allreduce_time(data, 8, hw, algo="ring", mode="cudagraph")
-    assert actual == pytest.approx(expected)
+    latency, br = allreduce_time_with_breakdown(
+        data, 8, hw, algo="simple_ring", mode="cudagraph",
+    )
+    assert br["path"] == "nccl"
+    assert br["selected"] == "simple_ring"
+    assert latency == pytest.approx(br["candidates"]["simple_ring"])
 
 
-# ------- allreduce hierarchical -------
+# ------- allreduce no legacy hierarchical -------
 
-def test_allreduce_hierarchical_formula_handcheck():
-    """tp=16 跨 2 节点 hierarchical allreduce 手算 vs actual.
-
-    公式 (§4.7.3):
-      t = 2(N1-1)(α_intra + data/(N1*β_intra))
-        + 2(N2-1)(α_inter + data/(N1*N2*β_inter))
-
-    H100: α_intra=0, α_inter=0, β_intra=450e9, β_inter=50e9
-    """
+def test_allreduce_cross_node_still_uses_nccl_candidates():
+    """allreduce 不再走 legacy hierarchical path, 即使 n 跨节点。"""
     hw = get_hardware_profile("H100")
     data = 1024 * 1024  # 1 MB
     n = 16
-    n1 = hw.intra_node_size  # 8
-    n2 = 2
-
-    intra_part = 2 * (n1 - 1) * (0.0 + data / (n1 * hw.effective_intra_bw(n1)))
-    inter_part = 2 * (n2 - 1) * (0.0 + data / (n1 * n2 * hw.effective_inter_bw))
-    expected = intra_part + inter_part
-
-    actual = _hierarchical_allreduce(data, n, hw)
-    assert actual == pytest.approx(expected, rel=1e-9)
-    # 也通过顶层 allreduce_time 入口 (cudagraph 模式纯 algorithm)
-    assert allreduce_time(data, n, hw, mode="cudagraph") == pytest.approx(expected, rel=1e-9)
-
-
-def test_allreduce_hierarchical_slower_than_flat_intra():
-    """跨节点 hierarchical 应该比假设全 intra 的 flat ring 慢 (因为 inter 段慢)."""
-    hw = get_hardware_profile("H100")
-    data = 1024 * 1024
-    # flat ring N=16 假设全 intra (用 N=16 的公式但 β=intra_bw, 仅作 lower bound 对比)
-    flat_intra = 2 * 15 * (0.0 + data / (16 * hw.effective_intra_bw(16)))
-    hier = _hierarchical_allreduce(data, 16, hw)
-    assert hier > flat_intra
-
-
-def test_allreduce_hierarchical_faster_than_all_inter():
-    """跨节点 hierarchical 应该比假设全 inter 的 flat ring 快 (intra 段还是快的)."""
-    hw = get_hardware_profile("H100")
-    data = 1024 * 1024
-    # flat ring N=16 假设全 inter
-    flat_inter = 2 * 15 * (0.0 + data / (16 * hw.effective_inter_bw))
-    hier = _hierarchical_allreduce(data, 16, hw)
-    assert hier < flat_inter
+    assert _is_cross_node(n, hw)
+    latency, br = allreduce_time_with_breakdown(data, n, hw, mode="cudagraph")
+    assert br["path"] == "nccl"
+    assert br["selected"] in br["candidates"]
+    assert latency == pytest.approx(br["candidates"][br["selected"]])
 
 
 # ------- alltoall hierarchical -------
@@ -150,24 +117,25 @@ def test_allgather_hierarchical_handcheck_n16():
 # ------- 边界 -------
 
 def test_boundary_n_eq_intra_size():
-    """n=intra_node_size: 仍走 flat ring, hierarchical 不激活."""
+    """n=intra_node_size: allreduce 走 NCCL candidate path."""
     hw = get_hardware_profile("H100")
     assert not _is_cross_node(hw.intra_node_size, hw)
-    # data ≥ 1MB 强制走 ring 而非 tree (_select_algo 在小 data 下选 tree)
     data = 2 * 1024 * 1024
-    t = allreduce_time(data, hw.intra_node_size, hw, algo="ring", mode="cudagraph")
-    expected = 2 * 7 * (0.0 + data / (8 * hw.effective_intra_bw(8)))
-    assert t == pytest.approx(expected, rel=1e-9)
+    t, br = allreduce_time_with_breakdown(
+        data, hw.intra_node_size, hw, algo="simple_ring", mode="cudagraph",
+    )
+    assert br["path"] == "nccl"
+    assert t == pytest.approx(br["candidates"]["simple_ring"], rel=1e-9)
 
 
 def test_boundary_n_eq_intra_size_plus_one():
-    """n=intra_node_size+1: 触发 hierarchical (2 节点)."""
+    """n=intra_node_size+1: allreduce 不再触发 legacy hierarchical."""
     hw = get_hardware_profile("H100")
     n = hw.intra_node_size + 1
     assert _is_cross_node(n, hw)
-    t = allreduce_time(1024, n, hw, mode="cudagraph")
-    # 应该跟 _hierarchical_allreduce 算出同样值 (cudagraph 跳过 framework_oh)
-    assert t == pytest.approx(_hierarchical_allreduce(1024, n, hw), rel=1e-9)
+    t, br = allreduce_time_with_breakdown(1024, n, hw, mode="cudagraph")
+    assert br["path"] == "nccl"
+    assert t == pytest.approx(br["candidates"][br["selected"]], rel=1e-9)
 
 
 def test_n_one_returns_zero():
