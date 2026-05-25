@@ -51,29 +51,92 @@ class RooflineBackend:
     def _estimate_compute(self, op: Any) -> CostTraceEntry:
         spec = self._roofline_spec(op)
         result = self.analyzer.analyze(op.name, spec)
+        metadata: dict[str, Any] = {
+            "bottleneck": result.bottleneck,
+            "t_compute": result.t_compute,
+            "t_memory": result.t_memory,
+            "t_comm": result.t_comm,
+            "kernel_overhead": result.kernel_overhead,
+            "arithmetic_intensity": result.arithmetic_intensity,
+            "achievable_performance": result.achievable_performance,
+            "mem_bytes": result.mem_bytes,
+            "flops": result.flops,
+        }
+        # moe_plan Phase 4: 如果 op 提供 formula_breakdown() (MoE 主要用),
+        # 把 breakdown 字段透传到 CostTraceEntry.metadata (distinct_experts /
+        # expert_flops / expert_weight_read / routing_skew 等).
+        breakdown_fn = getattr(op, "formula_breakdown", None)
+        if callable(breakdown_fn):
+            try:
+                bd = breakdown_fn()
+            except Exception:
+                bd = None
+            if bd:
+                metadata.update(bd)
+
+        # moe_plan §5.A: MoE calibration 后处理. 3 类 op 各按 knob 修 latency:
+        #   moe_topk           latency += topk_overhead_us
+        #   moe_dispatch       latency += local_dispatch_overhead_us
+        #   moe (routed_*)     latency /= grouped_gemm_efficiency (<1 慢, >1 快)
+        latency_s = self._apply_moe_calibration(op, result.total_time, metadata)
+
         return CostTraceEntry(
             op_name=op.name,
             op_kind=op.op_kind,
             op_subtype=op.op_subtype,
-            latency_s=result.total_time,
+            latency_s=latency_s,
             source="roofline",
             match_type="fallback",
             layer_idx=getattr(op, "layer_idx", None),
             display_name=format_display_name(op.name, getattr(op, "layer_idx", None)),
             roofline_s=result.total_time,
             roofline_gap=None,
-            metadata={
-                "bottleneck": result.bottleneck,
-                "t_compute": result.t_compute,
-                "t_memory": result.t_memory,
-                "t_comm": result.t_comm,
-                "kernel_overhead": result.kernel_overhead,
-                "arithmetic_intensity": result.arithmetic_intensity,
-                "achievable_performance": result.achievable_performance,
-                "mem_bytes": result.mem_bytes,
-                "flops": result.flops,
-            },
+            metadata=metadata,
         )
+
+    def _apply_moe_calibration(
+        self, op: Any, roofline_latency_s: float, metadata: dict[str, Any],
+    ) -> float:
+        """moe_plan §5.A: apply MoE calibration knobs + write metadata.
+
+        每个 knob 必须只影响对应 latency term (plan §5.A 验收 step 4).
+        无 calibration (hw.moe_efficiency is None) 时 latency_s = roofline_latency_s
+        且不写 t_topk / t_dispatch_local / t_expert_compute / grouped_gemm_efficiency
+        / moe_profile_id 等字段.
+        """
+        prof = getattr(self.hw, "moe_efficiency", None)
+        if prof is None:
+            return roofline_latency_s
+
+        op_kind = op.op_kind
+        op_subtype = getattr(op, "op_subtype", "")
+        latency = roofline_latency_s
+        applied = False
+
+        if op_kind == "elementwise" and op_subtype == "topk":
+            overhead_s = float(prof.topk_overhead_us) * 1e-6
+            latency = roofline_latency_s + overhead_s
+            metadata["t_topk"] = latency
+            metadata["topk_overhead_us"] = prof.topk_overhead_us
+            applied = True
+        elif op_kind == "moe_dispatch":
+            overhead_s = float(prof.local_dispatch_overhead_us) * 1e-6
+            latency = roofline_latency_s + overhead_s
+            metadata["t_dispatch_local"] = latency
+            metadata["local_dispatch_overhead_us"] = prof.local_dispatch_overhead_us
+            applied = True
+        elif op_kind == "moe":
+            eff = float(prof.grouped_gemm_efficiency)
+            if eff <= 0:
+                eff = 1.0
+            latency = roofline_latency_s / eff
+            metadata["t_expert_compute"] = latency
+            metadata["grouped_gemm_efficiency"] = eff
+            applied = True
+
+        if applied:
+            metadata["moe_profile_id"] = prof.profile_id
+        return latency
 
     def _estimate_collective(self, op: Any) -> CostTraceEntry:
         """Collective op latency: 调 core/cost/roofline/communication.py 公式.

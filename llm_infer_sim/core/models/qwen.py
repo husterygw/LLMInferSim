@@ -7,12 +7,14 @@
 TP>1 时 dense path 在 o_proj / down_proj 后追加 row-parallel allreduce:
     tp_o_proj_allreduce / tp_down_proj_allreduce
 
-阶段 3a: Qwen3 MoE (e.g. Qwen3-30B-A3B), MoE 层把 FFN 部分换成:
-    mlp_norm → moe_gate
+阶段 3a + moe_plan Phase 3: Qwen3 MoE (e.g. Qwen3-30B-A3B), MoE 层 FFN 部分:
+    mlp_norm → moe_gate (router GEMM) → moe_topk (softmax + topk)
+        → moe_dispatch_pre (local reorder/pack, MoEDispatch op)
         → [ep>1: ep_alltoall_dispatch]
-        → routed_experts
-        → [ep=1 & tp>1: routed_expert_allreduce]
-        → [ep>1:        ep_alltoall_combine]
+        → routed_experts (MoE op, backend-neutral)
+        → [ep>1: ep_alltoall_combine]
+        → moe_dispatch_post (local gather/unpack, MoEDispatch op)
+        → [ep==1 & tp>1: routed_expert_allreduce]
         → [num_shared_experts>0: shared_expert_up_gate / _act / _down / _allreduce]
         → mlp_add
 
@@ -21,8 +23,8 @@ TP>1 时 dense path 在 o_proj / down_proj 后追加 row-parallel allreduce:
 mixed/chunked_prefill phase 在 _attention_ops 内部拆 2 个 Attention op
 (prefill segment + decode segment), 仍是 layer-uniform 不影响 grouping.
 
-所有 op (Embedding / Norm / ElementWise / GEMM / Attention / FusedMoE / Collective)
-由 template 直接构造, ctx 从 self.ctx 派生.
+所有 op (Embedding / Norm / ElementWise / GEMM / Attention / MoE / MoEDispatch /
+Collective) 由 template 直接构造, ctx 从 self.ctx 派生.
 """
 from __future__ import annotations
 
@@ -40,6 +42,8 @@ from llm_infer_sim.core.operators import (
     Embedding,
     FusedMoE,
     GEMM,
+    MoE,
+    MoEDispatch,
     MoERoutingProfile,
     Norm,
 )
@@ -375,14 +379,34 @@ class QwenModelGraphTemplate:
         step: StepShape,
         ctx: OperatorContext,
     ) -> list[Operator]:
-        """mlp_norm → moe_gate → [alltoall_dispatch] → routed_experts → [comm] → shared → mlp_add."""
+        """moe_plan §3.3 + §3.4.1 标准化 MoE FFN block.
+
+        TP-only (ep == 1):
+          mlp_norm → moe_gate → moe_topk → moe_dispatch_pre → routed_experts
+            → moe_dispatch_post → [tp>1: routed_expert_allreduce]
+
+        EP (ep > 1):
+          mlp_norm → moe_gate → moe_topk → moe_dispatch_pre → ep_alltoall_dispatch
+            → routed_experts → ep_alltoall_combine → moe_dispatch_post
+        """
         tokens = step.total_tokens
         phase = step.phase
         routing = self.routing or MoERoutingProfile.balanced()
         m = self.model
         tp = ctx.tp_size
         ep = ctx.ep_size
-        comm_bytes_h = _comm_bytes_hidden(tokens, ctx)
+        topk = m.num_activated_experts
+        # moe_plan Phase 3 step 3: dispatch/combine bytes 按 backend path 分开
+        #   TP-only AllReduce  : tokens × hidden × a_byte
+        #   EP AllToAll        : tokens × topk × hidden × a_byte / ep
+        comm_bytes_tp = _comm_bytes_hidden(tokens, ctx)
+        comm_bytes_ep = int(tokens * topk * m.hidden_dim * ctx.a_byte / max(ep, 1))
+
+        # peer names: 由 backend path 决定; MoEDispatch metadata 互链
+        pre_comm_peer = "ep_alltoall_dispatch" if ep > 1 else None
+        post_comm_peer = "ep_alltoall_combine" if ep > 1 else (
+            "routed_expert_allreduce" if (ep == 1 and tp > 1) else None
+        )
 
         ops: list[Operator] = [
             Norm(
@@ -399,31 +423,52 @@ class QwenModelGraphTemplate:
                 op_precision_override="fp32",
                 ctx=ctx,
             ),
+            # moe_plan §3.3 op#3: 显式 softmax + topk kernel (placeholder elementwise)
+            ElementWise(
+                name="moe_topk", op_subtype="topk",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, intermediate=m.num_experts, ctx=ctx,
+            ),
+            # moe_plan §3.3 op#4: local dispatch (token reorder/pack)
+            MoEDispatch.local(
+                pre_dispatch=True, layer_idx=layer_idx, tokens=tokens,
+                ctx=ctx, phase=phase, communication_peer=pre_comm_peer,
+            ),
         ]
 
+        # moe_plan §3.3 op#5: optional dispatch communication, backend-dependent
         if ep > 1:
             ops.append(AllToAll(
                 name="ep_alltoall_dispatch",
-                message_bytes=comm_bytes_h,
+                message_bytes=comm_bytes_ep,
                 phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
             ))
 
-        # routed experts (fused_moe kernel)
-        ops.append(FusedMoE.routed_experts(
+        # moe_plan §3.3 op#6: routed experts (MoE, backend-neutral; was FusedMoE)
+        ops.append(MoE.routed_experts(
             layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
         ))
 
+        # moe_plan §3.3 op#7: optional combine communication
+        if ep > 1:
+            ops.append(AllToAll(
+                name="ep_alltoall_combine",
+                message_bytes=comm_bytes_ep,
+                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
+            ))
+
+        # moe_plan §3.3 op#8: local combine (expert output gather/unpack)
+        ops.append(MoEDispatch.local(
+            pre_dispatch=False, layer_idx=layer_idx, tokens=tokens,
+            ctx=ctx, phase=phase, communication_peer=post_comm_peer,
+        ))
+
+        # moe_plan §3.3 op#9: TP-only output allreduce, AFTER MoEDispatch(post)
         if ep == 1 and tp > 1:
             ops.append(AllReduce(
                 name="routed_expert_allreduce",
-                message_bytes=comm_bytes_h,
+                message_bytes=comm_bytes_tp,
                 phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
-            ))
-        elif ep > 1:
-            ops.append(AllToAll(
-                name="ep_alltoall_combine",
-                message_bytes=comm_bytes_h,
-                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
             ))
 
         # shared experts (V3 / Qwen3-Coder; A3B 没有)
@@ -453,7 +498,7 @@ class QwenModelGraphTemplate:
             if tp > 1:
                 ops.append(AllReduce(
                     name="shared_expert_allreduce",
-                    message_bytes=comm_bytes_h,
+                    message_bytes=comm_bytes_tp,
                     phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
                 ))
 

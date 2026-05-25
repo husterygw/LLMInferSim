@@ -1,0 +1,37 @@
+{
+  "model": "Qwen3-30B-A3B",
+  "hardware": "RTX_4090",
+  "moe_plan_phase": "Phase 4",
+  "cases": {
+    "decode_token1_tp4_ep1": {
+      "distinct_experts": 8.0,
+      "expert_dim_per_device": 192,
+      "tokens_per_device": 1,
+      "expert_flops": 18874368,
+      "expert_weight_read": 18874368,
+      "expert_act_load": 4096,
+      "expert_act_store": 4096,
+      "routing_skew": 0.0
+    },
+    "prefill_token128_tp4_ep1": {
+      "distinct_experts": 127.96692244891645,
+      "expert_dim_per_device": 192,
+      "tokens_per_device": 128,
+      "expert_flops": 2415919104,
+      "expert_weight_read": 301911848,
+      "expert_act_load": 524288,
+      "expert_act_store": 524288,
+      "routing_skew": 0.0
+    },
+    "ep4_token16_tp1": {
+      "distinct_experts": 82.42251130217052,
+      "expert_dim_per_device": 768,
+      "tokens_per_device": 32,
+      "expert_flops": 301989888,
+      "expert_weight_read": 194459101,
+      "expert_act_load": 131072,
+      "expert_act_store": 131072,
+      "routing_skew": 0.0
+    }
+  }
+}

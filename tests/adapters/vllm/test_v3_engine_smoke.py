@@ -136,7 +136,9 @@ def test_v3_qwen3_30b_a3b_decode_runs():
     assert trace.total_latency_s > 0
     names = {e.op_subtype for e in trace.entries}
     assert "router" in names                # moe_gate
-    assert "fused_moe" in names             # routed_experts
+    # moe_plan Phase 3: routed expert op_subtype is "routed_experts" (was "fused_moe").
+    # backend 信息走 kernel_source, 不进 op_subtype.
+    assert "routed_experts" in names
 
 
 # ---- DeepSeek-V3 (MLA) ----

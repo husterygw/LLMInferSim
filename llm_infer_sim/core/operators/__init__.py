@@ -42,6 +42,8 @@ from llm_infer_sim.core.operators.embedding import Embedding
 from llm_infer_sim.core.operators.gemm import GEMM
 from llm_infer_sim.core.operators.moe import (
     FusedMoE,
+    MoE,
+    MoEDispatch,
     MoERoutingProfile,
     estimate_distinct_experts,
 )
@@ -61,6 +63,8 @@ __all__ = [
     "FusedMoE",
     "GEMM",
     "KVTransfer",
+    "MoE",
+    "MoEDispatch",
     "ModelBuildContext",
     "MoERoutingProfile",
     "Norm",

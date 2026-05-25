@@ -19,6 +19,11 @@ from llm_infer_sim.core.profiles.communication import (
     CommunicationProfile,
     rtx_4090_nccl_communication,
 )
+from llm_infer_sim.core.profiles.moe_efficiency import (
+    MoEEfficiencyProfile,
+    default_moe_efficiency,
+    rtx_4090_moe_efficiency_v1,
+)
 
 
 TopologyHint = Literal["concentrated", "balanced"]
@@ -109,6 +114,11 @@ class HardwareConfig:
     # comm_plan Step 2: per-collective 通信参数 (替代 comm_step_latency 这种"万能 alpha").
     # 默认 None, 由 profile entry 显式注入. Step 4 接通 RooflineBackend 后取代旧字段.
     communication: Optional[CommunicationProfile] = None
+
+    # moe_plan §5.A: MoE calibration knobs (topk overhead / dispatch overhead /
+    # grouped_gemm_efficiency). None = 无 calibration (跟 default_moe_efficiency()
+    # 等价, 但 None 时 RooflineBackend 直接 skip 后处理).
+    moe_efficiency: Optional[MoEEfficiencyProfile] = None
 
     def __post_init__(self):
         if self.peak_flops_bf16 == 0.0:
@@ -491,6 +501,9 @@ KNOWN_PROFILES: dict[str, dict] = {
         # comm_plan Step 2: 新通信参数结构. AllReduce 已统一走 NCCL candidate 模型;
         # comm_step_latency / intra_node_protocol_efficiency 仍供其它 legacy collective 使用.
         communication=rtx_4090_nccl_communication(),
+        # moe_plan §5.B v1: MoE calibration from Phase 5 group_analysis data.
+        # source: docs/baselines/moe_db_coverage_RTX_4090_vllm-0.19.1.csv
+        moe_efficiency=rtx_4090_moe_efficiency_v1(),
     ),
 }
 

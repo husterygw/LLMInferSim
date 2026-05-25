@@ -94,6 +94,17 @@ class ElementWise:
                 load_act=int(elements * a_byte),
                 store_act=int(elements * a_byte),
             )
+        if sub == "topk":
+            # moe_plan §3.3 op#3: softmax + topk over (tokens, num_experts).
+            # caller 把 num_experts 传 self.intermediate.
+            # softmax 占主导 (~5 flops/elem); topk K-select 量级小, placeholder 不细拆.
+            elements = self.tokens * self.intermediate
+            return RooflineSpec(
+                op_category="activation",
+                flops=elements * 5,
+                load_act=int(elements * a_byte),
+                store_act=int(elements * a_byte),
+            )
         raise ValueError(f"unsupported elementwise subtype: {sub!r}")
 
     def signature(self) -> OperatorSignature:

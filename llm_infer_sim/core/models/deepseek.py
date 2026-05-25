@@ -28,6 +28,8 @@ from llm_infer_sim.core.operators import (
     Embedding,
     FusedMoE,
     GEMM,
+    MoE,
+    MoEDispatch,
     MoERoutingProfile,
     Norm,
     RooflineOperator,
@@ -516,7 +518,15 @@ class DeepSeekModelTemplate:
         tp = ctx.tp_size
         ep = ctx.ep_size
         routing = self.routing or MoERoutingProfile.balanced()
-        comm_bytes_h = _comm_bytes_hidden(tokens, ctx)
+        topk = m.num_activated_experts
+        # moe_plan Phase 3 step 3: dispatch/combine bytes 按 backend path 区分
+        comm_bytes_tp = _comm_bytes_hidden(tokens, ctx)
+        comm_bytes_ep = int(tokens * topk * m.hidden_dim * ctx.a_byte / max(ep, 1))
+
+        pre_comm_peer = "ep_alltoall_dispatch" if ep > 1 else None
+        post_comm_peer = "ep_alltoall_combine" if ep > 1 else (
+            "routed_expert_allreduce" if (ep == 1 and tp > 1) else None
+        )
 
         ops: list[Operator] = [
             Norm(
@@ -532,30 +542,50 @@ class DeepSeekModelTemplate:
                 op_precision_override="fp32",
                 ctx=ctx,
             ),
+            # moe_plan §3.3 op#3: softmax + topk kernel
+            ElementWise(
+                name="moe_topk", op_subtype="topk",
+                phase=phase, layer_idx=layer_idx,
+                tokens=tokens, intermediate=m.num_experts, ctx=ctx,
+            ),
+            # moe_plan §3.3 op#4: local pre-dispatch (token reorder/pack)
+            MoEDispatch.local(
+                pre_dispatch=True, layer_idx=layer_idx, tokens=tokens,
+                ctx=ctx, phase=phase, communication_peer=pre_comm_peer,
+            ),
         ]
 
         if ep > 1:
             ops.append(AllToAll(
                 name="ep_alltoall_dispatch",
-                message_bytes=comm_bytes_h,
+                message_bytes=comm_bytes_ep,
                 phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
             ))
 
-        ops.append(FusedMoE.routed_experts(
+        # moe_plan §3.3 op#6: routed experts (MoE, backend-neutral)
+        ops.append(MoE.routed_experts(
             layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
         ))
 
+        if ep > 1:
+            ops.append(AllToAll(
+                name="ep_alltoall_combine",
+                message_bytes=comm_bytes_ep,
+                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
+            ))
+
+        # moe_plan §3.3 op#8: local post-dispatch (output gather/unpack)
+        ops.append(MoEDispatch.local(
+            pre_dispatch=False, layer_idx=layer_idx, tokens=tokens,
+            ctx=ctx, phase=phase, communication_peer=post_comm_peer,
+        ))
+
+        # moe_plan §3.3 op#9: TP-only output allreduce, AFTER MoEDispatch(post)
         if ep == 1 and tp > 1:
             ops.append(AllReduce(
                 name="routed_expert_allreduce",
-                message_bytes=comm_bytes_h,
+                message_bytes=comm_bytes_tp,
                 phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
-            ))
-        elif ep > 1:
-            ops.append(AllToAll(
-                name="ep_alltoall_combine",
-                message_bytes=comm_bytes_h,
-                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
             ))
 
         if m.num_shared_experts > 0:
@@ -584,7 +614,7 @@ class DeepSeekModelTemplate:
             if tp > 1:
                 ops.append(AllReduce(
                     name="shared_expert_allreduce",
-                    message_bytes=comm_bytes_h,
+                    message_bytes=comm_bytes_tp,
                     phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
                 ))
 

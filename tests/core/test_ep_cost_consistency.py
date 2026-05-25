@@ -151,8 +151,9 @@ def test_ep_alltoall_dispatch_combine_both_present():
 
 
 def test_ep_alltoall_comm_bytes():
-    """AllToAll comm_bytes = tokens × h × a_byte (per rank 发/收量)."""
+    """moe_plan §3 step 3 routing-aware bytes: tokens × topk × h × a_byte / ep."""
     m = _qwen3_30b_a3b()
+    topk = m.num_activated_experts
     ep = 2
 
     for tokens in (4, 128):
@@ -161,9 +162,9 @@ def test_ep_alltoall_comm_bytes():
         for op_name in ("ep_alltoall_dispatch", "ep_alltoall_combine"):
             op = _find(ops, op_name)
             f = op.roofline_spec()
-            expected = tokens * m.hidden_dim * A_BYTE
+            expected = int(tokens * topk * m.hidden_dim * A_BYTE / ep)
             assert f.comm_bytes == expected, (
-                f"tokens={tokens} op={op_name}"
+                f"tokens={tokens} op={op_name}: got {f.comm_bytes} != {expected}"
             )
             assert f.comm_type == "alltoall"
 
