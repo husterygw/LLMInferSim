@@ -7,16 +7,18 @@
 TP>1 时 dense path 在 o_proj / down_proj 后追加 row-parallel allreduce:
     tp_o_proj_allreduce / tp_down_proj_allreduce
 
-阶段 3a + moe_plan Phase 3: Qwen3 MoE (e.g. Qwen3-30B-A3B), MoE 层 FFN 部分:
+阶段 3a + moe_plan Phase 3 + vLLM 默认 EP path fix: Qwen3 MoE (e.g. Qwen3-30B-A3B):
     mlp_norm → moe_gate (router GEMM) → moe_topk (softmax + topk)
-        → moe_dispatch_pre (local reorder/pack, MoEDispatch op)
-        → [ep>1: ep_alltoall_dispatch]
-        → routed_experts (MoE op, backend-neutral)
-        → [ep>1: ep_alltoall_combine]
-        → moe_dispatch_post (local gather/unpack, MoEDispatch op)
-        → [ep==1 & tp>1: routed_expert_allreduce]
+        → moe_dispatch_pre (local reorder/pack, vLLM fused_moe 内部 kernel)
+        → routed_experts (MoE op, expert_map 处理 non-local → partial sum)
+        → moe_dispatch_post (local gather/unpack)
+        → [max(tp,ep) > 1: routed_expert_allreduce 聚合 partial sums]
         → [num_shared_experts>0: shared_expert_up_gate / _act / _down / _allreduce]
         → mlp_add
+
+vLLM 默认 EP path (`enable_expert_parallel=True` + vllm_fused_moe Triton): 不走
+AllToAll dispatch/combine, 而是 `fused_experts(expert_map=[-1 for non-local])` +
+单次 `tensor_model_parallel_all_reduce`. TRT-LLM SM≥100 / SGLang DeepEP 才 AllToAll.
 
 全图: embedding → [layer ops × num_layers] → lm_head
 
@@ -36,11 +38,9 @@ from llm_infer_sim.core.models.layer_partition import partition_ffn_layers
 from llm_infer_sim.core.operators.context import OperatorContext
 from llm_infer_sim.core.operators import (
     AllReduce,
-    AllToAll,
     Attention,
     ElementWise,
     Embedding,
-    FusedMoE,
     GEMM,
     MoE,
     MoEDispatch,
@@ -395,17 +395,17 @@ class QwenModelGraphTemplate:
         m = self.model
         tp = ctx.tp_size
         ep = ctx.ep_size
-        topk = m.num_activated_experts
-        # moe_plan Phase 3 step 3: dispatch/combine bytes 按 backend path 分开
-        #   TP-only AllReduce  : tokens × hidden × a_byte
-        #   EP AllToAll        : tokens × topk × hidden × a_byte / ep
+        # vLLM 默认 MoE EP path (`enable_expert_parallel=True` + vllm_fused_moe Triton):
+        #   - weight 切分: ep>1 时切 expert 集合 (intermediate 不切 TP); ep=1 tp>1 时切 intermediate
+        #   - 通信: fused_experts(expert_map=[-1 for non-local]) 产 partial sum,
+        #          然后单次 tensor_model_parallel_all_reduce 跨 max(tp,ep) ranks 聚合
+        #   - 不走 AllToAll dispatch/combine. 仅 TRT-LLM SM≥100 / SGLang DeepEP 才 AllToAll
+        # MoEDispatch (pre/post) 仍存在, 表达 vLLM fused_moe 内部 local align/sort/gather kernel
+        # (不替代 communication).
+        ar_world_size = max(tp, ep)
         comm_bytes_tp = _comm_bytes_hidden(tokens, ctx)
-        comm_bytes_ep = int(tokens * topk * m.hidden_dim * ctx.a_byte / max(ep, 1))
-
-        # peer names: 由 backend path 决定; MoEDispatch metadata 互链
-        pre_comm_peer = "ep_alltoall_dispatch" if ep > 1 else None
-        post_comm_peer = "ep_alltoall_combine" if ep > 1 else (
-            "routed_expert_allreduce" if (ep == 1 and tp > 1) else None
+        post_comm_peer = (
+            "routed_expert_allreduce" if ar_world_size > 1 else None
         )
 
         ops: list[Operator] = [
@@ -429,46 +429,31 @@ class QwenModelGraphTemplate:
                 phase=phase, layer_idx=layer_idx,
                 tokens=tokens, intermediate=m.num_experts, ctx=ctx,
             ),
-            # moe_plan §3.3 op#4: local dispatch (token reorder/pack)
+            # moe_plan §3.3 op#4: local dispatch (token reorder/pack, vLLM fused_moe 内部 kernel)
             MoEDispatch.local(
                 pre_dispatch=True, layer_idx=layer_idx, tokens=tokens,
-                ctx=ctx, phase=phase, communication_peer=pre_comm_peer,
+                ctx=ctx, phase=phase, communication_peer=None,
+            ),
+            # moe_plan §3.3 op#6: routed experts (MoE, backend-neutral)
+            #   weight 已按 ep + tp 切, expert_map 处理 non-local experts → partial sum 输出
+            MoE.routed_experts(
+                layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
+            ),
+            # moe_plan §3.3 op#8: local combine (expert output gather/unpack)
+            MoEDispatch.local(
+                pre_dispatch=False, layer_idx=layer_idx, tokens=tokens,
+                ctx=ctx, phase=phase, communication_peer=post_comm_peer,
             ),
         ]
 
-        # moe_plan §3.3 op#5: optional dispatch communication, backend-dependent
-        if ep > 1:
-            ops.append(AllToAll(
-                name="ep_alltoall_dispatch",
-                message_bytes=comm_bytes_ep,
-                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
-            ))
-
-        # moe_plan §3.3 op#6: routed experts (MoE, backend-neutral; was FusedMoE)
-        ops.append(MoE.routed_experts(
-            layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
-        ))
-
-        # moe_plan §3.3 op#7: optional combine communication
-        if ep > 1:
-            ops.append(AllToAll(
-                name="ep_alltoall_combine",
-                message_bytes=comm_bytes_ep,
-                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
-            ))
-
-        # moe_plan §3.3 op#8: local combine (expert output gather/unpack)
-        ops.append(MoEDispatch.local(
-            pre_dispatch=False, layer_idx=layer_idx, tokens=tokens,
-            ctx=ctx, phase=phase, communication_peer=post_comm_peer,
-        ))
-
-        # moe_plan §3.3 op#9: TP-only output allreduce, AFTER MoEDispatch(post)
-        if ep == 1 and tp > 1:
+        # vLLM 默认 path 单 AllReduce: tp>1 或 ep>1 时跨 max(tp,ep) ranks 聚合 partial sums.
+        # 等价于 `tensor_model_parallel_all_reduce(reduce_results=True)`.
+        if ar_world_size > 1:
             ops.append(AllReduce(
                 name="routed_expert_allreduce",
                 message_bytes=comm_bytes_tp,
-                phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
+                phase=phase, layer_idx=layer_idx,
+                world_size=ar_world_size, ctx=ctx,
             ))
 
         # shared experts (V3 / Qwen3-Coder; A3B 没有)

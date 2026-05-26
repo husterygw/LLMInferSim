@@ -22,11 +22,9 @@ from llm_infer_sim.core.models.layer_partition import partition_ffn_layers
 from llm_infer_sim.core.operators.context import OperatorContext
 from llm_infer_sim.core.operators import (
     AllReduce,
-    AllToAll,
     Attention,
     ElementWise,
     Embedding,
-    FusedMoE,
     GEMM,
     MoE,
     MoEDispatch,
@@ -518,14 +516,12 @@ class DeepSeekModelTemplate:
         tp = ctx.tp_size
         ep = ctx.ep_size
         routing = self.routing or MoERoutingProfile.balanced()
-        topk = m.num_activated_experts
-        # moe_plan Phase 3 step 3: dispatch/combine bytes 按 backend path 区分
+        # vLLM 默认 MoE EP path: 单 AllReduce 聚合 partial sums, 不走 AllToAll.
+        # 详 qwen.py:_build_moe_ffn_block 的 backend path 注释.
+        ar_world_size = max(tp, ep)
         comm_bytes_tp = _comm_bytes_hidden(tokens, ctx)
-        comm_bytes_ep = int(tokens * topk * m.hidden_dim * ctx.a_byte / max(ep, 1))
-
-        pre_comm_peer = "ep_alltoall_dispatch" if ep > 1 else None
-        post_comm_peer = "ep_alltoall_combine" if ep > 1 else (
-            "routed_expert_allreduce" if (ep == 1 and tp > 1) else None
+        post_comm_peer = (
+            "routed_expert_allreduce" if ar_world_size > 1 else None
         )
 
         ops: list[Operator] = [
@@ -548,44 +544,30 @@ class DeepSeekModelTemplate:
                 phase=phase, layer_idx=layer_idx,
                 tokens=tokens, intermediate=m.num_experts, ctx=ctx,
             ),
-            # moe_plan §3.3 op#4: local pre-dispatch (token reorder/pack)
+            # moe_plan §3.3 op#4: local pre-dispatch (vLLM fused_moe 内部 kernel)
             MoEDispatch.local(
                 pre_dispatch=True, layer_idx=layer_idx, tokens=tokens,
-                ctx=ctx, phase=phase, communication_peer=pre_comm_peer,
+                ctx=ctx, phase=phase, communication_peer=None,
+            ),
+            # moe_plan §3.3 op#6: routed experts (MoE, backend-neutral)
+            #   weight 已按 ep + tp 切, expert_map 处理 non-local experts → partial sum
+            MoE.routed_experts(
+                layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
+            ),
+            # moe_plan §3.3 op#8: local post-dispatch (output gather/unpack)
+            MoEDispatch.local(
+                pre_dispatch=False, layer_idx=layer_idx, tokens=tokens,
+                ctx=ctx, phase=phase, communication_peer=post_comm_peer,
             ),
         ]
 
-        if ep > 1:
-            ops.append(AllToAll(
-                name="ep_alltoall_dispatch",
-                message_bytes=comm_bytes_ep,
-                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
-            ))
-
-        # moe_plan §3.3 op#6: routed experts (MoE, backend-neutral)
-        ops.append(MoE.routed_experts(
-            layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
-        ))
-
-        if ep > 1:
-            ops.append(AllToAll(
-                name="ep_alltoall_combine",
-                message_bytes=comm_bytes_ep,
-                phase=phase, layer_idx=layer_idx, world_size=ep, ctx=ctx,
-            ))
-
-        # moe_plan §3.3 op#8: local post-dispatch (output gather/unpack)
-        ops.append(MoEDispatch.local(
-            pre_dispatch=False, layer_idx=layer_idx, tokens=tokens,
-            ctx=ctx, phase=phase, communication_peer=post_comm_peer,
-        ))
-
-        # moe_plan §3.3 op#9: TP-only output allreduce, AFTER MoEDispatch(post)
-        if ep == 1 and tp > 1:
+        # vLLM 默认 path 单 AllReduce 聚合 partial sums.
+        if ar_world_size > 1:
             ops.append(AllReduce(
                 name="routed_expert_allreduce",
                 message_bytes=comm_bytes_tp,
-                phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
+                phase=phase, layer_idx=layer_idx,
+                world_size=ar_world_size, ctx=ctx,
             ))
 
         if m.num_shared_experts > 0:

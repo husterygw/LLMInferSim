@@ -12,10 +12,18 @@ moe_plan Phase 2: 字段口径 AIC-aligned (raw record 直接产 AIC 字段).
     distribution    - 'balanced' / 'power_law_<alpha>'
     execution_mode  - cudagraph / eager
 
-任意 (moe_tp, moe_ep) 都在单 GPU 上 sim 一个 rank 的本地 compute:
-    local_inter   = inter_size // moe_tp
-    local_experts = num_experts // moe_ep
-    expert_map    = vLLM determine_expert_map(ep_size=moe_ep, ep_rank=0, ...)
+任意合法 (moe_tp, moe_ep) 组合都在单 GPU 上 sim 一个 rank 的本地 compute.
+vLLM 不支持 moe_tp_size>1 AND moe_ep_size>1 同时启用 (TP-on-intermediate 跟
+EP-on-experts 两个 sharding 维度互斥), 该组合由 cases/moe.py:get_cases_for_profile
+skip + runner 入口 assert 双重兜底防误用. 合法组合下:
+
+    ep=1, tp>1: local_inter = inter_size // moe_tp   (TP 沿 intermediate 切)
+                E_local     = num_experts            (全 expert 在本卡)
+                expert_map  = None
+
+    ep>1, tp=1: local_inter = inter_size             (intermediate 不切, 整 expert)
+                E_local     = num_experts // moe_ep  (EP 切 expert 集合)
+                expert_map  = vLLM determine_expert_map(ep_size=moe_ep, ep_rank=0, ...)
 
 跟 AIC `aiconfigurator/collector/vllm/collect_moe_v2.py` 同思路: 单 GPU compute,
 通信 (AllReduce for TP / AllToAll for EP) 由 collective collector 单独测,
@@ -215,6 +223,15 @@ def run_case(case: Case, device: int) -> RawRecord:
     moe_ep = int(p["moe_ep_size"])
     distribution = str(p["distribution"])
 
+    # vLLM 不支持 TP-on-intermediate 跟 EP-on-experts 两个 sharding 维度同时启用.
+    # cases/moe.py:get_cases_for_profile 已 skip 该组合, 这里做 belt-and-suspenders 兜底
+    # 防止后续手写 case 直接调 runner 跑出语义错误数据.
+    if moe_tp > 1 and moe_ep > 1:
+        raise NotImplementedError(
+            f"moe_tp_size={moe_tp} AND moe_ep_size={moe_ep}: vLLM 不支持 TP+EP 同时启用 "
+            f"(TP 沿 intermediate / EP 沿 experts 两个 sharding 维度互斥, "
+            f"cases/moe.py 应已 skip)"
+        )
     if moe_inter % moe_tp != 0:
         raise NotImplementedError(
             f"inter_size={moe_inter} not divisible by moe_tp_size={moe_tp}"

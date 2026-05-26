@@ -141,74 +141,49 @@ def test_routed_experts_act_scales_with_tokens_per_device():
     assert f.store_act == expected_act_each
 
 
-# ------- AllToAll comm injection -------
+# ------- vLLM 默认 EP path: 单 AllReduce, 不 AllToAll -------
+# (TRT-LLM SM≥100 / SGLang DeepEP 才走 AllToAll dispatch/combine; vLLM 默认
+#  `fused_experts(expert_map=...) + tensor_model_parallel_all_reduce` 单次 AllReduce
+#  跨 max(tp, ep) ranks 聚合 partial sums.)
 
-def test_ep_alltoall_dispatch_combine_both_present():
-    """ep>1 时必须同时插入 dispatch + combine 两个 AllToAll ops."""
+def test_ep_uses_single_allreduce_not_alltoall():
+    """vLLM 默认 EP path: ep>1 时不应有 AllToAll dispatch/combine, 只 1 个 AllReduce."""
     ops = _layer_ops(tokens=4, phase="decode", tp=2, ep=2)
-    assert _has(ops, "ep_alltoall_dispatch")
-    assert _has(ops, "ep_alltoall_combine")
+    assert not _has(ops, "ep_alltoall_dispatch")
+    assert not _has(ops, "ep_alltoall_combine")
+    assert _has(ops, "routed_expert_allreduce")
 
 
-def test_ep_alltoall_comm_bytes():
-    """moe_plan §3 step 3 routing-aware bytes: tokens × topk × h × a_byte / ep."""
+def test_ep_allreduce_comm_bytes():
+    """AllReduce bytes = tokens × hidden × a_byte (output 聚合, 跟 ep=1 tp>1 同公式)."""
     m = _qwen3_30b_a3b()
-    topk = m.num_activated_experts
-    ep = 2
-
     for tokens in (4, 128):
         phase = "prefill" if tokens > 1 else "decode"
-        ops = _layer_ops(tokens=tokens, phase=phase, tp=2, ep=ep)
-        for op_name in ("ep_alltoall_dispatch", "ep_alltoall_combine"):
-            op = _find(ops, op_name)
-            f = op.roofline_spec()
-            expected = int(tokens * topk * m.hidden_dim * A_BYTE / ep)
-            assert f.comm_bytes == expected, (
-                f"tokens={tokens} op={op_name}: got {f.comm_bytes} != {expected}"
-            )
-            assert f.comm_type == "alltoall"
+        ops = _layer_ops(tokens=tokens, phase=phase, tp=2, ep=2)
+        op = _find(ops, "routed_expert_allreduce")
+        f = op.roofline_spec()
+        expected = tokens * m.hidden_dim * A_BYTE
+        assert f.comm_bytes == expected, (
+            f"tokens={tokens}: got {f.comm_bytes} != {expected}"
+        )
+        assert f.comm_type == "allreduce"
 
 
-def test_alltoall_world_size_equals_ep():
-    """Collective.parallel.world_size 应严格等于 ep_size (不是 tp)."""
-    for ep in (2, 4):
-        ops = _layer_ops(tokens=4, phase="decode", tp=2, ep=ep)
-        for name in ("ep_alltoall_dispatch", "ep_alltoall_combine"):
-            op = _find(ops, name)
-            assert op.parallel["world_size"] == ep, f"ep={ep} {name}"
+def test_allreduce_world_size_equals_max_tp_ep():
+    """AllReduce world_size = max(tp, ep) (vLLM default = world group when EP enabled)."""
+    for tp, ep, expected_ws in [(2, 2, 2), (4, 1, 4), (2, 4, 4), (4, 2, 4)]:
+        ops = _layer_ops(tokens=4, phase="decode", tp=tp, ep=ep)
+        op = _find(ops, "routed_expert_allreduce")
+        assert op.parallel["world_size"] == expected_ws, (
+            f"tp={tp} ep={ep}: world_size={op.parallel['world_size']} != {expected_ws}"
+        )
 
 
-# ------- routed_expert_allreduce gone under EP -------
-
-def test_routed_expert_allreduce_absent_under_ep():
-    """ep>1 时 routed_expert_allreduce 被 AllToAll 替代, 不应再出现."""
-    ops = _layer_ops(tokens=4, phase="decode", tp=2, ep=2)
-    assert not _has(ops, "routed_expert_allreduce")
-
-
-# ------- ep=1 vs ep>1 切换 -------
-
-def test_ep1_uses_allreduce_ep2_uses_alltoall():
-    """同 model 在 ep=1 / ep=2 之间切换, 通信 op 形态正确切换."""
+def test_ep1_and_ep2_both_use_allreduce():
+    """tp>1 时 routed_expert_allreduce 在 ep=1 和 ep>1 都存在 (vLLM 默认 path)."""
     ops_ep1 = _layer_ops(tokens=4, phase="decode", tp=2, ep=1)
     ops_ep2 = _layer_ops(tokens=4, phase="decode", tp=2, ep=2)
-
-    assert _has(ops_ep1, "routed_expert_allreduce")
-    assert not _has(ops_ep1, "ep_alltoall_dispatch")
-    assert not _has(ops_ep1, "ep_alltoall_combine")
-
-    assert not _has(ops_ep2, "routed_expert_allreduce")
-    assert _has(ops_ep2, "ep_alltoall_dispatch")
-    assert _has(ops_ep2, "ep_alltoall_combine")
-
-
-def test_dp_doubles_ep_world_size():
-    """DP+EP 场景: tp=2 dp=2 ep=4 vs tp=2 dp=1 ep=2.
-    Collective.parallel.world_size 必须等于 ep_size, 不是 tp."""
-    ops_small = _layer_ops(tokens=4, phase="decode", tp=2, ep=2)
-    ops_big = _layer_ops(tokens=4, phase="decode", tp=2, ep=4)
-
-    dispatch_small = _find(ops_small, "ep_alltoall_dispatch")
-    dispatch_big = _find(ops_big, "ep_alltoall_dispatch")
-    assert dispatch_small.parallel["world_size"] == 2
-    assert dispatch_big.parallel["world_size"] == 4
+    for ops, label in [(ops_ep1, "ep=1"), (ops_ep2, "ep=2")]:
+        assert _has(ops, "routed_expert_allreduce"), f"{label} 缺 routed_expert_allreduce"
+        assert not _has(ops, "ep_alltoall_dispatch"), f"{label} 不应有 alltoall (vLLM 默认 path)"
+        assert not _has(ops, "ep_alltoall_combine"), f"{label} 不应有 alltoall"

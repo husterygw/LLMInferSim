@@ -1,16 +1,17 @@
-"""moe_plan Phase 3.4 验收: MoE FFN block graph wiring 锁定.
+"""moe_plan Phase 3.4 验收 + vLLM 默认 EP path 修正: MoE FFN block graph wiring 锁定.
 
-锁住 plan §3.3 op 顺序 + §3.4.1 图结构:
+vLLM 默认 EP path 实际不走 AllToAll dispatch/combine, 是 `fused_experts(expert_map=...)`
+local compute + 单次 `tensor_model_parallel_all_reduce` 聚合 partial sums. 跟
+ep=1 tp>1 path 通信形态完全一样.
 
-TP-only (ep == 1, tp > 1):
+锁住:
+
+TP-only (ep == 1, tp > 1) 和 EP (ep > 1, vLLM 默认 path) 共享:
     mlp_norm → moe_gate → moe_topk → moe_dispatch_pre → routed_experts
-    → moe_dispatch_post → routed_expert_allreduce
-    (无 dispatch alltoall)
+    → moe_dispatch_post → routed_expert_allreduce (world=max(tp,ep))
+    (无 ep_alltoall_dispatch / ep_alltoall_combine)
 
-EP (ep > 1):
-    mlp_norm → moe_gate → moe_topk → moe_dispatch_pre → ep_alltoall_dispatch
-    → routed_experts → ep_alltoall_combine → moe_dispatch_post
-    (无 routed_expert_allreduce)
+TRT-LLM SM≥100 / SGLang DeepEP backend 才走 AllToAll (留 follow-up phase, 当前不实现).
 
 外加: MoEDispatch metadata.communication_peer 指向并列 collective op name.
 """
@@ -104,27 +105,33 @@ def test_tp1_no_routed_allreduce():
 # ---------------------------------------------------------------------------
 
 def test_ep_moe_block_order():
-    """EP: 验 op 顺序 + 含 alltoall 不含 routed_expert_allreduce."""
+    """vLLM 默认 EP path: 单 AllReduce 跟 TP-only 同, 不走 AllToAll."""
     names, _ = _moe_layer_ops(tp=4, ep=4)
     must_have = [
         "mlp_norm", "moe_gate", "moe_topk",
-        "moe_dispatch_pre", "ep_alltoall_dispatch",
-        "routed_experts", "ep_alltoall_combine",
-        "moe_dispatch_post", "mlp_add",
+        "moe_dispatch_pre", "routed_experts", "moe_dispatch_post",
+        "routed_expert_allreduce", "mlp_add",
     ]
     for name in must_have:
         assert name in names, f"EP 缺 op: {name} (got {names})"
 
-    # EP 时不出现 TP routed allreduce
-    assert "routed_expert_allreduce" not in names
+    # vLLM 默认 path 不走 AllToAll dispatch/combine
+    assert "ep_alltoall_dispatch" not in names
+    assert "ep_alltoall_combine" not in names
 
-    # 顺序验证: pre → alltoall_dispatch → routed → alltoall_combine → post
+    # 顺序: pre → routed_experts → post → AllReduce
     idx_pre = names.index("moe_dispatch_pre")
-    idx_aa_d = names.index("ep_alltoall_dispatch")
     idx_routed = names.index("routed_experts")
-    idx_aa_c = names.index("ep_alltoall_combine")
     idx_post = names.index("moe_dispatch_post")
-    assert idx_pre < idx_aa_d < idx_routed < idx_aa_c < idx_post
+    idx_ar = names.index("routed_expert_allreduce")
+    assert idx_pre < idx_routed < idx_post < idx_ar
+
+
+def test_ep_allreduce_world_size_eq_max_tp_ep():
+    """vLLM 默认 EP path AllReduce world = max(tp, ep)."""
+    _, ops = _moe_layer_ops(tp=4, ep=4)
+    ar = next(o for o in ops if o.name == "routed_expert_allreduce")
+    assert ar.parallel["world_size"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -142,12 +149,12 @@ def test_tp_only_moe_dispatch_metadata_peer():
 
 
 def test_ep_moe_dispatch_metadata_peer():
-    """EP: pre.peer = ep_alltoall_dispatch, post.peer = ep_alltoall_combine."""
+    """vLLM 默认 EP path: pre.peer=None (no alltoall), post.peer=routed_expert_allreduce."""
     _, ops = _moe_layer_ops(tp=4, ep=4)
     pre = next(o for o in ops if o.name == "moe_dispatch_pre")
     post = next(o for o in ops if o.name == "moe_dispatch_post")
-    assert pre.runtime.get("communication_peer") == "ep_alltoall_dispatch"
-    assert post.runtime.get("communication_peer") == "ep_alltoall_combine"
+    assert pre.runtime.get("communication_peer") is None
+    assert post.runtime.get("communication_peer") == "routed_expert_allreduce"
 
 
 # ---------------------------------------------------------------------------

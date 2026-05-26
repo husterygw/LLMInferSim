@@ -1,6 +1,28 @@
 # MoE Phase 5.B Calibration Residual Breakdown
 
-**Date**: 2026-05-25
+> ## ⚠️ OBSOLETE (2026-05-26)
+>
+> 本文档原诊断 "+24% TPOT gap 主因在 scheduler/framework overhead, 不在 MoE compute" **是错的**.
+>
+> **真实 root cause**: `qwen.py:_build_moe_ffn_block` 把 vLLM 默认 EP path 当成 TRT-LLM/DeepEP 那种 AllToAll-based, 错加 2 个 AllToAll/layer × 48 layer. vLLM 默认 EP path 实际是 `fused_experts(expert_map=...)` + 单次 `tensor_model_parallel_all_reduce`, 跟 ep=1 tp>1 路径同 collective 形态.
+>
+> **fix 后实测** (2026-05-26 重跑 moe_ep_sweep):
+>
+> | case | Phase 1 baseline | fix 后 |
+> |---|---|---|
+> | i128_o128 tp4 ep4 | TPOT +19.87% | **-1.29%** |
+> | i128_o2048 tp4 ep4 | TPOT +0.95% | **-11.51%** |
+> | **driver i2048_o128 tp4 ep4** | **TPOT +24.27%** | **-0.81%** |
+>
+> 全部 ±15% 内, 不需要 calibration. Phase 5.A wiring 架构保留, calibration knob 全部回 neutral.
+>
+> 见 `memory: feedback_ep_collective_topology_vs_calibration.md`.
+>
+> 本文档以下章节保留作 historical reference, **不要按这套诊断 calibrate**.
+
+---
+
+**Date**: 2026-05-25 (obsolete 2026-05-26)
 **Scope**: moe_plan §5.B validation — driver case `moe_ep_sweep i2048_o128 tp4 ep4`.
 
 ## 验收点 (plan §5.B step 5)
