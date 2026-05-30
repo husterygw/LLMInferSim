@@ -1,7 +1,7 @@
-"""Layer partition helper — grouped trace mode 用 (Task #154/#155).
+"""Layer partition helper.
 
-把 model 的 num_layers 按 "同 op composition pattern" 分桶, 一个桶一个 GroupedOperator
-代表. 当前 partition 规则:
+把 model 的 num_layers 按 "同 op composition pattern" 分桶, 模型图给每桶建一组带
+count 的静态 op (count = 桶大小). 当前 partition 规则:
 
 FFN (partition_ffn_layers):
     Dense model (is_moe=False) → 1 桶 (all dense layers).
@@ -17,10 +17,10 @@ V4 hash MoE 分桶 / V4 attention 按 compress_ratio 分桶 已在 #157 删除,
 """
 from __future__ import annotations
 
-from llm_infer_sim.core.profiles.model_config import ModelConfig
+from llm_infer_sim.core.models.config import ModelProfile
 
 
-def partition_ffn_layers(model: ModelConfig) -> list[tuple[str, tuple[int, ...]]]:
+def partition_ffn_layers(model: ModelProfile) -> list[tuple[str, tuple[int, ...]]]:
     """返回 [(ffn_kind, layer_indices), ...] 顺序: dense → moe.
 
     ffn_kind ∈ {"dense", "moe"}.

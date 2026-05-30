@@ -1,0 +1,48 @@
+# LLMInferSim 可选模拟配置 (薄覆盖层)。
+#
+# 用法: 复制本文件为 configs/config.yaml。文件不存在时 = 当前行为, 完全不影响。
+# 优先级: vLLM 推导 < configs/config.yaml < 已存在 env (env 永远最高)。
+# 只表达 vLLM 接口表达不了的 simulator 语义; 不承载 HF 模型结构 (那个从 vLLM/HF config 提取)。
+# 所有字段可选, 只写需要覆盖的; 未知 section/key 会直接报错 (防拼写错误静默生效)。
+
+hardware:
+  # 硬件 preset 名 (见 core/hardware/registry.py)。env: LLM_INFER_SIM_HW
+  name: H100
+  # NUMA/拓扑提示: concentrated | balanced。env: LLM_INFER_SIM_NUMA_HINT
+  topology_hint: concentrated
+  # 效率系数 0.0~1.0 (preset 默认 1.0)。会改 cost 数值 (effective_* roofline)。
+  # mem_efficiency 对标 AIConfigurator mem_bw_empirical_scaling_factor (~0.8)。
+  # env: LLM_INFER_SIM_MEM_EFFICIENCY (只覆盖 mem_efficiency)
+  compute_efficiency: 1.0
+  mem_efficiency: 1.0
+  comm_efficiency: 1.0
+
+calibration:
+  # false 时 get_calibration_profile 返回纯占位 (无 MoE 标定)。当前仅 RTX_4090 有
+  # NEUTRAL MoE 标定 (只写 trace metadata, 不改 latency), 其它硬件本就是占位。
+  enabled: true
+
+quantization:
+  # auto = 沿用 vLLM 推导 (从 quantization_config / cache_dtype 切)。
+  # 只有写 float 才覆盖 (单位: byte/元素, 如 fp16=2.0 / fp8=1.0 / fp4=0.5)。
+  w_byte: auto
+  a_byte: auto
+  kv_byte: auto
+
+pd_disagg:
+  # PD 分离 (纯 cost path)。优先级: vLLM kv_transfer_config < 这里 < LLM_INFER_SIM_PD_*。
+  # role: kv_producer | kv_consumer | kv_both | (留空 = 不启用)
+  role: null
+  connector_name: P2pNcclConnector
+  kv_parallel_size: 1
+  # 留 null 时按 connector_name 从 PD_CONNECTOR_PRESETS 取带宽/起始延迟。
+  connector_bandwidth_gbps: null
+  connector_latency_us: null
+
+runtime:
+  # 时间推进: realtime | instant。env: LLM_INFER_SIM_TIME_MODE
+  time_mode: realtime
+  # per-op breakdown dump: 0=不打 | 1=首个有效 step | 2=每 step。env: LLM_INFER_SIM_DUMP_OPS
+  dump_ops: 0
+  # per-request 调度 dump: 0=不打 | 1=每 step。env: LLM_INFER_SIM_DUMP_REQUESTS
+  dump_requests: 0

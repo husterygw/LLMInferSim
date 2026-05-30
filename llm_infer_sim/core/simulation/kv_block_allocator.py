@@ -28,11 +28,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from llm_infer_sim.core.profiles.model_config import ModelConfig
+from llm_infer_sim.core.models.config import ModelProfile
 
 
 def compute_block_bytes(
-    model: ModelConfig,
+    model: ModelProfile,
     block_size: int,
     kv_byte: float,
 ) -> int:
@@ -108,7 +108,7 @@ class KVBlockAllocator:
 
     def __init__(
         self,
-        model: ModelConfig,
+        model: ModelProfile,
         block_size: int,
         num_blocks_total: int,
         kv_byte: float = 2.0,

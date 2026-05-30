@@ -1,6 +1,6 @@
 """Qwen3-4B-Instruct-2507 shape profile.
 
-Model config (from /data/ygw/models/Qwen3-4B-Instruct-2507/config.json):
+Model config (from /data1/home/ygw268/models/Qwen3-4B-Instruct-2507/config.json):
   hidden_size           = 2560
   num_attention_heads   = 32
   num_key_value_heads   = 8

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from llm_infer_sim.core.profiles.deploy import DeployConfig
 from llm_infer_sim.core.workload.workload import GlobalStepWorkload, StepPhase
 
 
@@ -34,7 +33,7 @@ class StepShape:
     def from_workload(
         cls,
         workload: GlobalStepWorkload,
-        deploy: DeployConfig,
+        execution_mode: str = "eager",
     ) -> StepShape:
         phase_str = (
             workload.phase.value
@@ -57,5 +56,5 @@ class StepShape:
             max_context_len=workload.max_context_len,
             max_prefill_seqlen=workload.max_prefill_seqlen,
             avg_decode_context_len=workload.avg_decode_context_len,
-            execution_mode=deploy.execution_mode,
+            execution_mode=execution_mode,
         )

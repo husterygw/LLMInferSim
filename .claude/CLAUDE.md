@@ -28,13 +28,13 @@ cost model 估算,从而预测 latency / 吞吐而无需真显卡执行。
 conda activate llm_sim && pytest
 
 # 最轻量探针:只验证 plugin entry_point 注册 + platform 选中,不起 LLM,~5s
-python examples/run_platform_selected.py
+python examples/vllm_virtual/run_platform_selected.py
 
 # 端到端 smoke:真起一次 vLLM 跑 opt-125m
-python examples/run_opt125m.py
+python examples/vllm_virtual/run_opt125m.py
 
 # 对比 bench(真实 vLLM vs 虚拟后端),suite 列表见 scripts/README.md
-bash scripts/run_bench_suite.sh single_tp1_roofline
+bash scripts/bench/run_bench_suite.sh single_tp1_roofline
 ```
 
 `bench_cases.py` 是 benchmark 矩阵的唯一来源,`bench_compare.sh` 只执行它生成的 cases。
@@ -60,3 +60,9 @@ bash scripts/run_bench_suite.sh single_tp1_roofline
 - vLLM v1 会留僵尸子进程,`pkill -f vllm` 杀不到:用 `pgrep VLLM::` + `lsof -i tcp:<port>` 双兜底。
 - 短 prefill 的 bench TTFT 有 ±10–50ms 抖动,判定确定性看 step 内部 latency,别拿单次 TTFT outlier 当 sim bug。
 - 从 llm-viewer / LLMCompass 复制来的 family-specific 占位代码,接新模型前先审计 + 手算,别直接激活。
+- 新增 model/hardware 字段先加到**结构化 profile**(`ModelProfile`/`HardwareProfile`/
+  `DeploymentProfile`/`RuntimeProfile`/`CalibrationProfile`),再视需要补 flat read facade;
+  扁平 `ModelConfig`/`HardwareConfig` 只是兼容边界,生产装配链走
+  `build_roofline_engine_from_scenario(scenario)`,不走扁平 `build_roofline_engine()`。
+  `.to_legacy()`/`.from_legacy()` 折返只允许出现在 `profile_extractor`(vLLM ingest)+
+  `hardware/registry`(硬件域入口);`tests/contract/test_legacy_profile_guard.py` 会盯住这条线。

@@ -157,7 +157,7 @@ class VirtualPlatform(Platform):
         # NixlConnector / OffloadingConnector 等 (详 PD_CONNECTOR_PRESETS).
         kvt = getattr(vllm_config, "kv_transfer_config", None)
         if kvt is not None:
-            from llm_infer_sim.core.profiles.deploy import PD_CONNECTOR_PRESETS
+            from llm_infer_sim.core.deployment.pd_disagg import PD_CONNECTOR_PRESETS
             role = getattr(kvt, "kv_role", None)
             connector = getattr(kvt, "kv_connector", None)
             if role is None:

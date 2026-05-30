@@ -7,16 +7,15 @@ hash/eq (field compare=False), 不污染 OperatorDB lookup.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
+from llm_infer_sim.core.graph.runtime import OpRuntime, StepRuntime
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
-from llm_infer_sim.core.operator_schema.canonical import project, to_canonical
 from llm_infer_sim.core.operator_schema.signature import OperatorSignature
-from llm_infer_sim.core.operators.base import RooflineSpec
+from llm_infer_sim.core.operators.base import OperatorBase, RooflineSpec
 from llm_infer_sim.core.operators.context import OperatorContext
-from llm_infer_sim.core.profiles.deploy import DeployConfig
-from llm_infer_sim.core.profiles.hardware import HardwareConfig
-from llm_infer_sim.core.profiles.model_config import ModelConfig
+from llm_infer_sim.core.hardware.device import HardwareConfig
+from llm_infer_sim.core.models.config import ModelConfig
 
 _SHAPE_KEYS = ("m", "n", "k")
 _PARALLEL_KEYS = ("tp",)
@@ -38,7 +37,7 @@ def dtype_to_bytes(dtype: str) -> float:
 
 
 @dataclass(frozen=True)
-class GEMM:
+class GEMM(OperatorBase):
     name: str
     op_subtype: str
     phase: str
@@ -56,43 +55,56 @@ class GEMM:
     is_kv_proj: bool = False
     dependencies: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    # Phase 2 static contract (op_plan §6). count = static layer multiplicity
+    # (replaces GroupedOperator.count). m_fn computes the step-varying M from
+    # StepRuntime; n/k are already ctx-static on the op. compare=False so the
+    # migration fields don't perturb hash/eq / OperatorDB lookup.
+    count: int = 1
+    m_fn: Callable[[StepRuntime], int] | None = field(
+        default=None, compare=False, hash=False, repr=False,
+    )
 
     @property
     def op_kind(self) -> str:
         return "gemm"
 
     @property
-    def dtype(self) -> str:
-        return self.dtype_override if self.dtype_override else self.ctx.dtype
-
-    @property
     def shape(self) -> dict[str, Any]:
         return {"m": self.m, "n": self.n, "k": self.k}
 
-    @property
-    def parallel(self) -> dict[str, Any]:
-        return {"tp": self.ctx.tp_size}
+    # dtype / parallel ({"tp": tp_size}) / runtime 走 OperatorBase 默认。
 
-    @property
-    def runtime(self) -> dict[str, Any]:
-        return {
-            "framework": self.ctx.framework,
-            "framework_version": self.ctx.framework_version,
-            "execution_mode": self.ctx.execution_mode,
-            "kernel_source": self.kernel_source,
-        }
+    # ---- Phase 2 static + forward contract ----
+    # signature / roofline_spec are dual-mode during migration: called with no
+    # op_runtime → legacy (uses self.m/n/k from construction); called with an
+    # OpRuntime (from forward()) → uses its shape. The two MUST be numerically
+    # identical for the same effective shape (locked by tests) so the eventual
+    # engine switch to forward() does not move any sim number.
 
-    def signature(self) -> OperatorSignature:
-        return OperatorSignature(
-            op_kind=self.op_kind,
-            op_subtype=self.op_subtype,
-            dtype=self.dtype,
-            shape=to_canonical(project(self.shape, _SHAPE_KEYS)),
-            parallel=to_canonical(project(self.parallel, _PARALLEL_KEYS)),
-            runtime=to_canonical(project(self.runtime, _RUNTIME_KEYS)),
+    def forward(self, step: StepRuntime) -> OpRuntime:
+        m = self.m_fn(step) if self.m_fn is not None else self.m
+        return OpRuntime(
+            phase=step.phase,
+            op_subtype=None,  # GEMM subtype is static; signature uses self.op_subtype
+            shape={"m": int(m), "n": self.n, "k": self.k},
+            parallel=dict(self.parallel),
+            runtime=dict(self.runtime),
         )
 
-    def roofline_spec(self) -> RooflineSpec:
+    def signature(self, op_runtime: OpRuntime | None = None) -> OperatorSignature:
+        return self.resolved_signature(
+            op_runtime,
+            shape_keys=_SHAPE_KEYS,
+            parallel_keys=_PARALLEL_KEYS,
+            runtime_keys=_RUNTIME_KEYS,
+        )
+
+    def roofline_spec(self, op_runtime: OpRuntime | None = None) -> RooflineSpec:
+        if op_runtime is None:
+            m, n, k = self.m, self.n, self.k
+        else:
+            m, n, k = (int(op_runtime.shape["m"]), int(op_runtime.shape["n"]),
+                       int(op_runtime.shape["k"]))
         w_byte = (
             self.weight_bytes_per_elem if self.weight_bytes_per_elem is not None
             else self.ctx.w_byte
@@ -107,12 +119,12 @@ class GEMM:
             out_byte = self.ctx.kv_byte
         else:
             out_byte = a_byte
-        out_bytes = int(self.m * self.n * out_byte)
+        out_bytes = int(m * n * out_byte)
         precision = self.op_precision_override if self.op_precision_override else self.dtype
         return RooflineSpec(
-            flops=int(2 * self.m * self.n * self.k),
-            load_weight=int(self.k * self.n * w_byte),
-            load_act=int(self.m * self.k * a_byte),
+            flops=int(2 * m * n * k),
+            load_weight=int(k * n * w_byte),
+            load_act=int(m * k * a_byte),
             store_act=0 if self.is_kv_proj else out_bytes,
             store_kv_cache=out_bytes if self.is_kv_proj else 0,
             op_precision=precision,
@@ -138,16 +150,20 @@ class GEMM:
         m = int(shape["m"])
         n = int(shape["n"])
         k = int(shape["k"])
-        deploy = DeployConfig(
-            tp_size=int(parallel.get("tp", 1) or 1),
-            execution_mode=runtime.get("execution_mode", "eager"),
-            backend=runtime.get("framework", record.framework),
-            backend_version=runtime.get("framework_version", record.framework_version),
-        )
+        from llm_infer_sim.core.deployment.profile import DeploymentProfile
+        from llm_infer_sim.core.runtime.profile import RuntimeProfile
+
         elem_bytes = dtype_to_bytes(record.signature.dtype)
         ctx = OperatorContext(
             model=ModelConfig(),  # dummy, GEMM.formula 不依赖 model
-            deploy=deploy,
+            deployment=DeploymentProfile.flat(tp=int(parallel.get("tp", 1) or 1)),
+            runtime=RuntimeProfile.flat(
+                execution_mode=runtime.get("execution_mode", "eager"),
+                backend=runtime.get("framework", record.framework),
+                backend_version=runtime.get(
+                    "framework_version", record.framework_version
+                ),
+            ),
             hw=hw,
             w_byte=elem_bytes, a_byte=elem_bytes, kv_byte=elem_bytes,
             dtype=record.signature.dtype,

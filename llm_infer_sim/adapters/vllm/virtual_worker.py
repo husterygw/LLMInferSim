@@ -172,31 +172,30 @@ class VirtualWorker(WorkerBase):
         阶段 0-3 旧公式 `× 0.5` 占位已替换。
         阶段 5 (MoE) / 阶段 6 (EP) 起需细化 expert 切分逻辑。
         """
-        from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
-        from llm_infer_sim.core.profiles.sizing import (
+        from llm_infer_sim.adapters.vllm.profile_extractor import extract_scenario
+        from llm_infer_sim.core.models.sizing import (
             estimate_activation_bytes,
             per_rank_param_bytes,
         )
 
-        bundle = extract_profile_bundle(self.vllm_config)
-        model = bundle.model
-        deploy = bundle.deploy
-        efficiency = bundle.efficiency
-        hw = bundle.hw
+        scenario = extract_scenario(self.vllm_config)
+        model = scenario.model
+        quantization = scenario.model.quantization
+        hw = scenario.hardware
 
         hbm = int(hw.mem_capacity_gb * 1024 * 1024 * 1024)
         utilization = self.cache_config.gpu_memory_utilization
         budget = int(hbm * utilization)
 
-        tp = deploy.tp_size
-        ep = deploy.ep_size
-        # dtype-aware + EP-aware. base_w_byte / base_a_byte 当前 V3 EfficiencyProfile
-        # 没显式字段, 传 None → sizing fallback 到 w_byte; fp8/fp4 模型会偏乐观.
+        tp = scenario.deployment.parallelism.tp
+        ep = scenario.deployment.parallelism.ep
+        # dtype-aware + EP-aware. base_w_byte / base_a_byte 当前没显式字段, 传 None →
+        # sizing fallback 到 w_byte; fp8/fp4 模型会偏乐观.
         weight_bytes = per_rank_param_bytes(
-            model, efficiency.w_byte, tp, ep_size=ep, base_w_byte=None,
+            model, quantization.w_byte, tp, ep_size=ep, base_w_byte=None,
         )
         max_batched = getattr(self.scheduler_config, "max_num_batched_tokens", 2048)
-        activation_bytes = estimate_activation_bytes(model, max_batched, efficiency.a_byte)
+        activation_bytes = estimate_activation_bytes(model, max_batched, quantization.a_byte)
 
         available = budget - weight_bytes - activation_bytes
         if available <= 0:
@@ -265,13 +264,13 @@ class VirtualWorker(WorkerBase):
     # ------- 阶段 3 D 块: 报告抽取 (供 collective_rpc 调用) -------
 
     def _get_virtual_runner_report(self) -> str:
-        """examples/run_qwen3_4b_chunked.py 通过 collective_rpc 拉取每 rank 报告。"""
+        """examples/offline/run_qwen3_4b_chunked.py 通过 collective_rpc 拉取每 rank 报告。"""
         if self._virtual_model_runner is None:
             return "(runner not initialized — no steps executed)"
         return self._virtual_model_runner.get_report().generate_console_report()
 
     def _get_pd_stats(self) -> dict:
-        """examples/run_pd_disagg_loopback.py 拉 PD 累计传输统计."""
+        """examples/pd_disagg/run_pd_disagg_loopback.py 拉 PD 累计传输统计."""
         if self._virtual_model_runner is None:
             return {"pd_enabled": False}
         return self._virtual_model_runner.get_pd_stats()
@@ -288,7 +287,7 @@ class VirtualWorker(WorkerBase):
         return False
 
     def _get_per_request_metrics(self) -> list[dict]:
-        """examples/run_prefix_caching.py 用: 拉每 request 的 ttft / arrival_time /
+        """examples/vllm_virtual/run_prefix_caching.py 用: 拉每 request 的 ttft / arrival_time /
         first_token_time 等 sim-time 指标, 供 batch 间对比验证 prefix caching 命中。"""
         if self._virtual_model_runner is None:
             return []

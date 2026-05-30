@@ -1,0 +1,36 @@
+# LLMInferSim 默认模拟配置 (薄覆盖层)。
+#
+# 本机默认: RTX 4090。优先级: vLLM 推导 < 本文件 < 已存在 env (env 永远最高)。
+# 所有字段可选, 只写需要覆盖的; 未知 section/key 会直接报错 (防拼写错误静默生效)。
+# 完整字段说明见 config.yaml.example。
+
+hardware:
+  # 本地工作机硬件 preset。env: LLM_INFER_SIM_HW 可临时覆盖。
+  name: RTX_4090
+  topology_hint: concentrated
+  compute_efficiency: 1.0
+  mem_efficiency: 1.0
+  comm_efficiency: 1.0
+
+calibration:
+  # RTX_4090 启用 NEUTRAL MoE 标定 (只写 trace metadata, 不改 latency)。
+  enabled: true
+
+quantization:
+  # auto = 沿用 vLLM 推导 (从 quantization_config / cache_dtype 切)。
+  w_byte: auto
+  a_byte: auto
+  kv_byte: auto
+
+pd_disagg:
+  # 默认不启用 PD 分离。
+  role: null
+  connector_name: P2pNcclConnector
+  kv_parallel_size: 1
+  connector_bandwidth_gbps: null
+  connector_latency_us: null
+
+runtime:
+  time_mode: realtime
+  dump_ops: 0
+  dump_requests: 0

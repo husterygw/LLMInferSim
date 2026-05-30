@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from llm_infer_sim.core.calibration.profile import CalibrationProfile
 from llm_infer_sim.core.operators.base import RooflineSpec
-from llm_infer_sim.core.profiles.hardware import HardwareConfig
+from llm_infer_sim.core.hardware.device import HardwareProfile
 
 
 @dataclass
@@ -31,19 +32,19 @@ class RooflineResult:
 class RooflineAnalyzer:
     def __init__(
         self,
-        hw: HardwareConfig,
+        hw: HardwareProfile,
         w_bit: int = 16,
         a_bit: int = 16,
         kv_bit: int = 16,
-        efficiency_profile=None,
         execution_mode: str = "eager",
+        calibration: CalibrationProfile | None = None,
     ):
         self.hw = hw
         self.w_bit = w_bit
         self.a_bit = a_bit
         self.kv_bit = kv_bit
-        self.efficiency_profile = efficiency_profile
         self.execution_mode = execution_mode
+        self.calibration = calibration or CalibrationProfile()
 
     def _select_peak(self, formula: RooflineSpec) -> float:
         if formula.op_precision == "fp8":
@@ -73,7 +74,7 @@ class RooflineAnalyzer:
     def _get_kernel_overhead(self, op_category: str) -> float:
         if self.execution_mode == "cudagraph":
             return 0.0
-        overheads = self.hw.kernel_overhead
+        overheads = self.calibration.runtime_overhead.kernel_overhead
         if not overheads:
             return 0.0
         return overheads.get(op_category, overheads.get("default", 0.0))

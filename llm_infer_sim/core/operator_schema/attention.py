@@ -22,6 +22,9 @@ from llm_infer_sim.core.operator_schema.signature import OperatorSignature
 
 _SHAPE_KEYS = (
     "num_tokens", "num_seqs", "q_len", "kv_len",
+    # mixed (unified prefill+decode kernel) 段字段; 纯 prefill/decode 不含 → project
+    # 填 None → to_canonical 跳过 → 纯 prefill/decode hash 与旧版兼容。
+    "prefill_chunk", "n_prefill", "kv_prefill", "n_decode", "kv_decode",
     "num_q_heads", "num_kv_heads", "head_dim",
 )
 _PARALLEL_KEYS = ("tp",)
@@ -92,7 +95,7 @@ def attention_case_params_to_signature(
     )
 
 
-def attention_virtual_op_to_signature(op: Any) -> OperatorSignature:
+def attention_operator_to_signature(op: Any) -> OperatorSignature:
     if op.op_kind != "attention":
         raise ValueError(f"expected op_kind=attention, got {op.op_kind!r}")
     return OperatorSignature(

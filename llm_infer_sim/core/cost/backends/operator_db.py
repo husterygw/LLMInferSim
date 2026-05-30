@@ -32,11 +32,18 @@ class OperatorDBBackend:
         self.store = store
         self.roofline = roofline
 
-    def estimate(self, op: Any) -> CostTraceEntry | None:
+    def estimate(self, op: Any, op_runtime: Any = None) -> CostTraceEntry | None:
+        # op_runtime (OpRuntime | None): None = legacy (signature from op
+        # properties via operator_to_signature). A non-None op_runtime (from
+        # op.forward(step)) is used by migrated ops' signature(op_runtime)
+        # (Phase 2: GEMM).
         if op.op_kind not in self.SUPPORTED_KINDS:
             return None
         try:
-            signature = operator_to_signature(op)
+            if op_runtime is not None:
+                signature = op.signature(op_runtime)
+            else:
+                signature = operator_to_signature(op)
         except ValueError:
             return None
         record = self.store.lookup(signature)
@@ -44,11 +51,14 @@ class OperatorDBBackend:
             return None
 
         latency_s = record.latency_s
-        roofline_s, roofline_gap = self._roofline_compare(op, latency_s)
+        roofline_s, roofline_gap = self._roofline_compare(op, latency_s, op_runtime)
+        # resolved subtype (build-once) lives on op_runtime; signature used it too.
+        op_subtype = (op_runtime.op_subtype if op_runtime is not None and op_runtime.op_subtype
+                      else op.op_subtype)
         return CostTraceEntry(
             op_name=op.name,
             op_kind=op.op_kind,
-            op_subtype=op.op_subtype,
+            op_subtype=op_subtype,
             latency_s=latency_s,
             source="operator_db",
             match_type="exact",
@@ -70,12 +80,12 @@ class OperatorDBBackend:
         )
 
     def _roofline_compare(
-        self, op: Any, real_latency_s: float,
+        self, op: Any, real_latency_s: float, op_runtime: Any = None,
     ) -> tuple[float | None, float | None]:
         """跑 roofline 拿 lower bound, 用 real / roofline 算 gap."""
         if self.roofline is None:
             return None, None
-        rl_entry = self.roofline.estimate(op)
+        rl_entry = self.roofline.estimate(op, op_runtime)
         if rl_entry.latency_s <= 0:
             return rl_entry.latency_s, None
         return rl_entry.latency_s, real_latency_s / rl_entry.latency_s

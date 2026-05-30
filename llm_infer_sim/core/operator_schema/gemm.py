@@ -48,7 +48,7 @@ def gemm_case_params_to_signature(
     )
 
 
-def gemm_virtual_op_to_signature(op: Any) -> OperatorSignature:
+def gemm_operator_to_signature(op: Any) -> OperatorSignature:
     """runtime operator descriptor → OperatorSignature.
 
     op.shape 必含 m/n/k. op.parallel 必含 tp. op.runtime 必含 framework/version/mode/kernel_source.

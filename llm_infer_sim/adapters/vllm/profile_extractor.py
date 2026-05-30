@@ -1,43 +1,52 @@
-"""vLLM → ProfileBundle 提取 (V3 §4.8.1.1 + §4.8.3).
+"""vLLM → SimulationScenario 提取 (V3 §4.8.1.1 + §4.8.3).
 
-把"读 vllm_config 形状"的全部代码集中在 adapter 层, 与 core/profiles 解耦
+把"读 vllm_config 形状"的全部代码集中在 adapter 层, 与 core 解耦
 (V3 §1.1 架构分层: core 完全框架无关).
 
 职责:
-  1. extract_profile_bundle(vllm_config): 从 vllm.config.VllmConfig 抽取
-     ModelConfig + DeployConfig + HardwareConfig + EfficiencyProfile +
-     BackendExecutionProfile, 打包成框架无关的 ProfileBundle 返回.
-  2. vLLM AttentionBackendEnum → BackendExecutionProfile 映射表
+  1. extract_scenario(vllm_config): 从 vllm.config.VllmConfig 抽取
+     ModelProfile + DeploymentProfile + HardwareProfile + RuntimeProfile +
+     CalibrationProfile, 组装成框架无关的 SimulationScenario 返回.
+  2. vLLM AttentionBackendEnum → KernelBackendProfile 映射表
      (_VLLM_BACKEND_MODE_MAP / _VLLM_UNSUPPORTED_BACKENDS, V3 §4.8.1.1).
   3. vLLM hf_config → 框架无关 ModelConfig 字段抽取.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 
-from llm_infer_sim.core.profiles.backend_profile import (
-    BackendExecutionProfile,
+from llm_infer_sim.adapters.vllm.sim_overlay import PDDisaggOverlay, load_sim_overlay
+from llm_infer_sim.core.runtime.kernels import (
+    KernelBackendProfile,
     MixedAttentionPolicy,
 )
-from llm_infer_sim.core.profiles.deploy import DeployConfig, PDDisaggConfig
-from llm_infer_sim.core.profiles.efficiency_profile import EfficiencyProfile
-from llm_infer_sim.core.profiles.hardware import get_hardware_profile
-from llm_infer_sim.core.profiles.model_adapters import get_adapter
-from llm_infer_sim.core.profiles.model_config import ModelConfig
-from llm_infer_sim.core.profiles.profile_manager import ProfileBundle
+from llm_infer_sim.core.calibration import get_calibration_profile
+from llm_infer_sim.core.deployment.pd_disagg import PDDisaggConfig
+from llm_infer_sim.core.deployment.profile import DeploymentProfile
+from llm_infer_sim.core.hardware import get_hardware_config
+from llm_infer_sim.core.hardware.device import HardwareProfile
+from llm_infer_sim.core.models.adapters import get_adapter
+from llm_infer_sim.core.models.config import ModelConfig, ModelProfile
+from llm_infer_sim.core.models.quantization import QuantizationProfile
+from llm_infer_sim.core.runtime.profile import RuntimeProfile
+from llm_infer_sim.core.scenario import SimulationScenario
 
 
-def extract_profile_bundle(vllm_config) -> ProfileBundle:
-    """从 vllm.config.VllmConfig 构造框架无关的 ProfileBundle。
+def _parse_profile_parts(vllm_config) -> dict:
+    """从 vllm.config.VllmConfig 抽取框架无关的扁平域对象 (生产 + 测试共用解析核心)。
 
     Args:
         vllm_config: vllm.config.VllmConfig (含 model_config / parallel_config /
             cache_config / attention_config 等子配置)。
 
     Returns:
-        ProfileBundle —— 完全脱离 vllm 类型, 后续 cost model / planning 都不再
-        感知 vllm 形状。
+        dict(model, deployment, hardware, runtime, calibration) —— 完全脱离 vllm
+        类型; extract_scenario 直接 SimulationScenario(**parts)。
     """
+    # 可选 YAML overlay (vLLM 推导 < config.yaml < env)。缺文件 → 空 overlay → 行为不变。
+    overlay = load_sim_overlay()
+
     # ---- 1. ModelConfig (从 hf_config + model_adapter 提取) ----
     mc = vllm_config.model_config
     hf = mc.hf_config
@@ -53,10 +62,8 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # vLLM: enable_expert_parallel=True 时 ep = tp × dp; 否则 ep = 1
     ep = (tp * dp) if bool(getattr(pc, "enable_expert_parallel", False)) else 1
 
-    # ---- 3. EfficiencyProfile (placeholder 全 1.0) ----
-    efficiency = EfficiencyProfile.placeholder()
-
-    # ---- 3.5. Quantization 切 w_byte/a_byte ----
+    # ---- 3. Quantization 切 w_byte/a_byte (默认 bf16=2.0) ----
+    w_byte = a_byte = kv_byte = 2.0
     # 从 hf_config.quantization_config 读 quant_method, 决定全局 weight/activation byte:
     #   fp8 (V3/V4): w=1.0, activation_scheme="dynamic" → a=1.0; "static" → a 也是 1.0
     #   fp4 / nvfp4 / mxfp4: w=0.5, a=0.5 (假设 activation 同精度)
@@ -72,13 +79,13 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     # vLLM 会把 model-family-specific 名字写回 (e.g. "deepseek_v4_fp8"),
     # 不只是裸 "fp8" / "fp4"。用子串匹配兜底; "fp4" 优先匹配以免被 "fp8" 撞上.
     if "fp4" in quant_method:
-        efficiency.w_byte = 0.5
-        efficiency.a_byte = 0.5
+        w_byte = 0.5
+        a_byte = 0.5
     elif "fp8" in quant_method:
-        efficiency.w_byte = 1.0
+        w_byte = 1.0
         # activation_scheme="dynamic"/"static" 都是 per-token/tensor fp8 量化
         if activation_scheme in ("dynamic", "static"):
-            efficiency.a_byte = 1.0
+            a_byte = 1.0
 
     # ---- 3.5b. Non-quantized modules 解析 ----
     # compressed-tensors: `ignore` (list of patterns / regex)
@@ -96,42 +103,58 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
 
     # ---- 3.6. KV cache dtype 切 kv_byte ----
     # vLLM `cache_config.cache_dtype`:
-    #   "auto"        → 跟 model dtype 走 (默认; 这里保留 efficiency.kv_byte 不变)
+    #   "auto"        → 跟 model dtype 走 (默认; 这里保留 kv_byte=2.0 不变)
     #   "fp8" / "fp8_e4m3" / "fp8_e5m2"  → 1 byte
     #   "fp16" / "bfloat16"              → 2 bytes
     #   "int8"                           → 1 byte
     cc = getattr(vllm_config, "cache_config", None)
     cache_dtype = (getattr(cc, "cache_dtype", "") or "").lower()
     if "fp8" in cache_dtype or cache_dtype == "int8":
-        efficiency.kv_byte = 1.0
+        kv_byte = 1.0
     elif "fp4" in cache_dtype:
-        efficiency.kv_byte = 0.5
+        kv_byte = 0.5
     elif cache_dtype in ("fp16", "bfloat16", "float16"):
-        efficiency.kv_byte = 2.0
-    # "auto" 或空: 保留默认 (跟随 efficiency.kv_byte = 2.0 fp16)
+        kv_byte = 2.0
+    # "auto" 或空: 保留默认 kv_byte = 2.0 (fp16)
 
-    # ---- 4. HardwareConfig (默认 H100, env 可覆盖) ----
-    hw_name = os.environ.get("LLM_INFER_SIM_HW", "H100")
-    hw = get_hardware_profile(hw_name)
+    # YAML overlay 覆盖量化字节 (overlay 里 auto → None → 不覆盖, 沿用 vLLM 推导)。
+    if overlay.quantization.w_byte is not None:
+        w_byte = overlay.quantization.w_byte
+    if overlay.quantization.a_byte is not None:
+        a_byte = overlay.quantization.a_byte
+    if overlay.quantization.kv_byte is not None:
+        kv_byte = overlay.quantization.kv_byte
+    quantization = QuantizationProfile(w_byte=w_byte, a_byte=a_byte, kv_byte=kv_byte)
 
-    # ---- 4b. EfficiencyProfile apply (placeholder = 全 1.0 = pure roofline) ----
-    # 2026-05-18 起: 不再自动加载 YAML 校准。efficiency 默认 placeholder, 后续等
-    # MeasuredOperatorDB 落地后由 cost backend 替换。
-    efficiency.apply_to(hw)
+    # ---- 4. HardwareConfig (默认 H100; vLLM < config.yaml < env) ----
+    # env presence detection: env 设了才赢, 否则用 YAML, 再否则默认。
+    _env_hw = os.environ.get("LLM_INFER_SIM_HW")
+    hw_name = _env_hw if _env_hw is not None else (overlay.hardware.name or "H100")
+    hw = get_hardware_config(hw_name)
 
-    # 临时 sweep knob: LLM_INFER_SIM_MEM_EFFICIENCY 覆盖 hw.mem_efficiency.
-    # (对标 AIConfigurator mem_bw_empirical_scaling_factor, 0.8 是 H100/A100 经验值.)
+    # ---- 4b. hw efficiency (preset 默认 1.0; YAML 覆盖, env 最高) ----
+    # 临时 sweep knob: LLM_INFER_SIM_MEM_EFFICIENCY 覆盖 mem_efficiency
+    # (对标 AIConfigurator mem_bw_empirical_scaling_factor, 0.8 是 H100/A100 经验值)。
+    _eff: dict[str, float] = {}
+    if overlay.hardware.compute_efficiency is not None:
+        _eff["compute_efficiency"] = overlay.hardware.compute_efficiency
+    if overlay.hardware.mem_efficiency is not None:
+        _eff["mem_efficiency"] = overlay.hardware.mem_efficiency
+    if overlay.hardware.comm_efficiency is not None:
+        _eff["comm_efficiency"] = overlay.hardware.comm_efficiency
     _mem_eff = os.environ.get("LLM_INFER_SIM_MEM_EFFICIENCY")
     if _mem_eff is not None:
-        hw.mem_efficiency = float(_mem_eff)
+        _eff["mem_efficiency"] = float(_mem_eff)
+    if _eff:
+        hw = dataclasses.replace(hw, **_eff)
 
     # ---- 5. PD 分离 (详设 §7.6) ----
-    pd_cfg = _extract_pd_config(vllm_config)
+    pd_cfg = _extract_pd_config(vllm_config, overlay.pd_disagg)
 
-    # ---- 6. BackendExecutionProfile (阶段 3.5: 从 attention_config 推导) ----
-    backend = _extract_backend_profile(vllm_config)
+    # ---- 6. KernelBackendProfile (阶段 3.5: 从 attention_config 推导) ----
+    kernel_profile = _extract_kernel_profile(vllm_config, overlay.hardware.topology_hint)
 
-    # ---- 7. V3 §4.6 DeployConfig ----
+    # ---- 7. DeploymentProfile + RuntimeProfile (config_plan §2) ----
     cache_cfg = getattr(vllm_config, "cache_config", None)
     block_size = int(getattr(cache_cfg, "block_size", 16)) if cache_cfg else 16
     sched_cfg = getattr(vllm_config, "scheduler_config", None)
@@ -150,30 +173,44 @@ def extract_profile_bundle(vllm_config) -> ProfileBundle:
     except Exception:
         pass
 
-    deploy = DeployConfig(
-        tp_size=tp,
-        pp_size=1,
-        dp_size=dp,
-        ep_size=ep,
-        moe_tp_size=tp,
-        moe_ep_size=ep,
+    deployment = DeploymentProfile.flat(
+        tp=tp,
+        pp=1,
+        dp=dp,
+        ep=ep,
+        moe_tp=tp,
+        moe_ep=ep,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
         block_size=block_size,
         num_gpu_blocks=None,
-        execution_mode="cudagraph",   # vLLM v1 default
-        backend="vllm",
-        backend_version=backend_version,
         pd=pd_cfg,
     )
-
-    return ProfileBundle(
-        model=model_config,
-        deploy=deploy,
-        hw=hw,
-        efficiency=efficiency,
-        backend=backend,
+    runtime = RuntimeProfile.flat(
+        execution_mode=_infer_execution_mode(vllm_config),  # 单一来源 (cost 读它)
+        backend="vllm",
+        backend_version=backend_version,
+        kernel_profile=kernel_profile,
     )
+
+    # calibration.enabled: YAML 可关标定 (默认开)。无 env 控制。
+    _calibrated = True if overlay.calibration.enabled is None else overlay.calibration.enabled
+
+    return dict(
+        model=ModelProfile.from_legacy(model_config, quantization),
+        deployment=deployment,
+        hardware=HardwareProfile.from_legacy(hw),
+        runtime=runtime,
+        calibration=get_calibration_profile(hw_name, calibrated=_calibrated),
+    )
+
+
+def extract_scenario(vllm_config) -> SimulationScenario:
+    """从 vllm.config.VllmConfig 构造结构化 SimulationScenario (config_plan Step 3/8)。
+
+    生产路径入口: 直接从解析出的结构化域对象组装 scenario。
+    """
+    return SimulationScenario(**_parse_profile_parts(vllm_config))
 
 
 # 已知的 "永远 base dtype" 模块 (我们 sizing 已经把它们算成 base_w_byte).
@@ -305,11 +342,6 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
     # q_lora_rank: DeepSeek-V3 Q 投影也走 LoRA 分解 (1536 in V3); 0 = 直接 hidden→Q proj
     q_lora_rank = getattr(hf, "q_lora_rank", 0) or 0
 
-    # V3.2 lightning indexer 字段
-    index_topk = getattr(hf, "index_topk", 0) or 0
-    index_n_heads = getattr(hf, "index_n_heads", 0) or 0
-    index_head_dim = getattr(hf, "index_head_dim", 0) or 0
-
     # V4 model (sliding_window>0 + o_groups>0) 已在 #157 删除支持. 检测到 V4 hf_config
     # 字段时显式抛错, 避免静默 fallback 到 V3 path.
     if getattr(hf, "sliding_window", 0) and getattr(hf, "o_groups", 0):
@@ -319,8 +351,12 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
             f"V4 will be reimplemented on new operator class architecture."
         )
 
+    architectures = getattr(hf, "architectures", None) or []
+    arch = architectures[0] if architectures else ""
+
     return ModelConfig(
         name=model_id.split("/")[-1] if isinstance(model_id, str) else "model",
+        arch=arch,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -341,9 +377,6 @@ def _extract_model_config(model_id, adapter, hf) -> ModelConfig:
         qk_nope_head_dim=qk_nope_head_dim,
         rope_head_dim=qk_rope_head_dim,
         q_lora_rank=q_lora_rank,
-        index_topk=index_topk,
-        index_n_heads=index_n_heads,
-        index_head_dim=index_head_dim,
     )
 
 
@@ -406,11 +439,13 @@ def _vllm_backend_to_mode(backend) -> tuple[str, str]:
     return _VLLM_BACKEND_MODE_MAP[name]
 
 
-def _extract_backend_profile(vllm_config) -> BackendExecutionProfile:
-    """从 vllm_config 推断 BackendExecutionProfile (含 Phase 5 通信建模字段)。
+def _extract_kernel_profile(
+    vllm_config, topology_hint_overlay: str | None = None
+) -> KernelBackendProfile:
+    """从 vllm_config 推断 KernelBackendProfile (含 Phase 5 通信建模字段)。
 
-    阶段 3.5: mixed_attention.mode + name
-    Phase 5: execution_mode (eager/cudagraph), topology_hint (concentrated/balanced)
+    阶段 3.5: mixed_attention.mode + backend_name
+    Phase 5: topology_hint (concentrated/balanced)
 
     Raises:
         NotImplementedError: 命中 _VLLM_UNSUPPORTED_BACKENDS 或未列出的 enum。
@@ -418,11 +453,10 @@ def _extract_backend_profile(vllm_config) -> BackendExecutionProfile:
     attn_cfg = getattr(vllm_config, "attention_config", None)
     backend = getattr(attn_cfg, "backend", None) if attn_cfg is not None else None
     name, mode = _vllm_backend_to_mode(backend)
-    return BackendExecutionProfile(
-        name=name,
+    return KernelBackendProfile(
+        backend_name=name,
         mixed_attention=MixedAttentionPolicy(mode=mode),
-        execution_mode=_infer_execution_mode(vllm_config),
-        topology_hint=_infer_topology_hint(),
+        topology_hint=_infer_topology_hint(topology_hint_overlay),
     )
 
 
@@ -443,25 +477,62 @@ def _infer_execution_mode(vllm_config) -> str:
     return "cudagraph"
 
 
-def _infer_topology_hint() -> str:
-    """从 env (LLM_INFER_SIM_NUMA_HINT) 推 topology_hint (Phase 5).
+def _infer_topology_hint(overlay_hint: str | None = None) -> str:
+    """推 topology_hint (Phase 5): vLLM(暂无) < config.yaml < env。
 
-    暂不解析 CUDA_VISIBLE_DEVICES + gpu_to_root (留 Phase 6).
+    env presence detection: LLM_INFER_SIM_NUMA_HINT 设了才赢, 否则 YAML, 再否则
+    default "concentrated"。暂不解析 CUDA_VISIBLE_DEVICES + gpu_to_root (留 Phase 6)。
     """
-    return os.environ.get("LLM_INFER_SIM_NUMA_HINT", "concentrated")
+    env = os.environ.get("LLM_INFER_SIM_NUMA_HINT")
+    if env is not None:
+        return env
+    if overlay_hint is not None:
+        return overlay_hint
+    return "concentrated"
 
 
-def _extract_pd_config(vllm_config) -> PDDisaggConfig:
-    """PD 分离 config — sim-only env 优先, 否则读 vllm_config.kv_transfer_config (详设 §7.6).
+def _extract_pd_config(
+    vllm_config, overlay: PDDisaggOverlay | None = None
+) -> PDDisaggConfig:
+    """PD 分离 config — 优先级 vLLM 推导 < config.yaml < env (详设 §7.6)。
 
-    优先级:
-      1. `LLM_INFER_SIM_PD_ROLE=kv_producer|kv_consumer|kv_both`
-         + `LLM_INFER_SIM_PD_CONNECTOR=...` (可选, 默认 P2pNcclConnector)
-         **不触发 vLLM 真 connector**, 只走 cost path。推荐用此路径做 cost 评估。
-      2. vllm_config.kv_transfer_config — 用户已手动起 real connector (multi-proc PD).
-         **会同时触发 vLLM PD 真路径**, 我们叠加 cost; 但 vLLM 真路径需 msgpack
-         + connector class 可加载 + 多进程协调, 单进程 demo 通常不工作。
+    1. vLLM 推导: vllm_config.kv_transfer_config (用户已手动起 real connector,
+       multi-proc PD)。**会同时触发 vLLM PD 真路径**, 我们叠加 cost; 但 vLLM 真路径需
+       msgpack + connector class 可加载 + 多进程协调, 单进程 demo 通常不工作。
+    2. config.yaml: pd_disagg.* 覆盖 (纯 cost path)。
+    3. env: `LLM_INFER_SIM_PD_ROLE=kv_producer|kv_consumer|kv_both` (+ CONNECTOR /
+       BANDWIDTH_GBPS / LATENCY_US / PARALLEL_SIZE) 最高优先, **不触发 vLLM 真 connector**,
+       只走 cost path。推荐用此路径做 cost 评估。
     """
+    # 1. vLLM 推导基线
+    base = PDDisaggConfig()
+    kvt = getattr(vllm_config, "kv_transfer_config", None)
+    if kvt is not None:
+        role = getattr(kvt, "kv_role", None)
+        if role is not None:
+            base = PDDisaggConfig(
+                role=role,
+                connector_name=getattr(kvt, "kv_connector", None),
+                kv_parallel_size=int(getattr(kvt, "kv_parallel_size", 1) or 1),
+            )
+
+    # 2. config.yaml overlay (非 None 才覆盖)
+    if overlay is not None:
+        _repl: dict = {}
+        if overlay.role is not None:
+            _repl["role"] = overlay.role
+        if overlay.connector_name is not None:
+            _repl["connector_name"] = overlay.connector_name
+        if overlay.kv_parallel_size is not None:
+            _repl["kv_parallel_size"] = overlay.kv_parallel_size
+        if overlay.connector_bandwidth_gbps is not None:
+            _repl["connector_bandwidth_gbps"] = overlay.connector_bandwidth_gbps
+        if overlay.connector_latency_us is not None:
+            _repl["connector_latency_us"] = overlay.connector_latency_us
+        if _repl:
+            base = dataclasses.replace(base, **_repl)
+
+    # 3. env 最高优先 (整体替换为 sim-only cost path 配置)
     env_role = os.environ.get("LLM_INFER_SIM_PD_ROLE", "").strip()
     if env_role in ("kv_producer", "kv_consumer", "kv_both"):
         env_conn = os.environ.get(
@@ -469,7 +540,7 @@ def _extract_pd_config(vllm_config) -> PDDisaggConfig:
         ).strip()
         env_bw = os.environ.get("LLM_INFER_SIM_PD_BANDWIDTH_GBPS")
         env_lat = os.environ.get("LLM_INFER_SIM_PD_LATENCY_US")
-        return PDDisaggConfig(
+        base = PDDisaggConfig(
             role=env_role,
             connector_name=env_conn,
             kv_parallel_size=int(os.environ.get("LLM_INFER_SIM_PD_PARALLEL_SIZE", "1")),
@@ -477,23 +548,11 @@ def _extract_pd_config(vllm_config) -> PDDisaggConfig:
             connector_latency_us=float(env_lat) if env_lat else None,
         )
 
-    kvt = getattr(vllm_config, "kv_transfer_config", None)
-    if kvt is None:
-        return PDDisaggConfig()
-    role = getattr(kvt, "kv_role", None)
-    if role is None:
-        return PDDisaggConfig()
-    return PDDisaggConfig(
-        role=role,
-        connector_name=getattr(kvt, "kv_connector", None),
-        kv_parallel_size=int(getattr(kvt, "kv_parallel_size", 1) or 1),
-        connector_bandwidth_gbps=None,
-        connector_latency_us=None,
-    )
+    return base
 
 
 __all__ = [
-    "extract_profile_bundle",
+    "extract_scenario",
     # 以下导出供 feature gate (virtual_platform._check_unsupported_features) 用
     "_VLLM_BACKEND_MODE_MAP",
     "_VLLM_UNSUPPORTED_BACKENDS",

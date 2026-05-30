@@ -5,20 +5,20 @@ collector Case.params / runtime Operator / OperatorDB Query 必须 canonicalize 
 """
 from llm_infer_sim.core.operator_schema.attention import (
     attention_case_params_to_signature,
-    attention_virtual_op_to_signature,
+    attention_operator_to_signature,
 )
 from llm_infer_sim.core.operator_schema.canonical import project, to_canonical
 from llm_infer_sim.core.operator_schema.collective import (
     collective_case_params_to_signature,
-    collective_virtual_op_to_signature,
+    collective_operator_to_signature,
 )
 from llm_infer_sim.core.operator_schema.gemm import (
     gemm_case_params_to_signature,
-    gemm_virtual_op_to_signature,
+    gemm_operator_to_signature,
 )
 from llm_infer_sim.core.operator_schema.moe import (
     moe_case_params_to_signature,
-    moe_virtual_op_to_signature,
+    moe_operator_to_signature,
 )
 from llm_infer_sim.core.operator_schema.signature import OperatorSignature
 
@@ -34,10 +34,10 @@ def operator_to_signature(op) -> OperatorSignature:
         return signature_fn()
 
     dispatch = {
-        "gemm": gemm_virtual_op_to_signature,
-        "attention": attention_virtual_op_to_signature,
-        "moe": moe_virtual_op_to_signature,
-        "collective": collective_virtual_op_to_signature,
+        "gemm": gemm_operator_to_signature,
+        "attention": attention_operator_to_signature,
+        "moe": moe_operator_to_signature,
+        "collective": collective_operator_to_signature,
     }
     fn = dispatch.get(op.op_kind)
     if fn is None:
@@ -48,23 +48,17 @@ def operator_to_signature(op) -> OperatorSignature:
     return fn(op)
 
 
-def virtual_op_to_signature(op) -> OperatorSignature:
-    """Compatibility wrapper for legacy call sites."""
-    return operator_to_signature(op)
-
-
 __all__ = [
     "OperatorSignature",
     "to_canonical",
     "project",
     "operator_to_signature",
-    "virtual_op_to_signature",
     "gemm_case_params_to_signature",
-    "gemm_virtual_op_to_signature",
+    "gemm_operator_to_signature",
     "attention_case_params_to_signature",
-    "attention_virtual_op_to_signature",
+    "attention_operator_to_signature",
     "moe_case_params_to_signature",
-    "moe_virtual_op_to_signature",
+    "moe_operator_to_signature",
     "collective_case_params_to_signature",
-    "collective_virtual_op_to_signature",
+    "collective_operator_to_signature",
 ]

@@ -11,10 +11,15 @@ from pathlib import Path
 from llm_infer_sim.core.operator_db.importers.collector_v2 import import_record
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
 from llm_infer_sim.core.operator_db.stores.memory import MemoryOperatorStore
+from llm_infer_sim.core.operator_db.version_check import verify_db_framework_version
 
 
 class JsonlOperatorStore(MemoryOperatorStore):
     """MemoryOperatorStore + JSONL loader. 兼容同样的 lookup/add 接口."""
+
+    #: framework_version of the partition loaded via ``load_partition`` (None
+    #: until a partition is loaded). Set for the runtime-version precheck.
+    framework_version: str | None = None
 
     @classmethod
     def from_jsonl(cls, path: Path | str, *, hardware: str) -> "JsonlOperatorStore":
@@ -50,12 +55,27 @@ class JsonlOperatorStore(MemoryOperatorStore):
         framework: str,
         framework_version: str,
         op_kinds: tuple[str, ...] = ("gemm", "attention", "moe", "collective"),
+        verify_version: bool = True,
+        runtime_version: str | None = None,
+        ignore_version_mismatch: bool = False,
     ) -> dict[str, int]:
         """加载某个 (hardware, framework, version) 分区下指定 op_kinds 的 JSONL.
 
         路径布局: <root>/<hardware>/<framework>-<framework_version>/<op_kind>.jsonl
         返 {op_kind: count} 实际加载条数.
+
+        默认 (``verify_version=True``) 校验分区 framework_version 与运行时 vLLM
+        版本一致, 不一致 fail-closed (raise). ``ignore_version_mismatch=True``
+        降级为 warning —— 仅供临时调试, CI/bench 不应默认开启.
         """
+        if verify_version:
+            verify_db_framework_version(
+                framework_version,
+                runtime_version,
+                ignore_mismatch=ignore_version_mismatch,
+                source=f"{framework} partition under {root}",
+            )
+        self.framework_version = framework_version
         partition_dir = Path(root) / hardware / f"{framework}-{framework_version}"
         counts: dict[str, int] = {}
         for op_kind in op_kinds:

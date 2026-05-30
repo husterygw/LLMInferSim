@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from llm_infer_sim.core.cost.backends.operator_db import OperatorDBBackend
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
-from llm_infer_sim.core.graph.grouped_plan import GroupedStepPlan
 from llm_infer_sim.core.graph.step_plan import StepOpPlan
 
 
@@ -52,8 +51,21 @@ class CostRouter:
     def estimate(self, plan: StepOpPlan) -> StepCostTrace:
         entries: list[CostTraceEntry] = []
         for op in plan.ops:
-            entry = self._estimate_op(op)
-            entries.append(entry)
+            # 每个 op 定义 forward(runtime): 用 step runtime 绑定本步动态参数。
+            # forward() 返回 None 表示该 op 本步不激活 (例如 attention_decode 撞上
+            # 纯 prefill step) → 跳过。plan.runtime 为 None 时 (直接构造
+            # StepOpPlan(ops=...) 的单元测试) 不绑定, op_runtime=None, backend 用
+            # op 构造时 baked 的参数估算。
+            op_runtime = None
+            fwd = getattr(op, "forward", None)
+            plan_runtime = plan.runtime
+            if plan_runtime is not None and callable(fwd):
+                op_runtime = fwd(plan_runtime)
+                if op_runtime is None:
+                    continue
+            base = self._estimate_op(op, op_runtime)
+            count = int(getattr(op, "count", 1))
+            entries.append(self._scale_entry(base, count))
 
         total = sum(e.latency_s for e in entries)
         compute = sum(float(e.metadata.get("t_compute", 0.0)) for e in entries)
@@ -73,76 +85,51 @@ class CostRouter:
             bottleneck=bottleneck,
         )
 
-    def estimate_grouped(self, plan: GroupedStepPlan) -> StepCostTrace:
-        """Grouped trace mode: 同 pattern layer op 只算一次, latency × count.
+    def _scale_entry(self, base_entry, count):
+        """Scale a per-op cost entry by static layer multiplicity ``count``.
 
-        数学等价 full path (sum of per-layer roofline = group_latency × count),
-        但 op 调用次数从 ~398/step 降到 ~13/step.
+        ``count`` 来自 ``op.count`` (模型 _build_ops 把同构 layer 折叠成一个 op +
+        重复次数)。count==1 时原样返回, 否则按 count 线性放大 latency / 各时间分量。
         """
-        entries: list[CostTraceEntry] = []
-        total = 0.0
-        compute = 0.0
-        memory = 0.0
-        comm = 0.0
-        for group in plan.groups:
-            op = group.op
-            base_entry = self._estimate_op(op)
-            count = group.count
-            scaled_latency = base_entry.latency_s * count
-            scaled_compute = float(base_entry.metadata.get("t_compute", 0.0)) * count
-            scaled_memory = float(base_entry.metadata.get("t_memory", 0.0)) * count
-            scaled_comm = float(base_entry.metadata.get("t_comm", 0.0)) * count
-            new_md = dict(base_entry.metadata)
-            new_md["count"] = count
-            new_md["layer_indices"] = list(group.layer_indices)
-            if "t_compute" in new_md:
-                new_md["t_compute"] = scaled_compute
-            if "t_memory" in new_md:
-                new_md["t_memory"] = scaled_memory
-            if "t_comm" in new_md:
-                new_md["t_comm"] = scaled_comm
-            display = (
-                f"{base_entry.op_name}[count={count}]"
-                if count > 1 else base_entry.op_name
-            )
-            roofline_scaled = (
-                base_entry.roofline_s * count
-                if base_entry.roofline_s is not None else None
-            )
-            entries.append(dataclasses.replace(
-                base_entry,
-                latency_s=scaled_latency,
-                layer_idx=None,
-                display_name=display,
-                roofline_s=roofline_scaled,
-                metadata=new_md,
-            ))
-            total += scaled_latency
-            compute += scaled_compute
-            memory += scaled_memory
-            comm += scaled_comm
-        bottleneck = self._bottleneck(compute, memory, comm)
-        return StepCostTrace(
-            step_id=plan.step_id,
-            phase=plan.phase,
-            total_latency_s=total,
-            compute_time_s=compute,
-            memory_time_s=memory,
-            comm_time_s=comm,
-            runtime_time_s=0.0,
-            entries=tuple(entries),
-            bottleneck=bottleneck,
+        if count == 1:
+            return base_entry
+        scaled_latency = base_entry.latency_s * count
+        scaled_compute = float(base_entry.metadata.get("t_compute", 0.0)) * count
+        scaled_memory = float(base_entry.metadata.get("t_memory", 0.0)) * count
+        scaled_comm = float(base_entry.metadata.get("t_comm", 0.0)) * count
+        new_md = dict(base_entry.metadata)
+        new_md["count"] = count
+        if "t_compute" in new_md:
+            new_md["t_compute"] = scaled_compute
+        if "t_memory" in new_md:
+            new_md["t_memory"] = scaled_memory
+        if "t_comm" in new_md:
+            new_md["t_comm"] = scaled_comm
+        display = f"{base_entry.op_name}[count={count}]"
+        roofline_scaled = (
+            base_entry.roofline_s * count
+            if base_entry.roofline_s is not None else None
+        )
+        return dataclasses.replace(
+            base_entry,
+            latency_s=scaled_latency,
+            display_name=display,
+            roofline_s=roofline_scaled,
+            metadata=new_md,
         )
 
-    def _estimate_op(self, op) -> CostTraceEntry:
+    def _estimate_op(self, op, op_runtime=None) -> CostTraceEntry:
+        # op_runtime: OpRuntime | None. forward() 已绑定本步动态参数时传非 None;
+        # 直接构造 StepOpPlan (无 runtime) 时为 None, backend 退回 op 构造时 baked
+        # 的参数。policy.mode 决定 OperatorDB / roofline 的查表顺序。
         mode = self.policy.mode
 
         if mode == "roofline_only":
-            return self.roofline.estimate(op)
+            return self.roofline.estimate(op, op_runtime)
 
         if mode in ("operator_db_first", "require_operator_db"):
             if self.operator_db is not None and self.policy.enable_operator_db:
-                hit = self.operator_db.estimate(op)
+                hit = self.operator_db.estimate(op, op_runtime)
                 if hit is not None:
                     return hit
             if mode == "require_operator_db":
@@ -154,7 +141,7 @@ class CostRouter:
                 raise LookupError(
                     f"DB miss and roofline fallback disabled: op={op.name!r}"
                 )
-            return self.roofline.estimate(op)
+            return self.roofline.estimate(op, op_runtime)
 
         raise ValueError(f"unknown CostPolicy.mode: {mode!r}")
 

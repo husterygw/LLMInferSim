@@ -1,31 +1,24 @@
 """Collective operators (AllReduce / AllGather / ReduceScatter / AllToAll / P2P).
 
-Step 1 of comm_plan: 替换原来的 ``Collective(op_subtype=...)`` + ``make_collective(kind=...)``
-弱语义模式, 改成具体子类:
-
-    AllReduce(name=..., message_bytes=..., world_size=..., ...)
-    AllToAll(name=..., message_bytes=..., world_size=..., ...)
-    ...
+具体子类模式 (强语义): 直接构造 ``AllReduce(name=..., message_bytes=..., world_size=...)``
+等, 不用弱语义的 ``Collective(op_subtype=...)``。
 
 `Collective` 基类保留, 接受所有共享字段 + auto-compute `roofline_spec_value` (若没传).
 五个具体子类只覆盖 `op_subtype` 默认值, 其它字段全继承.
-
-`make_collective(...)` 保留为 deprecated wrapper, 转发到对应子类. 等所有模板模板迁完
-(qwen / deepseek / 各 moe) 后删除.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from llm_infer_sim.core.operator_schema.canonical import project, to_canonical
+from llm_infer_sim.core.graph.runtime import OpRuntime, StepRuntime
 from llm_infer_sim.core.operator_schema.signature import OperatorSignature
-from llm_infer_sim.core.operators.base import RooflineSpec
+from llm_infer_sim.core.operators.base import OperatorBase, RooflineSpec
 from llm_infer_sim.core.operators.context import OperatorContext
 
 
 @dataclass(frozen=True, kw_only=True)
-class Collective:
+class Collective(OperatorBase):
     """通信 op 基类. 通常用具体子类 (AllReduce / AllToAll / ...) 构造,
     不要直接实例化 Collective(op_subtype=...) — 会失去 op_subtype 的静态正确性.
     """
@@ -52,6 +45,12 @@ class Collective:
     topology: str = ""
     dependencies: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    # Phase 3 static contract (op_plan §6/§7). message_bytes_fn computes the
+    # step-varying message size; world_size / topology / op_subtype are static.
+    count: int = 1
+    message_bytes_fn: Callable[[StepRuntime], int] | None = field(
+        default=None, compare=False, hash=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.roofline_spec_value is None:
@@ -68,9 +67,7 @@ class Collective:
     def op_kind(self) -> str:
         return "collective"
 
-    @property
-    def dtype(self) -> str:
-        return self.dtype_override if self.dtype_override else self.ctx.dtype
+    # dtype 走 OperatorBase 默认; parallel/runtime/signature 通信专属, 下面覆盖。
 
     @property
     def shape(self) -> dict[str, Any]:
@@ -98,23 +95,42 @@ class Collective:
             out["topology"] = self.topology
         return out
 
-    def roofline_spec(self) -> RooflineSpec:
-        return self.roofline_spec_value  # type: ignore[return-value]
+    def forward(self, step: StepRuntime) -> OpRuntime | None:
+        # world_size <= 1 (e.g. tp=1): the collective is a structural no-op. Gate it
+        # out (return None) so the router skips it — same idiom as attention's
+        # inactive-regime forward()->None. Lets the graph stay tp-uniform (the op is
+        # built unconditionally) while tp=1 contributes no trace entry / no cost.
+        if self.world_size <= 1:
+            return None
+        mb = (self.message_bytes_fn(step) if self.message_bytes_fn is not None
+              else self.message_bytes)
+        return OpRuntime(
+            phase=step.phase, op_subtype=None,  # collective subtype is static
+            shape={"message_bytes": int(mb)},
+            parallel=dict(self.parallel), runtime=dict(self.runtime),
+        )
 
-    def signature(self) -> OperatorSignature:
-        return OperatorSignature(
-            op_kind="collective",
-            op_subtype=self.op_subtype,
-            dtype=self.dtype,
-            shape=to_canonical(project(self.shape, ("message_bytes",))),
-            parallel=to_canonical(project(self.parallel, (
+    def roofline_spec(self, op_runtime: OpRuntime | None = None) -> RooflineSpec:
+        if op_runtime is None:
+            return self.roofline_spec_value  # type: ignore[return-value]
+        return RooflineSpec(
+            comm_bytes=float(op_runtime.shape["message_bytes"]),
+            comm_type=self.op_subtype,
+            op_category="communication",
+        )
+
+    def signature(self, op_runtime: OpRuntime | None = None) -> OperatorSignature:
+        return self.resolved_signature(
+            op_runtime,
+            shape_keys=("message_bytes",),
+            parallel_keys=(
                 "world_size", "tp", "ep", "node_count", "gpus_per_node",
-            ))),
-            runtime=to_canonical(project(self.runtime, (
+            ),
+            runtime_keys=(
                 "framework", "framework_version", "backend",
                 "algo", "protocol", "topology",
                 "execution_mode", "kernel_source",
-            ))),
+            ),
         )
 
 
@@ -145,53 +161,3 @@ class AllToAll(Collective):
 @dataclass(frozen=True, kw_only=True)
 class P2P(Collective):
     op_subtype: str = "p2p"
-
-
-# ---------------------------------------------------------------------------
-# Deprecated wrapper — kept for callers not yet migrated to concrete classes.
-# ---------------------------------------------------------------------------
-
-_KIND_TO_CLASS: dict[str, type[Collective]] = {
-    "allreduce":      AllReduce,
-    "allgather":      AllGather,
-    "reducescatter":  ReduceScatter,
-    "reduce_scatter": ReduceScatter,
-    "alltoall":       AllToAll,
-    "p2p":            P2P,
-}
-
-
-def make_collective(
-    *,
-    kind: str,
-    name: str,
-    message_bytes: int,
-    world_size: int,
-    phase: str,
-    layer_idx: int | None,
-    ctx: OperatorContext,
-    comm_backend: str = "nccl",
-    topology: str = "single_node",
-    dtype: str = "bf16",
-) -> Collective:
-    """[Deprecated] 用具体子类 (AllReduce / AllToAll / ...) 替代.
-
-    本 wrapper 保留供旧模板 (deepseek, 部分 moe) 渐进迁移; 全部迁完后删除.
-    """
-    cls = _KIND_TO_CLASS.get(kind)
-    if cls is None:
-        raise ValueError(
-            f"unknown collective kind: {kind!r}; "
-            f"supported: {sorted(_KIND_TO_CLASS)}"
-        )
-    return cls(
-        name=name,
-        message_bytes=int(message_bytes),
-        world_size=world_size,
-        phase=phase,
-        layer_idx=layer_idx,
-        ctx=ctx,
-        dtype_override=dtype,
-        comm_backend=comm_backend,
-        topology=topology,
-    )

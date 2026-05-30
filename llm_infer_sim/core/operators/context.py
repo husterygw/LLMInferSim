@@ -1,33 +1,35 @@
-"""OperatorContext + ModelBuildContext — Op class refactor 配置上下文 (#158).
+"""OperatorContext — Op class refactor 配置上下文 (#158).
 
-将 model / deploy / hw / dtype / byte 字段一次性绑定, 让 op class 不再重复传 byte / runtime.
+将 model / deployment / runtime / hw / dtype / byte / routing 字段一次性绑定, 让 op
+class 不再重复传 byte / runtime. 每个 op 持有一个 ctx 引用 (immutable); op 类用
+field(compare=False) 把 ctx 排除在 hash/eq 之外, 不污染 OperatorDB lookup.
 
-- OperatorContext: 每个 op 持有, immutable. 包含 op-level formula 所需的所有共享配置.
-  签名 (compare/hash) 时设 compare=False, 不污染 OperatorDB lookup.
-- ModelBuildContext: 模型模板持有, 包含 OperatorContext + 模板构图时才用到的 routing /
-  indexer_kv_byte 等. op 实例只 carry OperatorContext, 不 carry routing.
+ctx 持结构化 DeploymentProfile + RuntimeProfile; op formula 经 property
+(framework / execution_mode / tp_size / ...) 读, 不再持 flat deploy 对象。
 
-build_operator_context(model, deploy, hw, efficiency=None) 从配置一次推导出 ctx,
-在 engine builder 里调用.
+build_operator_context(model, deployment, runtime, hw, ...) 是唯一装配入口
+(scenario / 测试共用)。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from typing import TYPE_CHECKING
 
-from llm_infer_sim.core.profiles.deploy import DeployConfig
-from llm_infer_sim.core.profiles.efficiency_profile import EfficiencyProfile
-from llm_infer_sim.core.profiles.hardware import HardwareConfig
-from llm_infer_sim.core.profiles.model_config import ModelConfig
+from llm_infer_sim.core.deployment.profile import DeploymentProfile
+from llm_infer_sim.core.models.config import ModelProfile
+from llm_infer_sim.core.hardware.device import HardwareProfile
+from llm_infer_sim.core.models.quantization import QuantizationProfile
 
 if TYPE_CHECKING:
     from llm_infer_sim.core.operators.moe import MoERoutingProfile
+    from llm_infer_sim.core.runtime.profile import RuntimeProfile
+    from llm_infer_sim.core.scenario import SimulationScenario
 
 
 @dataclass(frozen=True)
 class OperatorContext:
-    """Op 共享配置 (model / deploy / hw + byte / dtype).
+    """Op 共享配置 (model / deployment / runtime / hw + byte / dtype).
 
     每个 op 实例持有一个 ctx 引用; 多 op 共享同一 ctx (immutable, 安全).
     roofline_spec() / shape / parallel / runtime 从这里读 byte / framework / execution_mode.
@@ -35,89 +37,86 @@ class OperatorContext:
     OperatorDB signature 不含 ctx 内容 (byte 字段是 roofline 公式输入, 不进 DB key).
     op 类用 dataclass field(compare=False) 把 ctx 排除在 hash/eq 之外.
     """
-    model: ModelConfig
-    deploy: DeployConfig
-    hw: HardwareConfig
+    model: ModelProfile
+    deployment: DeploymentProfile
+    runtime: RuntimeProfile
+    hw: HardwareProfile
     w_byte: float = 2.0      # 量化层 dtype (bf16=2.0, fp8=1.0, fp4=0.5)
     a_byte: float = 2.0      # activation dtype
     kv_byte: float = 2.0     # KV cache dtype
     dtype: str = "bf16"      # op default precision; per-op override 通过构造参数
+    # MoE expert-routing 假设 (skew → distinct experts → routed_experts weight read).
+    # 是部署级成本假设, 不是结构身份 → compare=False (不进 hash/eq, 不污染 DB key).
+    # 模型图建图时读 ctx.routing; dense 模型忽略它. None → 各 MoE 模型默认 balanced().
+    routing: "MoERoutingProfile | None" = field(default=None, compare=False)
 
-    # ---- runtime convenience (避免每个 op formula 都 self.ctx.deploy.xxx) ----
+    # ---- runtime convenience (避免每个 op formula 都 self.ctx.<...>) ----
 
     @property
     def framework(self) -> str:
-        return self.deploy.backend
+        return self.runtime.framework.name
 
     @property
     def framework_version(self) -> str:
-        return self.deploy.backend_version or "unknown"
+        return self.runtime.framework.version or "unknown"
 
     @property
     def execution_mode(self) -> str:
-        return self.deploy.execution_mode
+        return self.runtime.execution.execution_mode
 
     @property
     def tp_size(self) -> int:
-        return self.deploy.tp_size
+        return self.deployment.parallelism.tp
 
     @property
     def ep_size(self) -> int:
-        return self.deploy.ep_size
+        return self.deployment.parallelism.ep
 
     @property
     def block_size(self) -> int:
-        return self.deploy.block_size
-
-
-@dataclass(frozen=True)
-class ModelBuildContext:
-    """模板构图上下文 (OperatorContext + routing / indexer 配置).
-
-    template.build_grouped_step(step, mbc) 从 mbc.op 派生 op, 从 mbc.routing 算
-    MoE expert count / alltoall message bytes.
-    """
-    op: OperatorContext
-    routing: "MoERoutingProfile | None" = None
-    indexer_kv_byte: float = 1.0      # V3.2 indexer KV cache 一般 fp8 (1.0 byte/elem)
+        return self.deployment.kv_cache.block_size
 
 
 def build_operator_context(
-    model: ModelConfig,
-    deploy: DeployConfig,
-    hw: HardwareConfig,
-    efficiency: EfficiencyProfile | None = None,
+    model: ModelProfile,
+    deployment: DeploymentProfile,
+    runtime: "RuntimeProfile",
+    hw: HardwareProfile,
+    *,
+    quantization: QuantizationProfile | None = None,
+    routing: "MoERoutingProfile | None" = None,
 ) -> OperatorContext:
-    """从配置一次性推导 OperatorContext.
+    """从结构化域对象一次性推导 OperatorContext (唯一装配入口)。
 
-    efficiency=None 时用 placeholder (全 1.0 / bf16). 实际部署由 adapter
-    (profile_extractor) 从 quantization_config 推导 EfficiencyProfile 后传入.
+    quantization=None 时用 placeholder (bf16 全 2.0). routing=None → MoE 模型图建图时
+    退回 balanced().
     """
-    eff = efficiency or EfficiencyProfile.placeholder()
+    quant = quantization or QuantizationProfile.placeholder()
     return OperatorContext(
         model=model,
-        deploy=deploy,
+        deployment=deployment,
+        runtime=runtime,
         hw=hw,
-        w_byte=eff.w_byte,
-        a_byte=eff.a_byte,
-        kv_byte=eff.kv_byte,
-        dtype="bf16",   # 默认 bf16; 未来由 efficiency 推导
+        w_byte=quant.w_byte,
+        a_byte=quant.a_byte,
+        kv_byte=quant.kv_byte,
+        dtype="bf16",   # 默认 bf16; 未来由 quantization 推导
+        routing=routing,
     )
 
 
-def build_model_build_context(
-    model: ModelConfig,
-    deploy: DeployConfig,
-    hw: HardwareConfig,
-    *,
-    efficiency: EfficiencyProfile | None = None,
-    routing: "MoERoutingProfile | None" = None,
-    indexer_kv_byte: float = 1.0,
-) -> ModelBuildContext:
-    """One-shot builder: 配置 → ModelBuildContext."""
-    op_ctx = build_operator_context(model, deploy, hw, efficiency)
-    return ModelBuildContext(
-        op=op_ctx,
-        routing=routing,
-        indexer_kv_byte=indexer_kv_byte,
+def build_operator_context_from_scenario(
+    scenario: "SimulationScenario",
+) -> OperatorContext:
+    """从 SimulationScenario 装配 OperatorContext (生产唯一入口)。
+
+    把 scenario → 域对象的拆包逻辑收敛在此, 调用方只持 scenario。
+    """
+    return build_operator_context(
+        scenario.model,
+        scenario.deployment,
+        scenario.runtime,
+        scenario.hardware,
+        quantization=scenario.model.quantization,
+        routing=scenario.runtime.kernels.moe_routing,
     )

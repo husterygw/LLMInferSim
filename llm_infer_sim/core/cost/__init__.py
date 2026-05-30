@@ -6,6 +6,8 @@ from llm_infer_sim.core.cost.engine import (
     build_deepseek_roofline_engine,
     build_qwen_dense_roofline_engine,
     build_qwen_roofline_engine,
+    build_roofline_engine,
+    build_roofline_engine_from_scenario,
 )
 from llm_infer_sim.core.cost.router import CostPolicy, CostRouter
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
@@ -21,4 +23,6 @@ __all__ = [
     "build_qwen_dense_roofline_engine",
     "build_qwen_roofline_engine",
     "build_deepseek_roofline_engine",
+    "build_roofline_engine",
+    "build_roofline_engine_from_scenario",
 ]

@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from llm_infer_sim.core.operator_schema.signature import OperatorSignature
-from llm_infer_sim.core.operators.base import RooflineSpec
+from llm_infer_sim.core.graph.runtime import OpRuntime, StepRuntime
+from llm_infer_sim.core.operators.base import OperatorBase, RooflineSpec
 from llm_infer_sim.core.operators.context import OperatorContext
 
 
 @dataclass(frozen=True)
-class Embedding:
+class Embedding(OperatorBase):
     """Token embedding lookup: tokens × hidden (vocab × hidden weight)."""
     name: str
     phase: str
@@ -23,6 +23,11 @@ class Embedding:
     kernel_source: str = "vllm_default"
     dependencies: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    # Phase 3 static contract (op_plan §6/§7). embedding/lm_head count=1.
+    count: int = 1
+    tokens_fn: Callable[[StepRuntime], int] | None = field(
+        default=None, compare=False, hash=False, repr=False,
+    )
 
     @property
     def op_kind(self) -> str:
@@ -33,10 +38,6 @@ class Embedding:
         return "embedding"
 
     @property
-    def dtype(self) -> str:
-        return self.dtype_override if self.dtype_override else self.ctx.dtype
-
-    @property
     def shape(self) -> dict[str, Any]:
         return {
             "tokens": self.tokens,
@@ -44,26 +45,21 @@ class Embedding:
             "hidden": self.hidden,
         }
 
-    @property
-    def parallel(self) -> dict[str, Any]:
-        return {"tp": self.ctx.tp_size}
+    # dtype / parallel / runtime / signature(raise) 走 OperatorBase 默认。
 
-    @property
-    def runtime(self) -> dict[str, Any]:
-        return {
-            "framework": self.ctx.framework,
-            "framework_version": self.ctx.framework_version,
-            "execution_mode": self.ctx.execution_mode,
-            "kernel_source": self.kernel_source,
-        }
+    def forward(self, step: StepRuntime) -> OpRuntime:
+        tokens = self.tokens_fn(step) if self.tokens_fn is not None else self.tokens
+        return OpRuntime(
+            phase=step.phase, op_subtype=None,
+            shape={"tokens": int(tokens), "vocab_size": self.vocab_size, "hidden": self.hidden},
+            parallel=dict(self.parallel), runtime=dict(self.runtime),
+        )
 
-    def roofline_spec(self) -> RooflineSpec:
+    def roofline_spec(self, op_runtime: OpRuntime | None = None) -> RooflineSpec:
+        tokens = int(op_runtime.shape["tokens"]) if op_runtime is not None else self.tokens
         return RooflineSpec(
             op_category="embedding",
             flops=0,
             load_weight=int(self.vocab_size * self.hidden * self.ctx.w_byte),
-            store_act=int(self.tokens * self.hidden * self.ctx.a_byte),
+            store_act=int(tokens * self.hidden * self.ctx.a_byte),
         )
-
-    def signature(self) -> OperatorSignature:
-        raise ValueError("embedding not in OperatorDB signature contract")

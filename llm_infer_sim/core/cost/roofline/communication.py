@@ -26,8 +26,8 @@ from __future__ import annotations
 import math
 from typing import Any, Literal, Optional
 
-from llm_infer_sim.core.profiles.communication import AllReduceParams
-from llm_infer_sim.core.profiles.hardware import HardwareConfig
+from llm_infer_sim.core.hardware.communication import AllReduceParams
+from llm_infer_sim.core.hardware.device import HardwareProfile
 
 
 CollectiveMode = Literal["eager", "cudagraph"]
@@ -66,7 +66,7 @@ DEFAULT_FRAMEWORK_CALL_OVERHEAD: dict[str, float] = {
 # ---------------------------------------------------------------------------
 
 def _framework_overhead(
-    hw: HardwareConfig, collective: str, mode: CollectiveMode
+    hw: HardwareProfile, collective: str, mode: CollectiveMode
 ) -> float:
     """Per-call framework overhead. cudagraph 模式下返 0 (跟计算 op 的 kernel_overhead 对称)."""
     if mode == "cudagraph":
@@ -75,7 +75,7 @@ def _framework_overhead(
     return table.get(collective, table.get("default", 0.0))
 
 
-def _optional_collective_floor(hw: HardwareConfig, collective: str) -> float:
+def _optional_collective_floor(hw: HardwareProfile, collective: str) -> float:
     """可选硬件级 floor (default None → 0). 用于 H100/B200/inter-node fallback."""
     if hw.optional_collective_floor is None:
         return 0.0
@@ -84,7 +84,7 @@ def _optional_collective_floor(hw: HardwareConfig, collective: str) -> float:
     )
 
 
-def _algo_bias(hw: HardwareConfig, collective: str, algo: str) -> float:
+def _algo_bias(hw: HardwareProfile, collective: str, algo: str) -> float:
     """算法 bias multiplier. 默认 1.0 (即 min(candidate) 自然选择最快)."""
     if hw.collective_algo_bias is None:
         return 1.0
@@ -92,7 +92,7 @@ def _algo_bias(hw: HardwareConfig, collective: str, algo: str) -> float:
 
 
 def _select_min_candidate(
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     collective: str,
     candidates: dict[str, float],
 ) -> tuple[str, float]:
@@ -108,7 +108,7 @@ def _select_min_candidate(
     return best_algo, best_time
 
 
-def _is_cross_node(n: int, hw: HardwareConfig) -> bool:
+def _is_cross_node(n: int, hw: HardwareProfile) -> bool:
     """是否跨节点 (n 大于单节点 GPU 数 且 inter_bw 已配)。"""
     return n > hw.intra_node_size and hw.effective_inter_bw > 0
 
@@ -171,7 +171,7 @@ def _p2p_single(data: float, alpha: float, beta: float) -> float:
 # 详 comm_plan §7.2.
 # ---------------------------------------------------------------------------
 
-def _nccl_allreduce_params(hw: HardwareConfig) -> AllReduceParams:
+def _nccl_allreduce_params(hw: HardwareProfile) -> AllReduceParams:
     """Return NCCL AllReduce params, falling back to module defaults.
 
     这里的 fallback 仍然是新版 NCCL 候选模型的默认参数, 不是旧 ring/tree 公式。
@@ -185,7 +185,7 @@ def _nccl_allreduce_params(hw: HardwareConfig) -> AllReduceParams:
 
 
 def _fabric_bw_no_protocol(
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     n: int,
     topology_hint: TopologyHint,
     visible_devices: Optional[list],
@@ -199,7 +199,7 @@ def _fabric_bw_no_protocol(
 
 
 def _allreduce_candidates_nccl(
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     n: int,
     message_bytes: float,
     *,
@@ -274,7 +274,7 @@ def _select_with_bias(
 def allreduce_time_with_breakdown(
     data_bytes: float,
     n: int,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -330,7 +330,7 @@ def allreduce_time_with_breakdown(
 def allreduce_time(
     data_bytes: float,
     n: int,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -351,7 +351,7 @@ def allreduce_time(
 def broadcast_time(
     data_bytes: float,
     n: int,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -379,7 +379,7 @@ def broadcast_time(
 def allgather_time(
     data_bytes: float,
     n: int,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -409,7 +409,7 @@ def allgather_time(
 def reducescatter_time(
     data_bytes: float,
     n: int,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -431,7 +431,7 @@ def reducescatter_time(
 
 
 def _alltoall_candidates_v2(
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     n: int,
     data_bytes: float,
     *,
@@ -459,7 +459,7 @@ def _alltoall_candidates_v2(
 def alltoall_time_with_breakdown(
     data_bytes: float,
     n: int,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -543,7 +543,7 @@ def alltoall_time_with_breakdown(
 def alltoall_time(
     data_bytes: float,
     n: int,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -562,7 +562,7 @@ def alltoall_time(
 
 def p2p_time(
     data_bytes: float,
-    hw: HardwareConfig,
+    hw: HardwareProfile,
     *,
     mode: CollectiveMode = "eager",
     topology_hint: TopologyHint = "concentrated",
@@ -591,7 +591,7 @@ def p2p_time(
 # ---------------------------------------------------------------------------
 
 def _hierarchical_allgather(
-    data_bytes: float, n: int, hw: HardwareConfig
+    data_bytes: float, n: int, hw: HardwareProfile
 ) -> float:
     """Hierarchical 2-level ring allgather."""
     n1 = hw.intra_node_size
@@ -606,7 +606,7 @@ def _hierarchical_allgather(
 
 
 def _hierarchical_alltoall(
-    data_bytes: float, n: int, hw: HardwareConfig
+    data_bytes: float, n: int, hw: HardwareProfile
 ) -> float:
     """Hierarchical 2-level alltoall (Phase 5 不动)."""
     n1 = hw.intra_node_size

@@ -7,8 +7,8 @@
     → VirtualTimeEmulator + MetricsCollector
     → ModelRunnerOutput (fake token)
 
-ProfileBundle (ModelConfig + DeployConfig + HardwareConfig + EfficiencyProfile)
-由 extract_profile_bundle 构造, core 完全框架无关 (V3 §1.1).
+SimulationScenario (model / deployment / hardware / runtime / calibration)
+由 extract_scenario 构造, core 完全框架无关 (V3 §1.1 / config_plan Step 3).
 """
 from __future__ import annotations
 
@@ -19,14 +19,12 @@ from typing import Any
 from vllm.config import VllmConfig
 from vllm.v1.outputs import ModelRunnerOutput
 
-from llm_infer_sim.adapters.vllm.profile_extractor import extract_profile_bundle
+from llm_infer_sim.adapters.vllm.profile_extractor import extract_scenario
+from llm_infer_sim.adapters.vllm.sim_overlay import load_sim_overlay
 from llm_infer_sim.adapters.vllm.step_extractor import VllmStepExtractor
 import dataclasses
 
-from llm_infer_sim.core.cost.engine import (
-    build_deepseek_roofline_engine,
-    build_qwen_roofline_engine,
-)
+from llm_infer_sim.core.cost.engine import build_roofline_engine_from_scenario
 from llm_infer_sim.core.cost.trace import StepCostTrace
 from llm_infer_sim.core.metrics.breakdown import format_step_breakdown
 from llm_infer_sim.core.metrics.collector import MetricsCollector
@@ -48,15 +46,19 @@ class VirtualModelRunner:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
 
-        # ---- 1. ProfileBundle (ModelConfig + DeployConfig + hw + efficiency) ----
-        self.bundle = extract_profile_bundle(vllm_config)
+        # ---- 1. SimulationScenario (model / deployment / hardware / runtime) ----
+        self.scenario = extract_scenario(vllm_config)
 
         # ---- 2. cost engine (V3 §4 StepCostEngine, 唯一路径) ----
         self.cost_engine = self._build_cost_engine()
-        _log(f"cost engine: {type(self.cost_engine.template).__name__}")
+        _log(f"cost engine: {type(self.cost_engine.model).__name__}")
+
+        # 可选 YAML overlay (runtime 段); env presence detection 保证 env 最高优先。
+        _overlay = load_sim_overlay().runtime
 
         # ---- 3. time emulator (realtime by default) ----
-        mode = os.environ.get("LLM_INFER_SIM_TIME_MODE", "realtime")
+        _env_mode = os.environ.get("LLM_INFER_SIM_TIME_MODE")
+        mode = _env_mode if _env_mode is not None else (_overlay.time_mode or "realtime")
         self.time_emulator = VirtualTimeEmulator(mode=mode)
 
         # ---- 4. request state cache (cached step 没 sampling_params) ----
@@ -67,7 +69,13 @@ class VirtualModelRunner:
 
         # ---- 5. op dump 控制 ----
         # LLM_INFER_SIM_DUMP_OPS: 0=不打 | 1=只打首个有效 step | 2=每个 step 都打
-        self._dump_ops_mode = int(os.environ.get("LLM_INFER_SIM_DUMP_OPS", "0"))
+        _env_dump_ops = os.environ.get("LLM_INFER_SIM_DUMP_OPS")
+        if _env_dump_ops is not None:
+            self._dump_ops_mode = int(_env_dump_ops)
+        elif _overlay.dump_ops is not None:
+            self._dump_ops_mode = int(_overlay.dump_ops)
+        else:
+            self._dump_ops_mode = 0
         self._ops_dumped = False
 
         # ---- 6. per-request 调度 dump 控制 ----
@@ -75,16 +83,20 @@ class VirtualModelRunner:
         # req_id/phase/num_tokens/ctx_len/generated_tokens
         # vLLM v1 scheduler 自己默认不打 step-level 调度决策, 我们在 step_extractor
         # 已经抓到了完整 per-request 信息, 这里负责打。
-        self._dump_requests_mode = int(
-            os.environ.get("LLM_INFER_SIM_DUMP_REQUESTS", "0")
-        )
+        _env_dump_req = os.environ.get("LLM_INFER_SIM_DUMP_REQUESTS")
+        if _env_dump_req is not None:
+            self._dump_requests_mode = int(_env_dump_req)
+        elif _overlay.dump_requests is not None:
+            self._dump_requests_mode = int(_overlay.dump_requests)
+        else:
+            self._dump_requests_mode = 0
 
         # ---- 7. fake token generator (详设 §4.3.5) ----
         # fixed (默认): 所有 token = 1, 兼容阶段 0/2 e2e。
         # deterministic_hash: token 由 (prompt_token_ids + num_generated) md5 决定,
         # 让重复 prompt 在 prefix caching ON 下命中 "prompt + 输出" 完整链。
         self.fake_token_gen = FakeTokenGenerator.from_env(
-            vocab_size=self.bundle.model.vocab_size
+            vocab_size=self.scenario.model.architecture.vocab_size
         )
 
         # ---- 8. KV block allocator (详设 §10.5 4.5 + §7.6) ----
@@ -93,9 +105,9 @@ class VirtualModelRunner:
         self._block_allocator: KVBlockAllocator | None = None
 
         # ---- 9. PD 分离 (详设 §7.6) ----
-        # V3 DeployConfig.pd 可能 None (standalone 构造时); profile_extractor 总是设置.
-        from llm_infer_sim.core.profiles.deploy import PDDisaggConfig
-        self._pd_cfg = self.bundle.deploy.pd or PDDisaggConfig()
+        # deployment.pd 可能 None (standalone 构造时); profile_extractor 总是设置.
+        from llm_infer_sim.core.deployment.pd_disagg import PDDisaggConfig
+        self._pd_cfg = self.scenario.deployment.pd or PDDisaggConfig()
         self._pd_total_transfer_time: float = 0.0   # 累计 (供 aggregate 报告)
         self._pd_total_transfer_bytes: int = 0
         self._pd_num_transfers: int = 0
@@ -104,8 +116,8 @@ class VirtualModelRunner:
         self._pd_handled_reqs: set[str] = set()
 
         _log(
-            f"init model={self.bundle.model.name} {self._model_summary()} "
-            f"hw={self.bundle.hw.name if hasattr(self.bundle.hw, 'name') else '?'} "
+            f"init model={self.scenario.model.name} {self._model_summary()} "
+            f"hw={self.scenario.hardware.name} "
             f"time_mode={mode} dump_ops={self._dump_ops_mode} "
             f"dump_requests={self._dump_requests_mode} "
             f"fake_token_mode={self.fake_token_gen.mode}"
@@ -141,7 +153,7 @@ class VirtualModelRunner:
         # ---- vLLM framework overhead on prefill steps (HTTP/scheduler/tokenize) ----
         # Roofline doesn't capture per-request CPU overhead in the vLLM stack.
         # Apply only when this step contains prefill work.
-        prefill_oh = self.bundle.deploy.prefill_worker_overhead_s
+        prefill_oh = self.scenario.runtime.execution.prefill_worker_overhead_s
         if prefill_oh > 0 and workload.num_prefill_requests > 0:
             cost = dataclasses.replace(
                 cost,
@@ -362,9 +374,9 @@ class VirtualModelRunner:
             block_size = getattr(cc, "block_size", 16) or 16
             if num_blocks <= 0:
                 return None
-            kv_byte = self.bundle.efficiency.kv_byte
+            kv_byte = self.scenario.model.quantization.kv_byte
             self._block_allocator = KVBlockAllocator(
-                model=self.bundle.model,
+                model=self.scenario.model,
                 block_size=block_size,
                 num_blocks_total=num_blocks,
                 kv_byte=kv_byte,
@@ -383,14 +395,8 @@ class VirtualModelRunner:
         return self.cost_engine.estimate(workload)
 
     def _build_cost_engine(self):
-        """选 Qwen / DeepSeek template 装配 StepCostEngine (#156: 单 grouped 路径)."""
-        m = self.bundle.model
-        deploy = self.bundle.deploy
-        hw = self.bundle.hw
-        # DeepSeek family: 有 MLA (kv_lora_rank > 0). V4 已在 #157 删除.
-        if m.kv_lora_rank > 0:
-            return build_deepseek_roofline_engine(m, deploy, hw)
-        return build_qwen_roofline_engine(m, deploy, hw)
+        """装配 StepCostEngine; arch dispatch (Qwen3 / DeepSeek MLA) 在 registry 内."""
+        return build_roofline_engine_from_scenario(self.scenario)
 
     def _maybe_dump_requests(self, workload: GlobalStepWorkload) -> None:
         """每 step per-request 调度细节: req_id / phase / num_tokens / ctx_len / generated."""
@@ -448,7 +454,7 @@ class VirtualModelRunner:
         self._ops_dumped = True
 
     def _model_summary(self) -> str:
-        m = self.bundle.model
+        m = self.scenario.model
         head = (
             f"L={m.num_layers} H={m.hidden_dim} "
             f"n_h={m.num_heads} n_kv={m.num_kv_heads} "

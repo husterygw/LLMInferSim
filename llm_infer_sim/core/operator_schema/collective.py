@@ -79,7 +79,7 @@ def collective_case_params_to_signature(
     )
 
 
-def collective_virtual_op_to_signature(op: Any) -> OperatorSignature:
+def collective_operator_to_signature(op: Any) -> OperatorSignature:
     """runtime operator descriptor → OperatorSignature."""
     if op.op_kind != "collective":
         raise ValueError(f"expected op_kind=collective, got {op.op_kind!r}")

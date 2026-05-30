@@ -9,6 +9,7 @@ description = "LLM inference performance simulator (Phase 1 spike)"
 requires-python = ">=3.10"
 dependencies = [
     "vllm==0.20.1",
+    "pyyaml",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -20,3 +21,14 @@ include = ["llm_infer_sim*", "collector*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "collector/tests"]
+markers = [
+  "unit: pure CPU unit tests",
+  "contract: API/schema/signature compatibility tests",
+  "integration: multi-module CPU integration tests",
+  "tools: script and CLI behavior tests",
+  "e2e: starts real runtime or exercises documented examples (opt-in: RUN_E2E=1)",
+  "gpu: requires CUDA/GPU (auto-skipped when CUDA unavailable)",
+  "realdata: requires local collector data assets (opt-in: RUN_REALDATA=1)",
+  "slow: expected to take more than a few seconds",
+  "nightly: not suitable for PR gate (opt-in: RUN_NIGHTLY=1)",
+]

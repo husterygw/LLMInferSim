@@ -1,59 +1,51 @@
-"""DeepSeekModelTemplate — #158 Step 4 ctx-based, qwen.py 同款直接构造.
+"""DeepSeekModel — #158 Step 4 ctx-based, qwen.py 同款直接构造.
 
-阶段 3b 范围:
+范围:
     DeepSeek V3 dense MLA layer (q_lora + kv_lora)
     DeepSeek V3 MoE FFN (跟 Qwen3-30B-A3B 同 op class)
 
-阶段 3c V3.2:
-    V3.2 sparse attention (lightning indexer) — 所有 layer attention 同结构, grouped 可用
-
-V4 (sparse + HC + hash MoE): 已从此 template 删除 (#157).
+V3.2 (sparse / lightning indexer) 与 V4 (sparse + HC + hash MoE) 均不支持 (已删除)。
 
 #158 Step 4: 所有 dense ops 直接构造 (Embedding / Norm / ElementWise / GEMM /
 Attention / FusedMoE / Collective), 不走 factory.
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
-from llm_infer_sim.core.graph.grouped_plan import GroupedOperator, GroupedStepPlan
+from llm_infer_sim.core.graph.runtime import StepRuntime
+from llm_infer_sim.core.graph.step_plan import StepOpPlan
 from llm_infer_sim.core.graph.step_shape import StepShape
 from llm_infer_sim.core.models.layer_partition import partition_ffn_layers
 from llm_infer_sim.core.operators.context import OperatorContext
 from llm_infer_sim.core.operators import (
     AllReduce,
-    Attention,
     ElementWise,
     Embedding,
     GEMM,
+    MLAAttention,
     MoE,
     MoEDispatch,
     MoERoutingProfile,
     Norm,
-    RooflineOperator,
 )
 from llm_infer_sim.core.operators.base import Operator
-from llm_infer_sim.core.profiles.model_config import ModelConfig
+from llm_infer_sim.core.models.registry import register_model
+from llm_infer_sim.core.models.config import ModelProfile
 
 
-def _ctx_len_from_step(step: StepShape) -> int:
-    """Pick ctx_len for MLA / V3.2 indexer kernel (sees full attention context)."""
-    if step.phase == "decode":
-        return step.avg_decode_context_len
-    return step.max_context_len if step.max_context_len > 0 else step.max_prefill_seqlen
-
-
-def _mla_qk_head_dim(model: ModelConfig) -> int:
+def _mla_qk_head_dim(model: ModelProfile) -> int:
     qk_nope = model.qk_nope_head_dim if model.qk_nope_head_dim > 0 else model.head_dim
     return qk_nope + (model.rope_head_dim or 0)
 
 
-def _mla_v_dim(model: ModelConfig) -> int:
+def _mla_v_dim(model: ModelProfile) -> int:
     qk_nope = model.qk_nope_head_dim if model.qk_nope_head_dim > 0 else model.head_dim
     return model.v_head_dim if model.v_head_dim > 0 else qk_nope
 
 
-def _mla_kv_latent_dim(model: ModelConfig) -> int:
+def _mla_kv_latent_dim(model: ModelProfile) -> int:
     if model.kv_latent_dim > 0:
         return model.kv_latent_dim
     return model.kv_lora_rank + (model.rope_head_dim or 0)
@@ -68,17 +60,15 @@ def _comm_bytes_hidden(tokens: int, ctx: OperatorContext) -> int:
 
 
 @dataclass(frozen=True)
-class DeepSeekModelTemplate:
-    model: ModelConfig
-    ctx: OperatorContext | None = None
-    routing: MoERoutingProfile | None = None
-    indexer_kv_byte: float = 1.0
+class DeepSeekModel:
+    model: ModelProfile
+    ctx: OperatorContext | None = None  # routing 随 ctx 传入 (ctx.routing)
 
-    def build_grouped_step(self, step: StepShape) -> GroupedStepPlan:
-        """V3 dense MLA / V3.2 sparse grouped path."""
+    def _build_ops(self, step: StepShape):
+        """(op, count, layer_indices) for the step, consumed by forward()."""
         if self.ctx is None:
             raise ValueError(
-                "DeepSeekModelTemplate.ctx is required (engine builder should pass it)"
+                "DeepSeekModel.ctx is required (engine builder should pass it)"
             )
         ctx = self.ctx
         m = self.model
@@ -87,67 +77,49 @@ class DeepSeekModelTemplate:
         layer_count = m.num_layers
         all_layer_indices = tuple(range(layer_count))
 
-        groups: list[GroupedOperator] = [
-            GroupedOperator(
-                op=Embedding(
-                    name="embedding",
-                    phase=phase, layer_idx=None,
-                    tokens=tokens,
-                    vocab_size=m.vocab_size,
-                    hidden=m.hidden_dim,
-                    ctx=ctx,
-                ),
-                count=1, layer_indices=(),
-            ),
-        ]
-
-        # MLA / sparse-MLA attention block: layer-uniform
+        out: list[tuple] = [(
+            Embedding(
+                name="embedding", phase=phase, layer_idx=None, tokens=tokens,
+                vocab_size=m.vocab_size, hidden=m.hidden_dim, ctx=ctx,
+            ), 1, (),
+        )]
         for op in self._build_mla_attn_block(0, step, ctx=ctx):
-            groups.append(GroupedOperator(
-                op=op, count=layer_count, layer_indices=all_layer_indices,
-            ))
-
-        # FFN partition (dense first_moe_layer 层, MoE 其余)
+            out.append((op, layer_count, all_layer_indices))
         for ffn_kind, layer_indices in partition_ffn_layers(m):
             rep = layer_indices[0]
-            if ffn_kind == "dense":
-                ffn_ops = self._build_dense_ffn_block(rep, step, ctx=ctx)
-            else:
-                ffn_ops = self._build_moe_ffn_block(rep, step, ctx=ctx)
+            ffn_ops = (self._build_dense_ffn_block(rep, step, ctx=ctx) if ffn_kind == "dense"
+                       else self._build_moe_ffn_block(rep, step, ctx=ctx))
             for op in ffn_ops:
-                groups.append(GroupedOperator(
-                    op=op,
-                    count=len(layer_indices),
-                    layer_indices=layer_indices,
-                ))
-
-        if phase == "prefill":
-            head_tokens = max(step.num_prefill_requests, 1)
-        else:
-            head_tokens = step.num_decode_requests
-        groups.append(GroupedOperator(
-            op=GEMM(
-                name="lm_head", op_subtype="lm_head",
-                phase=phase, layer_idx=None,
-                m=head_tokens,
-                n=m.vocab_size // ctx.tp_size,
-                k=m.hidden_dim,
-                kernel_source="vllm_row_parallel_linear",
-                ctx=ctx,
-            ),
-            count=1, layer_indices=(),
+                out.append((op, len(layer_indices), layer_indices))
+        head_tokens = (max(step.num_prefill_requests, 1) if phase == "prefill"
+                       else step.num_decode_requests)
+        out.append((
+            GEMM(
+                name="lm_head", op_subtype="lm_head", phase=phase, layer_idx=None,
+                m=head_tokens, n=m.vocab_size // ctx.tp_size, k=m.hidden_dim,
+                kernel_source="vllm_row_parallel_linear", ctx=ctx,
+            ), 1, (),
         ))
+        return out
 
-        return GroupedStepPlan(
-            step_id=step.step_id,
-            phase=phase,
-            groups=tuple(groups),
-            metadata={
-                "model": m.name,
-                "num_layers": layer_count,
-                "execution_mode": step.execution_mode,
-                "first_moe_layer": m.first_moe_layer,
-            },
+    def _metadata(self, step: StepShape) -> dict:
+        return {
+            "model": self.model.name,
+            "num_layers": self.model.num_layers,
+            "execution_mode": step.execution_mode,
+            "first_moe_layer": self.model.first_moe_layer,
+        }
+
+    def forward(self, step: StepShape) -> StepOpPlan:
+        """Static-contract engine entry (op_plan §7). 与 Qwen 同路径:
+        _build_ops → 带 count 的静态 op → StepOpPlan(runtime=...)。"""
+        ops = tuple(
+            dataclasses.replace(op, count=count)
+            for op, count, _li in self._build_ops(step)
+        )
+        return StepOpPlan(
+            step_id=step.step_id, phase=step.phase, ops=ops,
+            runtime=StepRuntime.from_step(step), metadata=self._metadata(step),
         )
 
     # ---- MLA attention block (direct construction) ----
@@ -222,14 +194,8 @@ class DeepSeekModelTemplate:
             ctx=ctx,
         ))
 
-        # V3.2 DSA: lightning indexer + sparse MLA attention.
-        # V3 (无 indexer): dense MLA attention.
-        if m.index_topk > 0:
-            ctx_len = _ctx_len_from_step(step)
-            ops.extend(self._build_v32_indexer_block(layer_idx, tokens, phase, ctx_len, ctx))
-            ops.append(self._build_mla_sparse_attention(layer_idx, step, ctx))
-        else:
-            ops.append(self._build_mla_attention(layer_idx, step, ctx))
+        # V3 dense MLA attention (V3.2 sparse indexer 不支持)。
+        ops.append(self._build_mla_attention(layer_idx, step, ctx))
 
         # O projection: heads_per_tp × v_head_dim → hidden (Row Parallel)
         ops.append(GEMM(
@@ -260,7 +226,7 @@ class DeepSeekModelTemplate:
         layer_idx: int,
         step: StepShape,
         ctx: OperatorContext,
-    ) -> Attention:
+    ) -> MLAAttention:
         m = self.model
         heads_per_tp = m.num_heads // ctx.tp_size
         qk_head_dim = _mla_qk_head_dim(m)
@@ -268,7 +234,7 @@ class DeepSeekModelTemplate:
         kv_latent_dim = _mla_kv_latent_dim(m)
 
         if step.phase == "decode":
-            return Attention.mla_decode(
+            return MLAAttention.mla_decode(
                 layer_idx=layer_idx,
                 ctx_len=step.avg_decode_context_len,
                 bs=step.num_decode_requests,
@@ -278,7 +244,7 @@ class DeepSeekModelTemplate:
                 ctx=ctx,
             )
         if step.phase == "prefill":
-            return Attention.mla_prefill(
+            return MLAAttention.mla_prefill(
                 layer_idx=layer_idx,
                 seqlen=step.max_prefill_seqlen,
                 bs=max(step.num_prefill_requests, 1),
@@ -291,159 +257,6 @@ class DeepSeekModelTemplate:
         raise NotImplementedError(
             f"mla_attention 只支持 prefill/decode, got {step.phase!r}"
         )
-
-    def _build_mla_sparse_attention(
-        self,
-        layer_idx: int,
-        step: StepShape,
-        ctx: OperatorContext,
-    ) -> Attention:
-        m = self.model
-        heads_per_tp = m.num_heads // ctx.tp_size
-        qk_head_dim = _mla_qk_head_dim(m)
-        v_dim = _mla_v_dim(m)
-        kv_latent_dim = _mla_kv_latent_dim(m)
-
-        if step.phase == "decode":
-            return Attention.mla_sparse_decode(
-                layer_idx=layer_idx,
-                ctx_len=step.avg_decode_context_len,
-                bs=step.num_decode_requests,
-                heads_per_tp=heads_per_tp,
-                kv_latent_dim=kv_latent_dim,
-                kv_lora_rank=m.kv_lora_rank,
-                index_topk=m.index_topk,
-                ctx=ctx,
-            )
-        if step.phase == "prefill":
-            return Attention.mla_sparse_prefill(
-                layer_idx=layer_idx,
-                seqlen=step.max_prefill_seqlen,
-                bs=max(step.num_prefill_requests, 1),
-                ctx_len=step.max_context_len,
-                heads_per_tp=heads_per_tp,
-                qk_head_dim=qk_head_dim, v_dim=v_dim,
-                kv_latent_dim=kv_latent_dim,
-                index_topk=m.index_topk,
-                ctx=ctx,
-            )
-        raise NotImplementedError(
-            f"mla_sparse_attention 只支持 prefill/decode, got {step.phase!r}"
-        )
-
-    # ---- V3.2 lightning indexer 5-op block ----
-
-    def _build_v32_indexer_block(
-        self,
-        layer_idx: int,
-        tokens: int,
-        phase: str,
-        ctx_len: int,
-        ctx: OperatorContext,
-    ) -> list[Operator]:
-        """V3.2 indexer: indexer_wq_b → indexer_wk_weights_proj → indexer_k_norm
-        → indexer_q_fp8_quant → sparse_attn_indexer.
-
-        indexer_k_norm + indexer_q_fp8_quant 用 RooflineOperator (legacy) 因为 Norm/
-        ElementWise 的 hidden = head_dim (非 model.hidden_dim) 且 q_fp8_quant 的
-        IO 不在 ElementWise standard formula 里; 留 legacy 直到 ElementWise 公式
-        支持 quantize subtype.
-        """
-        from llm_infer_sim.core.operators.base import RooflineSpec
-
-        # 内联 dense_parallel / make_runtime (factories/common.py 已删, #158 Step 5)
-        def _dense_parallel(deploy):
-            return {"tp": deploy.tp_size}
-
-        def _make_runtime(deploy, *, kernel_source="vllm_default"):
-            return {
-                "framework": deploy.backend,
-                "framework_version": deploy.backend_version or "unknown",
-                "execution_mode": deploy.execution_mode,
-                "kernel_source": kernel_source,
-            }
-
-        m = self.model
-        h = m.hidden_dim
-        n_head = m.index_n_heads
-        head_dim = m.index_head_dim
-        op_prec_idx = "fp8" if ctx.w_byte <= 1.0 else "fp16"
-        a_byte = ctx.a_byte
-        prefix = f"layer{layer_idx}"
-
-        ops: list[Operator] = []
-
-        # indexer_wq_b: q_lora_rank → n_head × head_dim (ReplicatedLinear, no /tp)
-        ops.append(GEMM(
-            name=f"{prefix}_indexer_wq_b", op_subtype="indexer_wq_b",
-            phase=phase, layer_idx=layer_idx,
-            m=tokens, n=n_head * head_dim, k=m.q_lora_rank,
-            kernel_source="vllm_replicated_linear",
-            op_precision_override=op_prec_idx,
-            ctx=ctx,
-        ))
-
-        # indexer_wk_weights_proj: hidden → (head_dim + n_head), bf16 unquant
-        fused_oc = head_dim + n_head
-        ops.append(GEMM(
-            name=f"{prefix}_indexer_wk_weights_proj", op_subtype="indexer_wk_weights_proj",
-            phase=phase, layer_idx=layer_idx,
-            m=tokens, n=fused_oc, k=h,
-            kernel_source="vllm_replicated_linear",
-            op_precision_override="bf16",
-            weight_bytes_per_elem=2.0,    # 强制 bf16 weight (unquant)
-            ctx=ctx,
-        ))
-
-        # indexer_k_norm: LayerNorm on head_dim (hidden=head_dim, 不是 model.hidden_dim)
-        ops.append(Norm(
-            name=f"{prefix}_indexer_k_norm", op_subtype="rmsnorm",
-            phase=phase, layer_idx=layer_idx,
-            tokens=tokens, hidden=head_dim, ctx=ctx,
-        ))
-
-        # indexer_q_fp8_quant: per-token group fp8 quant on Q. 用 RooflineOperator
-        # legacy (ElementWise standard subtype 没 "quantize", IO 不规则).
-        q_size = tokens * n_head * head_dim
-        ops.append(RooflineOperator(
-            name=f"{prefix}_indexer_q_fp8_quant",
-            op_kind="elementwise", op_subtype="quantize",
-            phase=phase, layer_idx=layer_idx, dtype="bf16",
-            shape_fields={"tokens": tokens, "n_head": n_head, "head_dim": head_dim},
-            parallel_fields=_dense_parallel(ctx.deploy),
-            runtime_fields=_make_runtime(ctx.deploy),
-            roofline_spec_value=RooflineSpec(
-                op_category="activation",
-                flops=q_size * 5,
-                load_act=int(q_size * a_byte),
-                store_act=int(q_size * 1.0 + q_size // 128 * 4),
-            ),
-        ))
-
-        # sparse_attn_indexer: Q×K_cache → top-k. Attention-kind 但有非标 shape (ctx_len/n_head).
-        # 用 RooflineOperator legacy (Attention class shape 是 num_tokens/num_seqs/q_len/kv_len 定型).
-        scale_bytes_per_pos = 4 * (head_dim // 128)
-        ops.append(RooflineOperator(
-            name=f"{prefix}_sparse_attn_indexer",
-            op_kind="attention", op_subtype="sparse_index",
-            phase=phase, layer_idx=layer_idx, dtype="bf16",
-            tags=("v32_indexer",),
-            shape_fields={
-                "tokens": tokens, "ctx_len": ctx_len,
-                "n_head": n_head, "head_dim": head_dim,
-                "index_topk": m.index_topk,
-            },
-            parallel_fields=_dense_parallel(ctx.deploy),
-            runtime_fields=_make_runtime(ctx.deploy, kernel_source="vllm_sparse_attn_indexer"),
-            roofline_spec_value=RooflineSpec(
-                op_category="attention",
-                flops=tokens * ctx_len * head_dim * n_head * 2,
-                load_act=int(tokens * n_head * head_dim * 1.0),
-                load_kv_cache=int(ctx_len * (head_dim * self.indexer_kv_byte + scale_bytes_per_pos)),
-                store_act=int(tokens * m.index_topk * 4),
-            ),
-        ))
-        return ops
 
     # ---- dense FFN block ----
 
@@ -514,15 +327,9 @@ class DeepSeekModelTemplate:
         phase = step.phase
         m = self.model
         tp = ctx.tp_size
-        ep = ctx.ep_size
-        routing = self.routing or MoERoutingProfile.balanced()
-        # vLLM 默认 MoE EP path: 单 AllReduce 聚合 partial sums, 不走 AllToAll.
-        # 详 qwen.py:_build_moe_ffn_block 的 backend path 注释.
-        ar_world_size = max(tp, ep)
-        comm_bytes_tp = _comm_bytes_hidden(tokens, ctx)
-        post_comm_peer = (
-            "routed_expert_allreduce" if ar_world_size > 1 else None
-        )
+        routing = ctx.routing or MoERoutingProfile.balanced()
+        # vLLM 默认 MoE 路径: 本地 fused_experts + 单次 allreduce 聚合 partial sums
+        # (不走 AllToAll). 通信由 post-dispatch op 承载 (AIC 对齐: MoEDispatch=通信).
 
         ops: list[Operator] = [
             Norm(
@@ -544,31 +351,32 @@ class DeepSeekModelTemplate:
                 phase=phase, layer_idx=layer_idx,
                 tokens=tokens, intermediate=m.num_experts, ctx=ctx,
             ),
-            # moe_plan §3.3 op#4: local pre-dispatch (vLLM fused_moe 内部 kernel)
-            MoEDispatch.local(
-                pre_dispatch=True, layer_idx=layer_idx, tokens=tokens,
-                ctx=ctx, phase=phase, communication_peer=None,
+            # moe_plan §3.3 op#4: local pre-dispatch (vLLM fused_moe 内部 permute/align)
+            MoEDispatch(
+                name="moe_dispatch_pre", pre_dispatch=True,
+                phase=phase, layer_idx=layer_idx, num_tokens=tokens,
+                hidden=m.hidden_dim, topk=m.num_activated_experts,
+                num_experts=m.num_experts, ctx=ctx,
             ),
-            # moe_plan §3.3 op#6: routed experts (MoE, backend-neutral)
-            #   weight 已按 ep + tp 切, expert_map 处理 non-local experts → partial sum
-            MoE.routed_experts(
-                layer_idx=layer_idx, tokens=tokens, ctx=ctx, routing=routing, phase=phase,
+            # moe_plan §3.3 op#6: routed experts (weight 已按 ep+tp 切, expert_map → partial sum)
+            MoE(
+                name="routed_experts", op_subtype="routed_experts",
+                phase=phase, layer_idx=layer_idx, num_tokens=tokens,
+                hidden=m.hidden_dim, moe_intermediate=m.expert_dim,
+                topk=m.num_activated_experts, num_experts=m.num_experts,
+                routing_distribution=routing.distribution,
+                power_law_alpha=routing.power_law_alpha,
+                skew=routing.get_skew_for_layer(layer_idx), ctx=ctx,
             ),
-            # moe_plan §3.3 op#8: local post-dispatch (output gather/unpack)
-            MoEDispatch.local(
-                pre_dispatch=False, layer_idx=layer_idx, tokens=tokens,
-                ctx=ctx, phase=phase, communication_peer=post_comm_peer,
+            # moe_plan §3.3 op#8: post-dispatch 承载跨卡通信 (forward 按 tp/ep 解析为
+            #   allreduce(world=max(tp,ep)) 或本地); 不再有独立 routed_expert_allreduce.
+            MoEDispatch(
+                name="moe_dispatch_post", pre_dispatch=False,
+                phase=phase, layer_idx=layer_idx, num_tokens=tokens,
+                hidden=m.hidden_dim, topk=m.num_activated_experts,
+                num_experts=m.num_experts, ctx=ctx,
             ),
         ]
-
-        # vLLM 默认 path 单 AllReduce 聚合 partial sums.
-        if ar_world_size > 1:
-            ops.append(AllReduce(
-                name="routed_expert_allreduce",
-                message_bytes=comm_bytes_tp,
-                phase=phase, layer_idx=layer_idx,
-                world_size=ar_world_size, ctx=ctx,
-            ))
 
         if m.num_shared_experts > 0:
             shared_per_tp = _shared_dim_per_tp(ctx)
@@ -596,7 +404,7 @@ class DeepSeekModelTemplate:
             if tp > 1:
                 ops.append(AllReduce(
                     name="shared_expert_allreduce",
-                    message_bytes=comm_bytes_tp,
+                    message_bytes=_comm_bytes_hidden(tokens, ctx),
                     phase=phase, layer_idx=layer_idx, world_size=tp, ctx=ctx,
                 ))
 
@@ -606,3 +414,8 @@ class DeepSeekModelTemplate:
             tokens=tokens, hidden=m.hidden_dim, ctx=ctx,
         ))
         return ops
+
+
+@register_model("DeepseekV3ForCausalLM")
+def _build_deepseek_graph(model, ctx, **_):
+    return DeepSeekModel(model=model, ctx=ctx)

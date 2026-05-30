@@ -5,21 +5,22 @@ Each op class in its own module:
   - norm.py        Norm
   - elementwise.py ElementWise
   - embedding.py   Embedding
-  - attention.py   Attention
-  - collective.py  Collective + AllReduce/AllGather/ReduceScatter/AllToAll/P2P + make_collective() (deprecated)
-  - moe.py         FusedMoE
-  - base.py        Operator protocol + RooflineSpec + legacy RooflineOperator / KVTransfer
-  - context.py     OperatorContext + ModelBuildContext
+  - attention.py   Attention (flash/GQA)
+  - mla.py         MLAAttention (DeepSeek V3 dense MLA)
+  - collective.py  Collective + AllReduce/AllGather/ReduceScatter/AllToAll/P2P
+  - moe.py         MoE + MoEDispatch + MoERoutingProfile + build_routed_experts / build_moe_dispatch
+  - base.py        Operator protocol + OperatorBase 基类 + RooflineSpec
+  - context.py     OperatorContext
 
 每个 op class 的 roofline_spec 公式都内联在该 op 文件 (Attention named constructors,
-FusedMoE.routed_experts 等). 不再有独立 formulas/ helper module.
+moe build_routed_experts 等). 不再有独立 formulas/ helper module.
 """
 
 from llm_infer_sim.core.operators.attention import Attention
+from llm_infer_sim.core.operators.mla import MLAAttention
 from llm_infer_sim.core.operators.base import (
-    RooflineOperator,
-    KVTransfer,
     Operator,
+    OperatorBase,
     RooflineSpec,
 )
 from llm_infer_sim.core.operators.collective import (
@@ -29,22 +30,21 @@ from llm_infer_sim.core.operators.collective import (
     Collective,
     P2P,
     ReduceScatter,
-    make_collective,
 )
 from llm_infer_sim.core.operators.context import (
-    ModelBuildContext,
     OperatorContext,
-    build_model_build_context,
     build_operator_context,
+    build_operator_context_from_scenario,
 )
 from llm_infer_sim.core.operators.elementwise import ElementWise
 from llm_infer_sim.core.operators.embedding import Embedding
 from llm_infer_sim.core.operators.gemm import GEMM
 from llm_infer_sim.core.operators.moe import (
-    FusedMoE,
     MoE,
     MoEDispatch,
     MoERoutingProfile,
+    build_moe_dispatch,
+    build_routed_experts,
     estimate_distinct_experts,
 )
 from llm_infer_sim.core.operators.norm import Norm
@@ -54,25 +54,24 @@ __all__ = [
     "AllReduce",
     "AllToAll",
     "Attention",
+    "MLAAttention",
     "Collective",
     "ElementWise",
     "P2P",
     "ReduceScatter",
     "Embedding",
-    "RooflineOperator",
-    "FusedMoE",
     "GEMM",
-    "KVTransfer",
     "MoE",
     "MoEDispatch",
-    "ModelBuildContext",
     "MoERoutingProfile",
     "Norm",
+    "build_moe_dispatch",
+    "build_routed_experts",
     "estimate_distinct_experts",
     "Operator",
+    "OperatorBase",
     "OperatorContext",
     "RooflineSpec",
-    "build_model_build_context",
     "build_operator_context",
-    "make_collective",
+    "build_operator_context_from_scenario",
 ]

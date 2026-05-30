@@ -11,12 +11,19 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from llm_infer_sim.core.calibration.profile import CalibrationProfile
 from llm_infer_sim.core.cost.roofline import communication as comm
 from llm_infer_sim.core.cost.roofline_analyzer import RooflineAnalyzer
 from llm_infer_sim.core.cost.trace import CostTraceEntry, format_display_name
 from llm_infer_sim.core.operators.base import RooflineSpec
-from llm_infer_sim.core.profiles.deploy import DeployConfig
-from llm_infer_sim.core.profiles.hardware import HardwareConfig
+from llm_infer_sim.core.hardware.device import HardwareProfile
+
+# collective comm_type 集合 (_dispatch_collective 支持的). moe_dispatch 解析为本地时
+# comm_type 不在此集合 (None/pre_dispatch) → 通信成本 0.
+_COLLECTIVE_TYPES = frozenset({
+    "allreduce", "allgather", "reducescatter", "reduce_scatter",
+    "alltoall", "broadcast", "p2p",
+})
 
 
 class RooflineBackend:
@@ -24,32 +31,38 @@ class RooflineBackend:
 
     def __init__(
         self,
-        hw: HardwareConfig,
-        deploy: DeployConfig,
+        hw: HardwareProfile,
+        execution_mode: str = "eager",
         *,
         w_bit: int = 16,
         a_bit: int = 16,
         kv_bit: int = 16,
-        efficiency_profile=None,
+        calibration: CalibrationProfile | None = None,
     ):
         self.hw = hw
-        self.deploy = deploy
+        self.execution_mode = execution_mode
+        self.calibration = calibration or CalibrationProfile()
         self.analyzer = RooflineAnalyzer(
             hw,
             w_bit=w_bit,
             a_bit=a_bit,
             kv_bit=kv_bit,
-            efficiency_profile=efficiency_profile,
-            execution_mode=deploy.execution_mode,
+            execution_mode=execution_mode,
+            calibration=self.calibration,
         )
 
-    def estimate(self, op: Any) -> CostTraceEntry:
-        if op.op_kind == "collective":
-            return self._estimate_collective(op)
-        return self._estimate_compute(op)
+    def estimate(self, op: Any, op_runtime: Any = None) -> CostTraceEntry:
+        # op_runtime (OpRuntime | None): None = legacy (op carries dynamic params
+        # from construction). A non-None op_runtime (from op.forward(step)) is
+        # consumed by ops migrated to the static contract (Phase 2: GEMM).
+        # collective still reads op properties (migrates in a later phase).
+        # moe_dispatch 现承载 dispatch 通信 (AIC 对齐: MoEDispatch=通信), 走 collective 路径.
+        if op.op_kind in ("collective", "moe_dispatch"):
+            return self._estimate_collective(op, op_runtime)
+        return self._estimate_compute(op, op_runtime)
 
-    def _estimate_compute(self, op: Any) -> CostTraceEntry:
-        spec = self._roofline_spec(op)
+    def _estimate_compute(self, op: Any, op_runtime: Any = None) -> CostTraceEntry:
+        spec = self._roofline_spec(op, op_runtime)
         result = self.analyzer.analyze(op.name, spec)
         metadata: dict[str, Any] = {
             "bottleneck": result.bottleneck,
@@ -62,28 +75,20 @@ class RooflineBackend:
             "mem_bytes": result.mem_bytes,
             "flops": result.flops,
         }
-        # moe_plan Phase 4: 如果 op 提供 formula_breakdown() (MoE 主要用),
-        # 把 breakdown 字段透传到 CostTraceEntry.metadata (distinct_experts /
-        # expert_flops / expert_weight_read / routing_skew 等).
-        breakdown_fn = getattr(op, "formula_breakdown", None)
-        if callable(breakdown_fn):
-            try:
-                bd = breakdown_fn()
-            except Exception:
-                bd = None
-            if bd:
-                metadata.update(bd)
-
         # moe_plan §5.A: MoE calibration 后处理. 3 类 op 各按 knob 修 latency:
         #   moe_topk           latency += topk_overhead_us
         #   moe_dispatch       latency += local_dispatch_overhead_us
         #   moe (routed_*)     latency /= grouped_gemm_efficiency (<1 慢, >1 快)
-        latency_s = self._apply_moe_calibration(op, result.total_time, metadata)
+        latency_s = 0 #self._apply_moe_calibration(op, result.total_time, metadata)
 
+        # build-once: the resolved subtype (e.g. mixed_prefill/mixed_decode) lives
+        # on op_runtime; the static op carries only the placeholder (prefill/decode).
+        op_subtype = (op_runtime.op_subtype if op_runtime is not None and op_runtime.op_subtype
+                      else op.op_subtype)
         return CostTraceEntry(
             op_name=op.name,
             op_kind=op.op_kind,
-            op_subtype=op.op_subtype,
+            op_subtype=op_subtype,
             latency_s=latency_s,
             source="roofline",
             match_type="fallback",
@@ -100,11 +105,11 @@ class RooflineBackend:
         """moe_plan §5.A: apply MoE calibration knobs + write metadata.
 
         每个 knob 必须只影响对应 latency term (plan §5.A 验收 step 4).
-        无 calibration (hw.moe_efficiency is None) 时 latency_s = roofline_latency_s
+        无 calibration (calibration.moe_efficiency is None) 时 latency_s = roofline_latency_s
         且不写 t_topk / t_dispatch_local / t_expert_compute / grouped_gemm_efficiency
         / moe_profile_id 等字段.
         """
-        prof = getattr(self.hw, "moe_efficiency", None)
+        prof = self.calibration.moe_efficiency
         if prof is None:
             return roofline_latency_s
 
@@ -138,7 +143,7 @@ class RooflineBackend:
             metadata["moe_profile_id"] = prof.profile_id
         return latency
 
-    def _estimate_collective(self, op: Any) -> CostTraceEntry:
+    def _estimate_collective(self, op: Any, op_runtime: Any = None) -> CostTraceEntry:
         """Collective op latency: 调 core/cost/roofline/communication.py 公式.
 
         Step 3 接管自旧 CommunicationRooflineBackend.
@@ -149,28 +154,41 @@ class RooflineBackend:
             pairwise 候选 (with contention_factor), breakdown 写
             metadata.alltoall_candidates / selected_algorithm.
         """
-        comm_type = str(op.op_subtype)
-        message_bytes = int(getattr(op, "message_bytes", 0))
-        if message_bytes <= 0:
-            message_bytes = int(op.shape.get("message_bytes", 0))
-        world_size = int(getattr(op, "world_size", 1))
-        if world_size <= 1:
-            world_size = int(op.parallel.get("world_size", 1))
-
-        runtime = op.runtime
-        execution_mode = str(runtime.get("execution_mode", self.deploy.execution_mode))
+        if op_runtime is not None:
+            # migrated static collective: read shape/parallel/runtime from the
+            # step-resolved OpRuntime (legacy reads them off the op directly).
+            comm_type = str(op_runtime.op_subtype or op.op_subtype)
+            message_bytes = int(op_runtime.shape.get("message_bytes", 0))
+            world_size = int(op_runtime.parallel.get("world_size", 1))
+            runtime = op_runtime.runtime
+        else:
+            comm_type = str(op.op_subtype)
+            message_bytes = int(getattr(op, "message_bytes", 0))
+            if message_bytes <= 0:
+                message_bytes = int(op.shape.get("message_bytes", 0))
+            world_size = int(getattr(op, "world_size", 1))
+            if world_size <= 1:
+                world_size = int(op.parallel.get("world_size", 1))
+            runtime = op.runtime
+        execution_mode = str(runtime.get("execution_mode", self.execution_mode))
         topology_hint = self._topology_hint(runtime)
         algo_hint = str(runtime.get("algo", "auto") or "auto")
         protocol_hint = runtime.get("protocol_hint")
-        latency_s, breakdown = self._dispatch_collective(
-            comm_type=comm_type,
-            message_bytes=message_bytes,
-            world_size=world_size,
-            execution_mode=execution_mode,
-            topology_hint=topology_hint,
-            algo=algo_hint,
-            protocol_hint=protocol_hint,
-        )
+        # MoEDispatch 解析为本地 (无跨卡通信) 时 comm_type=None/pre_dispatch、bytes=0
+        # 或 world<=1 → 通信成本 0 (跳过 _dispatch_collective, 避免对非 collective
+        # comm_type 报 NotImplementedError); local_dispatch_overhead 由下面 calibration 加.
+        if comm_type in _COLLECTIVE_TYPES and message_bytes > 0 and world_size > 1:
+            latency_s, breakdown = self._dispatch_collective(
+                comm_type=comm_type,
+                message_bytes=message_bytes,
+                world_size=world_size,
+                execution_mode=execution_mode,
+                topology_hint=topology_hint,
+                algo=algo_hint,
+                protocol_hint=protocol_hint,
+            )
+        else:
+            latency_s, breakdown = 0.0, {}
 
         metadata: dict[str, Any] = {
             "bottleneck": "communication",
@@ -195,6 +213,11 @@ class RooflineBackend:
             if cands:
                 metadata[f"{comm_type}_candidates"] = dict(cands)
 
+        # MoE calibration: moe_dispatch op 在 comm 之上叠加 local_dispatch_overhead_us
+        # (本地 permute/align). 真 collective (op_kind=collective) 无匹配分支 → 不变.
+        comm_latency_s = latency_s
+        latency_s = 0 #self._apply_moe_calibration(op, latency_s, metadata)
+
         return CostTraceEntry(
             op_name=op.name,
             op_kind=op.op_kind,
@@ -204,7 +227,7 @@ class RooflineBackend:
             match_type="fallback",
             layer_idx=getattr(op, "layer_idx", None),
             display_name=format_display_name(op.name, getattr(op, "layer_idx", None)),
-            roofline_s=latency_s,
+            roofline_s=comm_latency_s,
             roofline_gap=None,
             metadata=metadata,
         )
@@ -255,9 +278,14 @@ class RooflineBackend:
         return os.environ.get("LLM_INFER_SIM_NUMA_HINT", "concentrated")
 
     @staticmethod
-    def _roofline_spec(op: Any) -> RooflineSpec:
+    def _roofline_spec(op: Any, op_runtime: Any = None) -> RooflineSpec:
         spec_attr = getattr(op, "roofline_spec")
-        spec = spec_attr() if callable(spec_attr) else spec_attr
+        if callable(spec_attr):
+            # migrated ops accept op_runtime; pass it only when present so legacy
+            # no-arg roofline_spec() signatures are unaffected.
+            spec = spec_attr(op_runtime) if op_runtime is not None else spec_attr()
+        else:
+            spec = spec_attr
         if isinstance(spec, RooflineSpec):
             return spec
 

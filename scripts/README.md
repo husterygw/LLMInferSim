@@ -1,5 +1,19 @@
 # scripts/
 
+可执行工具目录,按用途分子目录:
+
+```text
+bench/    bench_cases.py / bench_compare.sh / run_bench_*.sh / run_stage_bench.sh / analyze_bench.py
+report/   report_*_gap.py / analyze_collectives.py / analyze_sim_step_latency.py / analyze_stage.py / analyze_vllm_worker_profile.py
+measure/  measure_*.py/.sh + run_collective_sweep.sh(标定实测)
+profile/  profile_moe_fused_measured.py / profile_virtual_runner.py / profile_vllm_runtime_overhead.py
+debug/    debug_qwen3_30b_offline.py / explain_op_db_miss.py / step0_ar_param_sweep.py
+lib/      _extract_metrics.py / _meas_common.py(共享 helper,被上面脚本 import)
+```
+
+工具**行为的断言**放在 `tests/tools/`(`tools` marker),不放在本目录,避免测试逻辑
+污染工具。这些工具默认不进 PR gate;测试分层与默认 gate 命令见 `tests/README.md`。
+
 ## Case-Driven Benchmarks
 
 `bench_cases.py` is the single source of truth for benchmark matrices. It
@@ -9,14 +23,14 @@ vLLM and LLMInferSim virtual backend.
 ### Common Commands
 
 ```bash
-bash scripts/run_bench_suite.sh single_tp1_roofline
-bash scripts/run_bench_suite.sh batch_tp1_sweep
-bash scripts/run_bench_suite.sh tp_comm_sweep
-bash scripts/run_bench_suite.sh tp_batch_sweep
-bash scripts/run_bench_suite.sh long_context_sweep
-bash scripts/run_bench_suite.sh moe_tp_sweep
-bash scripts/run_bench_suite.sh moe_ep_sweep
-bash scripts/run_bench_suite.sh multi_model_regression
+bash scripts/bench/run_bench_suite.sh single_tp1_roofline
+bash scripts/bench/run_bench_suite.sh batch_tp1_sweep
+bash scripts/bench/run_bench_suite.sh tp_comm_sweep
+bash scripts/bench/run_bench_suite.sh tp_batch_sweep
+bash scripts/bench/run_bench_suite.sh long_context_sweep
+bash scripts/bench/run_bench_suite.sh moe_tp_sweep
+bash scripts/bench/run_bench_suite.sh moe_ep_sweep
+bash scripts/bench/run_bench_suite.sh multi_model_regression
 ```
 
 Legacy aliases are still accepted:
@@ -32,16 +46,16 @@ E -> multi_model_regression
 ### Generate Cases
 
 ```bash
-python scripts/bench_cases.py --suite single_tp1_roofline --out /tmp/cases.jsonl
-python scripts/bench_cases.py --suite batch_tp1_sweep --out /tmp/cases.jsonl
-python scripts/bench_cases.py --list
+python scripts/bench/bench_cases.py --suite single_tp1_roofline --out /tmp/cases.jsonl
+python scripts/bench/bench_cases.py --suite batch_tp1_sweep --out /tmp/cases.jsonl
+python scripts/bench/bench_cases.py --list
 ```
 
 ### Execute Cases
 
 ```bash
-bash scripts/bench_compare.sh --cases /tmp/cases.jsonl --out /tmp/bench_out
-bash scripts/bench_compare.sh --cases /tmp/cases.jsonl --out /tmp/bench_out --dry-run
+bash scripts/bench/bench_compare.sh --cases /tmp/cases.jsonl --out /tmp/bench_out
+bash scripts/bench/bench_compare.sh --cases /tmp/cases.jsonl --out /tmp/bench_out --dry-run
 ```
 
 `bench_compare.sh` does not define scenarios, batch sizes, or ISL/OSL matrices.
@@ -73,6 +87,6 @@ and only passes `--max-model-len` / `--max-num-seqs` when the case sets them.
 ### Analyze
 
 ```bash
-python scripts/analyze_bench.py /tmp/llm_infer_sim_bench --suite single_tp1_roofline
-python scripts/analyze_bench.py /tmp/llm_infer_sim_bench --csv /tmp/bench.csv
+python scripts/bench/analyze_bench.py /tmp/llm_infer_sim_bench --suite single_tp1_roofline
+python scripts/bench/analyze_bench.py /tmp/llm_infer_sim_bench --csv /tmp/bench.csv
 ```

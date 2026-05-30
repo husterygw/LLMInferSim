@@ -1,7 +1,18 @@
 # Examples
 
 启动真实 vLLM 进程跑某个具体模型, 用于 op dump / 阶段 spike 验证 / debug。
-**这些脚本不属于自动化测试**——`tests/` 只放 pure unit。
+**这些脚本不属于自动化测试**, 不被 `pytest` 收集。若某个 example 对 release 关键,
+应在 `tests/e2e/` 写一个薄 wrapper(`e2e` marker, opt-in `RUN_E2E=1`)而不是直接让
+pytest 收 examples。测试分层与默认 gate 命令见 `tests/README.md`。
+
+按用途分子目录:
+
+```text
+vllm_virtual/  run_platform_selected / run_opt125m / run_qwen3_4b / run_prefix_caching(VirtualPlatform 主验证)
+offline/       各模型/并行配置 offline 跑(run_deepseek_* / run_qwen3_*)
+serving/       bench_serve_*.sh
+pd_disagg/     run_pd_disagg_loopback.py/.sh(PD 分离)
+```
 
 ## 公共环境变量
 
@@ -30,7 +41,7 @@ export LLM_INFER_SIM_TIME_MODE=realtime   # realtime / instant — 是否真 sle
 
 ```bash
 VLLM_VIRTUAL_BACKEND=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-python examples/run_platform_selected.py
+python examples/vllm_virtual/run_platform_selected.py
 ```
 
 ### `run_opt125m.py`
@@ -44,7 +55,7 @@ python examples/run_platform_selected.py
 VLLM_VIRTUAL_BACKEND=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_USE_V1=1 \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 LLM_INFER_SIM_DUMP_OPS=1 \
-python examples/run_opt125m.py
+python examples/vllm_virtual/run_opt125m.py
 ```
 
 ### `run_qwen3_4b.py`
@@ -53,15 +64,15 @@ python examples/run_opt125m.py
 - llm-viewer dense_layer_time 输出 SwiGLU 三个 GEMM (gate / up / down)
 - GQA: q_proj 的 flops ≈ 4 × k_proj / v_proj
 
-需要本地 `/data/ygw/models/Qwen3-4B-Instruct-2507`, 或通过 `VLLM_INFER_SIM_MODEL`
+需要本地 `/data1/home/ygw268/models/Qwen3-4B-Instruct-2507`, 或通过 `VLLM_INFER_SIM_MODEL`
 环境变量指向其他可用路径。
 
 ```bash
 VLLM_VIRTUAL_BACKEND=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_USE_V1=1 \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 LLM_INFER_SIM_DUMP_OPS=1 \
-VLLM_INFER_SIM_MODEL=/data/ygw/models/Qwen3-4B-Instruct-2507 \
-python examples/run_qwen3_4b.py 2>&1 | tee /tmp/qwen3_dump.log
+VLLM_INFER_SIM_MODEL=/data1/home/ygw268/models/Qwen3-4B-Instruct-2507 \
+python examples/vllm_virtual/run_qwen3_4b.py 2>&1 | tee /tmp/qwen3_dump.log
 ```
 
 加 `VLLM_LOGGING_LEVEL=DEBUG` 看 vLLM 内部 debug log。
@@ -81,7 +92,7 @@ block allocator (与 PD 分离 §10.5 7.6 共享一部分基建)。
 VLLM_VIRTUAL_BACKEND=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_USE_V1=1 \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 LLM_INFER_SIM_TIME_MODE=instant \
-python examples/run_prefix_caching.py
+python examples/vllm_virtual/run_prefix_caching.py
 ```
 
 ## 与 tests/ 的分工
