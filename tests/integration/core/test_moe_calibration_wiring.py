@@ -15,7 +15,7 @@ import pytest
 
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.router import CostRouter
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
+from llm_infer_sim.core.step.step_plan import StepOpPlan
 from llm_infer_sim.core.operators import (
     AllReduce, ElementWise, GEMM, MoERoutingProfile,
     build_moe_dispatch, build_routed_experts,

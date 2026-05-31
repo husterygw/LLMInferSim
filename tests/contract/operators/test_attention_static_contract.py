@@ -8,7 +8,7 @@ MLA 在 test_mla_static_contract (operators/mla.py)。"""
 from __future__ import annotations
 
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
-from llm_infer_sim.core.graph.runtime import StepRuntime
+from llm_infer_sim.core.step.runtime import StepRuntime
 from llm_infer_sim.core.operators.attention import (
     Attention, _add_specs, _flash_decode_spec, _flash_prefill_spec,
 )

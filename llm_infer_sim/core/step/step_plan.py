@@ -1,4 +1,4 @@
-"""V3 §4.4 StepOpPlan — 一个 step 的 op graph.
+"""V3 §4.4 StepOpPlan — 一个 step 的 op plan.
 
 当前新 runtime: flat tuple of Operator-compatible objects.
 后续扩展为 StagePlan / RankPlan 嵌套 (TP/EP/DP, collective, overlap, critical path).
@@ -8,10 +8,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from llm_infer_sim.core.operators.base import Operator
-
 if TYPE_CHECKING:
-    from llm_infer_sim.core.graph.runtime import StepRuntime
+    from llm_infer_sim.core.operators.base import Operator
+    from llm_infer_sim.core.step.runtime import StepRuntime
 
 
 @dataclass(frozen=True)

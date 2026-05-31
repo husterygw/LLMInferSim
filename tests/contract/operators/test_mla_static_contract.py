@@ -7,7 +7,7 @@ byte identical to the constructor's baked spec, for dense MLA, prefill + decode.
 which is what forward derives.)"""
 from __future__ import annotations
 
-from llm_infer_sim.core.graph.runtime import StepRuntime
+from llm_infer_sim.core.step.runtime import StepRuntime
 from llm_infer_sim.core.operators.mla import MLAAttention
 from llm_infer_sim.core.operators.context import build_operator_context
 from llm_infer_sim.core.deployment.profile import DeploymentProfile

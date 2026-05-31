@@ -12,7 +12,7 @@ import pytest
 from llm_infer_sim.core.cost.backends.operator_db import OperatorDBBackend
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.router import CostPolicy, CostRouter
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
+from llm_infer_sim.core.step.step_plan import StepOpPlan
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
 from llm_infer_sim.core.operator_db.stores.memory import MemoryOperatorStore
 from llm_infer_sim.core.operator_schema import operator_to_signature

@@ -8,8 +8,8 @@ from typing import Any
 
 from llm_infer_sim.core.cost.router import CostRouter
 from llm_infer_sim.core.cost.trace import CostTraceEntry
-from llm_infer_sim.core.graph.runtime import OpRuntime, StepRuntime
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
+from llm_infer_sim.core.step.runtime import OpRuntime, StepRuntime
+from llm_infer_sim.core.step.step_plan import StepOpPlan
 
 
 class _FakeRoofline:

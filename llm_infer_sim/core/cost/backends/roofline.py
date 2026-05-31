@@ -79,7 +79,7 @@ class RooflineBackend:
         #   moe_topk           latency += topk_overhead_us
         #   moe_dispatch       latency += local_dispatch_overhead_us
         #   moe (routed_*)     latency /= grouped_gemm_efficiency (<1 慢, >1 快)
-        latency_s = 0 #self._apply_moe_calibration(op, result.total_time, metadata)
+        latency_s = self._apply_moe_calibration(op, result.total_time, metadata)
 
         # build-once: the resolved subtype (e.g. mixed_prefill/mixed_decode) lives
         # on op_runtime; the static op carries only the placeholder (prefill/decode).
@@ -216,7 +216,7 @@ class RooflineBackend:
         # MoE calibration: moe_dispatch op 在 comm 之上叠加 local_dispatch_overhead_us
         # (本地 permute/align). 真 collective (op_kind=collective) 无匹配分支 → 不变.
         comm_latency_s = latency_s
-        latency_s = 0 #self._apply_moe_calibration(op, latency_s, metadata)
+        latency_s = self._apply_moe_calibration(op, latency_s, metadata)
 
         return CostTraceEntry(
             op_name=op.name,

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.step_shape import StepShape
 from llm_infer_sim.core.models.qwen3 import Qwen3Model
 from llm_infer_sim.core.operators import Collective, GEMM
 from llm_infer_sim.core.operators.base import Operator

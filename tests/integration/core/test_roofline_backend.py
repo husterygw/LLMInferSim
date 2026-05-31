@@ -16,7 +16,7 @@ import pytest
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.router import CostRouter
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
+from llm_infer_sim.core.step.step_plan import StepOpPlan
 from llm_infer_sim.core.operators import Collective, GEMM
 from llm_infer_sim.core.operators.base import RooflineSpec
 from llm_infer_sim.core.deployment.profile import DeploymentProfile

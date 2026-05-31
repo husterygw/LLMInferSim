@@ -22,23 +22,6 @@ from llm_infer_sim.core.hardware.communication import rtx_4090_nccl_communicatio
 
 
 KNOWN_PROFILES: dict[str, dict] = {
-    "A100": dict(
-        peak_flops_fp16=312e12,
-        peak_flops_bf16=312e12,
-        peak_flops_int8=624e12,
-        peak_flops_fp8=0.0,
-        peak_flops_fp4=0.0,
-        vector_flops=19.5e12,
-        has_fp4_tc=False,
-        mem_bandwidth=1555e9,
-        mem_capacity_gb=40,
-        onchip_buffer=27648e3,
-        intra_node_bandwidth=600e9,
-        intra_node_protocol_efficiency=0.67,  # NVLink 3 busbw ~200/300 GB/s, https://github.com/NVIDIA/nccl-tests/issues/149
-        comm_step_latency=0.0,
-        inter_node_bandwidth=2.5e+10,
-        inter_node_latency=0.0,
-    ),
     "H100": dict(
         peak_flops_fp16=1979e12 / 2,
         peak_flops_bf16=1979e12 / 2,
@@ -262,7 +245,6 @@ KNOWN_PROFILES: dict[str, dict] = {
 
 
 PROFILE_ALIASES: dict[str, str] = {
-    "nvidia_A100": "A100",
     "nvidia_H100": "H100",
     "nvidia_H800": "H800",
     "nvidia_H200": "H200",

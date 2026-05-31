@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.router import CostRouter
 from llm_infer_sim.core.cost.trace import StepCostTrace
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.step_shape import StepShape
 from llm_infer_sim.core.deployment.profile import DeploymentProfile
 from llm_infer_sim.core.models.base import BaseModel
 from llm_infer_sim.core.models.registry import get_model

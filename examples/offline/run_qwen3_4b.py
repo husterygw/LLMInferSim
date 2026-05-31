@@ -48,10 +48,10 @@ def main() -> int:
 
     from vllm import LLM, SamplingParams, TokensPrompt
 
-    print(f"[init] LLM(model={model!r}, tp=2, chunked_prefill 强制)")
+    print(f"[init] LLM(model={model!r}, tp=1, chunked_prefill 强制)")
     llm = LLM(
         model=model,
-        tensor_parallel_size=2,                     # ← 4-α spike 核心
+        tensor_parallel_size=1,                     # ← 4-α spike 核心
         dtype="float16",
         gpu_memory_utilization=0.5,
         enforce_eager=True,

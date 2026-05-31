@@ -463,17 +463,16 @@ def _extract_kernel_profile(
 def _infer_execution_mode(vllm_config) -> str:
     """从 vllm_config 推 execution_mode (Phase 5)。
 
-    enforce_eager=True → "eager"
-    compilation_config.cudagraph_mode in {None, NONE} → "eager"
-    其他 → "cudagraph"
+    enforce_eager=True → "eager"，否则 "cudagraph"。
+
+    execution_mode 描述的是**被模拟的 GPU** 的行为，不是宿主 CPU 能不能 capture。
+    VirtualPlatform.check_and_update_config 会清空 cudagraph_capture_sizes（CPU 没法
+    capture 真 cudagraph），导致 cudagraph_mode 被 vLLM 塌缩成 NONE，所以这里不能再
+    拿 cudagraph_mode 判断——否则 cudagraph 用例会被误判成 eager，通信成本模型每个
+    allreduce 多算 framework_overhead，TPOT 系统性高估。用户的真实意图只看 enforce_eager。
     """
     if getattr(vllm_config, "enforce_eager", False):
         return "eager"
-    cc = getattr(vllm_config, "compilation_config", None)
-    if cc is not None:
-        cgm = getattr(cc, "cudagraph_mode", None)
-        if cgm is None or str(cgm).endswith("NONE"):
-            return "eager"
     return "cudagraph"
 
 

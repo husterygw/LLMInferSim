@@ -8,7 +8,7 @@ sim number. Locks the口径 fix too: signature carries kernel_source + topology.
 from __future__ import annotations
 
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
-from llm_infer_sim.core.graph.runtime import StepRuntime
+from llm_infer_sim.core.step.runtime import StepRuntime
 from llm_infer_sim.core.operators.collective import AllReduce
 from llm_infer_sim.core.operators.context import build_operator_context
 from llm_infer_sim.core.deployment.profile import DeploymentProfile

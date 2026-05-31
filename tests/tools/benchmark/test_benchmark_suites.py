@@ -154,3 +154,4 @@ def test_run_bench_suite_legacy_alias_dry_run(tmp_path: Path):
 
     assert "suite=single_tp1_roofline" in result.stdout
     assert "BENCH[real]" in result.stdout
+    assert ">>> analyze: python scripts/bench/analyze_bench.py" in result.stdout

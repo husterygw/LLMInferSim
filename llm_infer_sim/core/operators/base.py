@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from llm_infer_sim.core.graph.runtime import OpRuntime
+from llm_infer_sim.core.step.runtime import OpRuntime
 from llm_infer_sim.core.operator_schema.canonical import project, to_canonical
 from llm_infer_sim.core.operator_schema.signature import OperatorSignature
 

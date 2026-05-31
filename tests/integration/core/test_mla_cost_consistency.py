@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from llm_infer_sim.core.cost.engine import build_deepseek_roofline_engine
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.step_shape import StepShape
 from llm_infer_sim.core.deployment.profile import DeploymentProfile
 from llm_infer_sim.core.runtime.profile import RuntimeProfile
 from llm_infer_sim.core.hardware import get_hardware_config as get_hardware_profile

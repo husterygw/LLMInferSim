@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from llm_infer_sim.core.graph.runtime import OpRuntime, StepRuntime
+from llm_infer_sim.core.step.runtime import OpRuntime, StepRuntime
 from llm_infer_sim.core.operator_schema.moe import moe_operator_to_signature
 from llm_infer_sim.core.operator_schema.signature import OperatorSignature
 from llm_infer_sim.core.operators.base import OperatorBase, RooflineSpec

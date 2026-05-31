@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.step_plan import StepOpPlan
+from llm_infer_sim.core.step.step_shape import StepShape
 
 
 @runtime_checkable

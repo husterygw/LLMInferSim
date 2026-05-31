@@ -11,13 +11,11 @@ from typing import Optional
 
 from llm_infer_sim.core.calibration.moe_efficiency import MoEEfficiencyProfile
 from llm_infer_sim.core.calibration.provenance import CalibrationProvenance
-from llm_infer_sim.core.calibration.roofline import RooflineCalibration
 from llm_infer_sim.core.calibration.runtime_overhead import RuntimeOverheadCalibration
 
 
 @dataclass(frozen=True)
 class CalibrationProfile:
-    roofline: RooflineCalibration = field(default_factory=RooflineCalibration)
     runtime_overhead: RuntimeOverheadCalibration = field(
         default_factory=RuntimeOverheadCalibration
     )

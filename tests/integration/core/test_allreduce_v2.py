@@ -19,7 +19,7 @@ from llm_infer_sim.core.cost.roofline.communication import (
     allreduce_time_with_breakdown,
 )
 from llm_infer_sim.core.cost.router import CostRouter
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
+from llm_infer_sim.core.step.step_plan import StepOpPlan
 from llm_infer_sim.core.operators import Collective
 from llm_infer_sim.core.operators.base import RooflineSpec
 from llm_infer_sim.core.deployment.profile import DeploymentProfile

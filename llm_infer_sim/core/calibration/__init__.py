@@ -7,11 +7,9 @@ from llm_infer_sim.core.calibration.moe_efficiency import (
 from llm_infer_sim.core.calibration.profile import CalibrationProfile
 from llm_infer_sim.core.calibration.provenance import CalibrationProvenance
 from llm_infer_sim.core.calibration.registry import get_calibration_profile
-from llm_infer_sim.core.calibration.roofline import RooflineCalibration
 from llm_infer_sim.core.calibration.runtime_overhead import RuntimeOverheadCalibration
 
 __all__ = [
-    "RooflineCalibration",
     "RuntimeOverheadCalibration",
     "CalibrationProvenance",
     "CalibrationProfile",

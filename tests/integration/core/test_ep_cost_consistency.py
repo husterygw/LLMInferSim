@@ -17,7 +17,7 @@ import pytest
 
 from llm_infer_sim.core.operators import MoERoutingProfile, estimate_distinct_experts
 from llm_infer_sim.core.operators.context import build_operator_context
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.step_shape import StepShape
 from llm_infer_sim.core.models.qwen3_moe import Qwen3MoeModel
 from llm_infer_sim.core.deployment.profile import DeploymentProfile
 from llm_infer_sim.core.runtime.profile import RuntimeProfile

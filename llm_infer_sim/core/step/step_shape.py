@@ -1,6 +1,6 @@
-"""V3 §4.2 StepShape — graph/cost 层消费的 step shape.
+"""V3 §4.2 StepShape — step/cost 层消费的 step shape.
 
-从 GlobalStepWorkload 派生, 加入 graph/cudagraph 和 cost 相关字段.
+从 GlobalStepWorkload 派生, 加入 step/cudagraph 和 cost 相关字段.
 
 阶段 1:    PREFILL / DECODE.
 阶段 3d:   MIXED — prefill seqs + decode seqs 同 step (chunked prefill).

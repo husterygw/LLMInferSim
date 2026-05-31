@@ -11,7 +11,7 @@ import pytest
 # 的潜在 import cycle (本文件按字母序最先被 collect, 成为链的入口)。
 from llm_infer_sim.core.models.config import ModelConfig, ModelProfile
 from tests.helpers.support import make_model_config
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.step_shape import StepShape
 from llm_infer_sim.core.models.registry import get_model
 from llm_infer_sim.core.operators.context import build_operator_context
 from llm_infer_sim.core.deployment.profile import DeploymentProfile

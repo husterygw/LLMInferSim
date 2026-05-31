@@ -9,7 +9,7 @@ hardware:
   name: RTX_4090
   topology_hint: concentrated
   compute_efficiency: 1.0
-  mem_efficiency: 1.0
+  mem_efficiency: 0.9
   comm_efficiency: 1.0
 
 calibration:

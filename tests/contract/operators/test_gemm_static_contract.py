@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from llm_infer_sim.core.cost.backends.operator_db import OperatorDBBackend
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
-from llm_infer_sim.core.graph.runtime import StepRuntime
+from llm_infer_sim.core.step.runtime import StepRuntime
 from llm_infer_sim.core.operator_db.schema import OperatorRecord
 from llm_infer_sim.core.operator_db.stores.memory import MemoryOperatorStore
 from llm_infer_sim.core.operators.context import build_operator_context

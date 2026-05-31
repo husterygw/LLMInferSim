@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from llm_infer_sim.core.cost.engine import build_qwen_roofline_engine
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.step_shape import StepShape
 from llm_infer_sim.core.operator_db.importers.collector_v2 import raw_record_to_signature
 from llm_infer_sim.core.operator_db.version_check import (
     OperatorDBVersionMismatch, verify_db_framework_version,

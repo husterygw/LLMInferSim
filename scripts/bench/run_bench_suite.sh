@@ -48,4 +48,9 @@ bash "$SCRIPT_DIR/bench_compare.sh" \
 
 echo
 echo ">>> suite $SUITE done. results: $OUT_ROOT/$SUITE"
-echo ">>> analyze: python scripts/bench/analyze_bench.py $OUT_ROOT --suite $SUITE --cases $CASES_JSONL"
+if [ -z "$DRY_RUN_FLAG" ]; then
+  echo ">>> analysis"
+  python "$SCRIPT_DIR/analyze_bench.py" "$OUT_ROOT" --suite "$SUITE" --cases "$CASES_JSONL"
+else
+  echo ">>> analyze: python scripts/bench/analyze_bench.py $OUT_ROOT --suite $SUITE --cases $CASES_JSONL"
+fi

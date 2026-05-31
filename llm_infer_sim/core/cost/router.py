@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from llm_infer_sim.core.cost.backends.operator_db import OperatorDBBackend
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
 from llm_infer_sim.core.cost.trace import CostTraceEntry, StepCostTrace
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
+from llm_infer_sim.core.step.step_plan import StepOpPlan
 
 
 @dataclass(frozen=True)

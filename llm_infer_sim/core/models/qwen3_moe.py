@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import os
 
-from llm_infer_sim.core.graph.runtime import StepRuntime
-from llm_infer_sim.core.graph.step_plan import StepOpPlan
-from llm_infer_sim.core.graph.step_shape import StepShape
+from llm_infer_sim.core.step.runtime import StepRuntime
+from llm_infer_sim.core.step.step_plan import StepOpPlan
+from llm_infer_sim.core.step.step_shape import StepShape
 from llm_infer_sim.core.models.layer_partition import partition_ffn_layers
 from llm_infer_sim.core.operators import (
     AllReduce,

@@ -53,7 +53,7 @@ def _moe_layer_ops(*, tp: int, ep: int, tokens: int = 128):
         num_prefill_tokens=tokens, total_scheduled_tokens=tokens,
         num_prefill_requests=1,
     )
-    from llm_infer_sim.core.graph.step_shape import StepShape
+    from llm_infer_sim.core.step.step_shape import StepShape
     step = StepShape.from_workload(wl, runtime.execution.execution_mode)
     plan = engine.model.forward(step)
     layer0_ops = [op for op in plan.ops if op.layer_idx == 0]

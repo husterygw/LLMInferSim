@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from llm_infer_sim.core.graph.runtime import OpRuntime, StepRuntime
+from llm_infer_sim.core.step.runtime import OpRuntime, StepRuntime
 from llm_infer_sim.core.operators.base import OperatorBase, RooflineSpec
 from llm_infer_sim.core.operators.context import OperatorContext
 

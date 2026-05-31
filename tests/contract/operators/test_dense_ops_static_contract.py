@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from llm_infer_sim.core.cost.backends.roofline import RooflineBackend
-from llm_infer_sim.core.graph.runtime import StepRuntime
+from llm_infer_sim.core.step.runtime import StepRuntime
 from llm_infer_sim.core.operators.context import build_operator_context
 from llm_infer_sim.core.operators.elementwise import ElementWise
 from llm_infer_sim.core.operators.embedding import Embedding

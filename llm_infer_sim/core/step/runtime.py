@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
-    from llm_infer_sim.core.graph.step_shape import StepShape
+    from llm_infer_sim.core.step.step_shape import StepShape
 
 
 @dataclass(frozen=True)
